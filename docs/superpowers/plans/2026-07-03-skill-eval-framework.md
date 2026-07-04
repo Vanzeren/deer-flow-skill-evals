@@ -311,14 +311,14 @@ git commit -m "feat: add skill eval schemas"
 
 **Interfaces:**
 - Consumes: `SkillAssertionSpec`, `AgentTrace`.
-- Produces: `AssertionResult` and `evaluate_assertion(assertion, trace, final_answer)`.
+- Produces: `AssertionResult`, `ASSERTION_REGISTRY`, `register_assertion(name)`, and `evaluate_assertion(assertion, trace, final_answer)`.
 
 - [ ] **Step 1: Add failing assertion tests**
 
 Append these tests to `backend/tests/skill_eval/test_assertion_engine.py`:
 
 ```python
-from skill_eval.assertion_engine import evaluate_assertion
+from skill_eval.assertion_engine import ASSERTION_REGISTRY, evaluate_assertion
 
 
 def _valid_trace(**overrides):
@@ -330,6 +330,16 @@ def _valid_trace(**overrides):
     }
     data.update(overrides)
     return AgentTrace(**data)
+
+
+def test_mvp_assertions_are_registered():
+    assert set(ASSERTION_REGISTRY) == {
+        "tool_called",
+        "tool_not_called",
+        "output_contains",
+        "success_is_true",
+        "trace_complete",
+    }
 
 
 def test_tool_called_passes_when_expected_tool_appears():
@@ -468,11 +478,12 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'skill_eval.assertion_
 Create `backend/skill_eval/assertion_engine.py`:
 
 ```python
+from collections.abc import Callable
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-from skill_eval.case_schema import SkillAssertionSpec
+from skill_eval.case_schema import AssertionName, SkillAssertionSpec
 from skill_eval.trace_schema import AgentTrace
 
 
@@ -483,48 +494,59 @@ class AssertionResult(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+AssertionHandler = Callable[[SkillAssertionSpec, AgentTrace, str], AssertionResult]
+ASSERTION_REGISTRY: dict[AssertionName, AssertionHandler] = {}
+
+
+def register_assertion(name: AssertionName) -> Callable[[AssertionHandler], AssertionHandler]:
+    def decorator(handler: AssertionHandler) -> AssertionHandler:
+        ASSERTION_REGISTRY[name] = handler
+        return handler
+
+    return decorator
+
+
 def evaluate_assertion(assertion: SkillAssertionSpec, trace: AgentTrace, final_answer: str) -> AssertionResult:
-    if assertion.name == "tool_called":
-        return evaluate_tool_called(assertion, trace)
-    if assertion.name == "tool_not_called":
-        return evaluate_tool_not_called(assertion, trace)
-    if assertion.name == "output_contains":
-        return evaluate_output_contains(assertion, final_answer)
-    if assertion.name == "success_is_true":
-        return evaluate_success_is_true(assertion, trace)
-    if assertion.name == "trace_complete":
-        return evaluate_trace_complete(assertion, trace)
-    return _fail(assertion, f"Unsupported assertion in MVP: {assertion.name}")
+    handler = ASSERTION_REGISTRY.get(assertion.name)
+    if handler is None:
+        return _fail(assertion, f"Unsupported assertion in MVP: {assertion.name}")
+
+    return handler(assertion, trace, final_answer)
 
 
-def evaluate_tool_called(assertion: SkillAssertionSpec, trace: AgentTrace) -> AssertionResult:
+@register_assertion("tool_called")
+def evaluate_tool_called(assertion: SkillAssertionSpec, trace: AgentTrace, final_answer: str) -> AssertionResult:
     called = any(call.name == assertion.target for call in trace.tool_calls)
     if called:
         return _pass(assertion, f"Tool `{assertion.target}` was called.")
     return _fail(assertion, f"Expected tool `{assertion.target}` to be called.")
 
 
-def evaluate_tool_not_called(assertion: SkillAssertionSpec, trace: AgentTrace) -> AssertionResult:
+@register_assertion("tool_not_called")
+def evaluate_tool_not_called(assertion: SkillAssertionSpec, trace: AgentTrace, final_answer: str) -> AssertionResult:
     called = any(call.name == assertion.target for call in trace.tool_calls)
     if not called:
         return _pass(assertion, f"Tool `{assertion.target}` was not called.")
     return _fail(assertion, f"Forbidden tool `{assertion.target}` was called.")
 
 
-def evaluate_output_contains(assertion: SkillAssertionSpec, final_answer: str) -> AssertionResult:
+@register_assertion("output_contains")
+def evaluate_output_contains(assertion: SkillAssertionSpec, trace: AgentTrace, final_answer: str) -> AssertionResult:
     target = assertion.target or ""
     if target in final_answer:
         return _pass(assertion, f"Output contained `{target}`.")
     return _fail(assertion, f"Expected output to contain `{target}`.")
 
 
-def evaluate_success_is_true(assertion: SkillAssertionSpec, trace: AgentTrace) -> AssertionResult:
+@register_assertion("success_is_true")
+def evaluate_success_is_true(assertion: SkillAssertionSpec, trace: AgentTrace, final_answer: str) -> AssertionResult:
     if trace.success is True:
         return _pass(assertion, "Trace success is true.")
     return _fail(assertion, "Trace success is not true.")
 
 
-def evaluate_trace_complete(assertion: SkillAssertionSpec, trace: AgentTrace) -> AssertionResult:
+@register_assertion("trace_complete")
+def evaluate_trace_complete(assertion: SkillAssertionSpec, trace: AgentTrace, final_answer: str) -> AssertionResult:
     failures: list[str] = []
     if not trace.input:
         failures.append("trace.input is empty")
