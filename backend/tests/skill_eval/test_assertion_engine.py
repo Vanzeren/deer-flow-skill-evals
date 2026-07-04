@@ -1,7 +1,9 @@
+from typing import get_args
+
 import pytest
 from pydantic import ValidationError
 
-from skill_eval.case_schema import SkillAssertionSpec, SkillEvalCase
+from skill_eval.case_schema import AssertionName, SkillAssertionSpec, SkillEvalCase
 from skill_eval.trace_schema import AgentToolCall, AgentTrace, SkillInvocation
 
 
@@ -16,9 +18,25 @@ def test_skill_eval_case_defaults():
     assert case.difficulty == "normal"
 
 
-def test_skill_assertion_rejects_unknown_name():
+def test_skill_assertion_accepts_only_resolved_mvp_and_skill_names():
+    allowed_names = {
+        "tool_called",
+        "tool_not_called",
+        "output_contains",
+        "success_is_true",
+        "trace_complete",
+        "skill_loaded",
+        "skill_used",
+        "skill_not_used",
+        "skill_applied",
+        "skill_not_applied",
+    }
+
+    assert set(get_args(AssertionName)) == allowed_names
+    assert SkillAssertionSpec(name="skill_used").name == "skill_used"
+
     with pytest.raises(ValidationError):
-        SkillAssertionSpec(name="unknown_assertion")
+        SkillAssertionSpec(name="regex_match")
 
 
 def test_agent_trace_captures_normalized_evidence_and_raw_ref():
