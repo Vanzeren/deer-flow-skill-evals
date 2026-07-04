@@ -252,14 +252,25 @@ class AgentTrace(BaseModel):
 
 ## Agent Runner Interface
 
-`agent_runner.py` owns the runtime-independent interface.
+`agent_runner.py` owns the runtime-independent execution boundary. The Inspect solver converts `TaskState` into an `AgentRunRequest`; the runner owns skill-selection policy and runtime execution.
 
 ```python
-from typing import Protocol
+from typing import Any, Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from skill_eval.trace_schema import AgentTrace
+
+
+class AgentRunRequest(BaseModel):
+    case_id: str | None = None
+    user_input: str
+    target: str | None = None
+    required_skills: list[str] = Field(default_factory=list)
+    candidate_skills: list[str] = Field(default_factory=list)
+    forced_skills: list[str] | None = None
+    sandbox: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentRunResult(BaseModel):
@@ -269,31 +280,17 @@ class AgentRunResult(BaseModel):
 
 
 class AgentRunner(Protocol):
-    async def run(
-        self,
-        user_input: str,
-        skills: list[str],
-        sandbox: str | None = None,
-    ) -> AgentRunResult:
+    async def run(self, request: AgentRunRequest) -> AgentRunResult:
         raise NotImplementedError
 
 
-async def run_agent(
-    user_input: str,
-    skills: list[str],
-    sandbox: str | None = None,
-    runner: AgentRunner | None = None,
-) -> AgentRunResult:
+async def run_agent(request: AgentRunRequest, runner: AgentRunner | None = None) -> AgentRunResult:
     if runner is None:
         from skill_eval.adapters.mock import MockAgentRunner
 
         runner = MockAgentRunner()
 
-    return await runner.run(
-        user_input=user_input,
-        skills=skills,
-        sandbox=sandbox,
-    )
+    return await runner.run(request)
 ```
 
 ### Mock Runner
@@ -301,24 +298,20 @@ async def run_agent(
 The MVP uses `MockAgentRunner` to prove the Inspect → solver → trace → scorer chain without a real agent dependency.
 
 ```python
-from skill_eval.agent_runner import AgentRunResult
+from skill_eval.agent_runner import AgentRunRequest, AgentRunResult
 from skill_eval.trace_schema import AgentTrace, AgentToolCall, SkillInvocation
 
 
 class MockAgentRunner:
-    async def run(
-        self,
-        user_input: str,
-        skills: list[str],
-        sandbox: str | None = None,
-    ) -> AgentRunResult:
+    async def run(self, request: AgentRunRequest) -> AgentRunResult:
+        selected_skills = request.forced_skills if request.forced_skills is not None else request.candidate_skills
         tool_calls = []
         final_answer = "Mock answer."
 
-        if "cloud run" in user_input.lower():
+        if "cloud run" in request.user_input.lower():
             final_answer = "Use gcloud run deploy to deploy a Cloud Run service."
 
-        if "write todos" in user_input.lower() and "do not" not in user_input.lower():
+        if "write todos" in request.user_input.lower() and "do not" not in request.user_input.lower():
             tool_calls.append(
                 AgentToolCall(
                     name="write_todos",
@@ -327,7 +320,7 @@ class MockAgentRunner:
             )
 
         trace = AgentTrace(
-            input=user_input,
+            input=request.user_input,
             final_answer=final_answer,
             success=True,
             tool_calls=tool_calls,
@@ -336,28 +329,25 @@ class MockAgentRunner:
                     name=skill,
                     path=skill,
                     loaded=True,
-                    used=bool(skills),
+                    used=True,
                     applied=None,
                     trigger_reason="mock runner loaded candidate skill",
                     evidence=["mock runner selected candidate skill"],
                 )
-                for skill in skills
+                for skill in selected_skills
             ],
             messages=[
-                {"role": "user", "content": user_input},
+                {"role": "user", "content": request.user_input},
                 {"role": "assistant", "content": final_answer},
             ],
             steps=[
                 {"type": "mock_start"},
                 {"type": "mock_final_answer"},
             ],
+            runtime="mock",
         )
 
-        return AgentRunResult(
-            final_answer=final_answer,
-            success=True,
-            trace=trace,
-        )
+        return AgentRunResult(final_answer=final_answer, success=True, trace=trace)
 ```
 
 ### DeerFlow Runner
@@ -386,12 +376,13 @@ Generic scorers must not parse DeerFlow-native structures directly. If a DeerFlo
 
 ## Inspect Solver
 
-`inspect_solver.py` is the adapter between Inspect `TaskState` and the agent runner.
+`inspect_solver.py` adapts Inspect `TaskState` into `AgentRunRequest`, then writes the agent result back to Inspect. It does not decide selected skills; it passes `forced_skills` and `candidate_skills` to the runner.
 
 ```python
 from inspect_ai.solver import Generate, TaskState, solver
 
-from skill_eval.agent_runner import AgentRunner, run_agent
+from skill_eval.agent_runner import AgentRunner, AgentRunRequest, run_agent
+from skill_eval.case_schema import SkillEvalCase
 
 
 @solver
@@ -401,15 +392,19 @@ def skill_agent_solver(
     sandbox: str | None = "docker",
 ):
     async def solve(state: TaskState, generate: Generate) -> TaskState:
-        case = state.metadata.get("case", {})
-        selected_skills = skills if skills is not None else case.get("candidate_skills", [])
-
-        result = await run_agent(
+        case = SkillEvalCase.model_validate(state.metadata.get("case", {}))
+        request = AgentRunRequest(
+            case_id=case.id,
             user_input=state.input_text,
-            skills=selected_skills,
+            target=case.target,
+            required_skills=case.required_skills,
+            candidate_skills=case.candidate_skills,
+            forced_skills=skills,
             sandbox=sandbox,
-            runner=agent_runner,
+            metadata={"inspect_sample_id": state.sample_id},
         )
+
+        result = await run_agent(request, runner=agent_runner)
 
         state.output.completion = result.final_answer
         state.metadata["agent_trace"] = result.trace.model_dump()
@@ -419,8 +414,6 @@ def skill_agent_solver(
 
     return solve
 ```
-
-The solver usually does not call `await generate(state)` because the real model call happens inside the custom agent runtime. `generate(state)` is only appropriate when Inspect itself owns the model invocation.
 
 ---
 
@@ -811,7 +804,7 @@ def skills_eval(
 
 `baseline_eval.py` uses `skills=[]`.
 
-`with_skill_eval.py` uses `skills=None`, allowing the solver to read `case.candidate_skills`.
+`with_skill_eval.py` uses `skills=None`, passing case `candidate_skills` through `AgentRunRequest` so the runner can select them.
 
 ---
 
