@@ -4,30 +4,16 @@ from pydantic import BaseModel, Field
 
 
 AssertionName = Literal[
+    "tool_called",
+    "tool_not_called",
+    "output_contains",
+    "success_is_true",
+    "trace_complete",
     "skill_loaded",
     "skill_used",
     "skill_not_used",
     "skill_applied",
     "skill_not_applied",
-    "tool_called",
-    "tool_not_called",
-    "tool_args_contains",
-    "tool_args_match",
-    "tool_call_order",
-    "tool_error_absent",
-    "tool_result_contains",
-    "tool_result_match",
-    "output_contains",
-    "output_not_contains",
-    "regex_match",
-    "json_valid",
-    "success_is_true",
-    "trace_complete",
-    "latency_under",
-    "tokens_under",
-    "tool_count_under",
-    "max_steps_under",
-    "no_unexpected_clarification",
 ]
 
 
