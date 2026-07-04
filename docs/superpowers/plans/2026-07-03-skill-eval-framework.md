@@ -17,7 +17,7 @@
 - `state.output.completion` MUST hold the agent final answer.
 - `state.metadata["agent_trace"]` MUST hold `AgentTrace.model_dump()`.
 - Assertion engine MUST be pure Python and testable without Inspect.
-- MVP assertions are exactly `tool_called`, `tool_not_called`, `output_contains`, `success_is_true`, and `trace_complete`.
+- MVP assertions are exactly `tool_called`, `tool_not_called`, `output_contains`, `success_is_true`, `trace_complete`, `skill_loaded`, `skill_used`, `skill_not_used`, `skill_applied`, and `skill_not_applied`.
 - MVP scorers are exactly `skill_assertion_scorer()` and `trace_integrity_scorer()`.
 - Tool behavior, tool input/output, skill usage, output rules, performance limits, and clarification behavior MUST be modeled as assertion types evaluated by `skill_assertion_scorer()`, not as separate MVP scorers.
 - `SkillInvocation.used` MUST mean the skill was selected/activated, including a successful `read_file` of `SKILL.md`; `SkillInvocation.applied` MUST mean behavior complied with the skill and MAY be `None` when unknown.
@@ -194,30 +194,16 @@ from pydantic import BaseModel, Field
 
 
 AssertionName = Literal[
+    "tool_called",
+    "tool_not_called",
+    "output_contains",
+    "success_is_true",
+    "trace_complete",
     "skill_loaded",
     "skill_used",
     "skill_not_used",
     "skill_applied",
     "skill_not_applied",
-    "tool_called",
-    "tool_not_called",
-    "tool_args_contains",
-    "tool_args_match",
-    "tool_call_order",
-    "tool_error_absent",
-    "tool_result_contains",
-    "tool_result_match",
-    "output_contains",
-    "output_not_contains",
-    "regex_match",
-    "json_valid",
-    "success_is_true",
-    "trace_complete",
-    "latency_under",
-    "tokens_under",
-    "tool_count_under",
-    "max_steps_under",
-    "no_unexpected_clarification",
 ]
 
 
@@ -337,6 +323,11 @@ def test_mvp_assertions_are_registered():
         "output_contains",
         "success_is_true",
         "trace_complete",
+        "skill_loaded",
+        "skill_used",
+        "skill_not_used",
+        "skill_applied",
+        "skill_not_applied",
     }
 
 

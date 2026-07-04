@@ -2,7 +2,6 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-
 AssertionName = Literal[
     "tool_called",
     "tool_not_called",

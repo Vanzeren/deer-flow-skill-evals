@@ -145,30 +145,16 @@ from pydantic import BaseModel, Field
 
 
 AssertionName = Literal[
+    "tool_called",
+    "tool_not_called",
+    "output_contains",
+    "success_is_true",
+    "trace_complete",
     "skill_loaded",
     "skill_used",
     "skill_not_used",
     "skill_applied",
     "skill_not_applied",
-    "tool_called",
-    "tool_not_called",
-    "tool_args_contains",
-    "tool_args_match",
-    "tool_call_order",
-    "tool_error_absent",
-    "tool_result_contains",
-    "tool_result_match",
-    "output_contains",
-    "output_not_contains",
-    "regex_match",
-    "json_valid",
-    "success_is_true",
-    "trace_complete",
-    "latency_under",
-    "tokens_under",
-    "tool_count_under",
-    "max_steps_under",
-    "no_unexpected_clarification",
 ]
 
 
@@ -468,7 +454,7 @@ def evaluate_assertion(
 
 ### MVP Assertions
 
-The first implementation must support only these assertions:
+The first implementation supports these assertions:
 
 | Assertion | Rule |
 |---|---|
@@ -477,6 +463,11 @@ The first implementation must support only these assertions:
 | `output_contains` | `target in final_answer`. |
 | `success_is_true` | `trace.success is True`. |
 | `trace_complete` | Required trace fields are present and no fatal errors. |
+| `skill_loaded` | A target skill invocation has `loaded is True`. |
+| `skill_used` | A target skill invocation has `used is True`. |
+| `skill_not_used` | No target skill invocation has `used is True`. |
+| `skill_applied` | A target skill invocation has `applied is True`. |
+| `skill_not_applied` | A target skill invocation has `applied is False`; `None` is unknown and fails. |
 
 Each MVP rule is implemented as an `@register_assertion("<name>")` handler. `evaluate_assertion()` is only the registry lookup and unsupported-assertion fallback.
 
@@ -493,11 +484,6 @@ Each MVP rule is implemented as an `@register_assertion("<name>")` handler. `eva
 Phase 2 can add the remaining deterministic assertions. These stay inside the assertion engine and are executed by `skill_assertion_scorer()` rather than by adding one scorer per concern:
 
 ```text
-skill_loaded
-skill_used
-skill_not_used
-skill_applied
-skill_not_applied
 tool_args_contains
 tool_args_match
 tool_call_order

@@ -4,7 +4,7 @@ from inspect_ai.scorer import Target
 from inspect_ai.solver import TaskState
 
 from skill_eval.inspect_scorer import skill_assertion_scorer
-from skill_eval.trace_schema import AgentTrace, AgentToolCall
+from skill_eval.trace_schema import AgentToolCall, AgentTrace
 
 
 def _state(metadata):
