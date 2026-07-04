@@ -20,6 +20,7 @@
 - MVP assertions are exactly `tool_called`, `tool_not_called`, `output_contains`, `success_is_true`, and `trace_complete`.
 - MVP scorers are exactly `skill_assertion_scorer()` and `trace_integrity_scorer()`.
 - Tool behavior, tool input/output, skill usage, output rules, performance limits, and clarification behavior MUST be modeled as assertion types evaluated by `skill_assertion_scorer()`, not as separate MVP scorers.
+- `SkillInvocation.used` MUST mean the skill was selected/activated, including a successful `read_file` of `SKILL.md`; `SkillInvocation.applied` MUST mean behavior complied with the skill and MAY be `None` when unknown.
 - Baseline vs with-skill impact analysis MUST be implemented later as `comparison.py` / `report.py`, not as an Inspect scorer.
 - Do not add DeerFlow runtime adapter in this MVP.
 - Do not add LLM-as-judge scorers in this MVP.
@@ -150,7 +151,7 @@ def test_agent_trace_captures_normalized_evidence_and_raw_ref():
         final_answer="Done",
         success=True,
         tool_calls=[AgentToolCall(name="bash", args={"cmd": "pwd"})],
-        skill_invocations=[SkillInvocation(name="demo", loaded=True, used=False)],
+        skill_invocations=[SkillInvocation(name="demo", loaded=True, used=True, applied=None, evidence=["read_file loaded SKILL.md"])],
         messages=[{"role": "assistant", "content": "Done"}],
         steps=[{"type": "final"}],
         runtime="mock",
@@ -161,6 +162,9 @@ def test_agent_trace_captures_normalized_evidence_and_raw_ref():
     assert trace.raw_trace_ref == "artifact://trace"
     assert trace.tool_calls[0].name == "bash"
     assert trace.skill_invocations[0].loaded is True
+    assert trace.skill_invocations[0].used is True
+    assert trace.skill_invocations[0].applied is None
+    assert trace.skill_invocations[0].evidence == ["read_file loaded SKILL.md"]
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -195,12 +199,16 @@ AssertionName = Literal[
     "skill_loaded",
     "skill_used",
     "skill_not_used",
+    "skill_applied",
+    "skill_not_applied",
     "tool_called",
     "tool_not_called",
     "tool_args_contains",
     "tool_args_match",
     "tool_call_order",
     "tool_error_absent",
+    "tool_result_contains",
+    "tool_result_match",
     "output_contains",
     "output_not_contains",
     "regex_match",
@@ -255,7 +263,9 @@ class SkillInvocation(BaseModel):
     path: str | None = None
     loaded: bool = False
     used: bool = False
+    applied: bool | None = None
     trigger_reason: str | None = None
+    evidence: list[str] = Field(default_factory=list)
 
 
 class AgentTrace(BaseModel):
@@ -755,6 +765,7 @@ async def test_mock_runner_avoids_write_todos_when_user_forbids_it():
 
     assert result.trace.tool_calls == []
     assert result.trace.skill_invocations[0].used is True
+    assert result.trace.skill_invocations[0].applied is None
 ```
 
 - [ ] **Step 2: Run mock tests to verify failure**
@@ -839,7 +850,9 @@ class MockAgentRunner:
                     path=skill,
                     loaded=True,
                     used=bool(skills),
+                    applied=None,
                     trigger_reason="mock runner loaded candidate skill",
+                    evidence=["mock runner selected candidate skill"],
                 )
                 for skill in skills
             ],
@@ -1501,6 +1514,7 @@ git commit -m "docs: document skill eval harness"
 - `SkillEvalCase.assertions` uses `list[SkillAssertionSpec]` in schema and scorer tests.
 - `AgentTrace.tool_calls` uses `list[AgentToolCall]` in schema and assertion tests.
 - `AgentTrace.skill_invocations` uses `list[SkillInvocation]` in schema and mock runner.
+- `SkillInvocation.used` means selected/activated; `SkillInvocation.applied` means behavior complied and may be `None` before assertion/comparison post-processing.
 - `run_agent()` accepts `runner: AgentRunner | None` and is used by `skill_agent_solver()`.
 - `skill_agent_solver()` writes `state.output.completion`, `state.metadata["agent_trace"]`, and `state.metadata["success"]`.
 - `skill_assertion_scorer()` returns per-assertion metadata under `assertion_results`.
