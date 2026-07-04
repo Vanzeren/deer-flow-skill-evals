@@ -10,21 +10,17 @@
 
 ## Global Constraints
 
-- Generic scorers MUST evaluate `AgentTrace`, not raw DeerFlow or LangGraph messages.
+- Generic scorers MUST evaluate `AgentTrace`, not raw LangChain, LangGraph, or DeerFlow messages.
 - Raw runtime data MUST remain adapter input or debug evidence through `AgentTrace.raw_trace_ref`.
 - `Sample.target` MUST hold final-answer reference text.
 - `Sample.metadata["case"]` MUST hold behavior expectations.
 - `state.output.completion` MUST hold the agent final answer.
 - `state.metadata["agent_trace"]` MUST hold `AgentTrace.model_dump()`.
 - Assertion engine MUST be pure Python and testable without Inspect.
-- MVP assertions are exactly `tool_called`, `tool_not_called`, `output_contains`, `success_is_true`, `trace_complete`, `skill_loaded`, `skill_used`, `skill_not_used`, `skill_applied`, and `skill_not_applied`.
+- MVP assertions are exactly `tool_called`, `tool_not_called`, `output_contains`, `success_is_true`, and `trace_complete`.
 - MVP scorers are exactly `skill_assertion_scorer()` and `trace_integrity_scorer()`.
-- Tool behavior, tool input/output, skill usage, output rules, performance limits, and clarification behavior MUST be modeled as assertion types evaluated by `skill_assertion_scorer()`, not as separate MVP scorers.
-- `SkillInvocation.used` MUST mean the skill was selected/activated, including a successful `read_file` of `SKILL.md`; `SkillInvocation.applied` MUST mean behavior complied with the skill and MAY be `None` when unknown.
-- Baseline vs with-skill impact analysis MUST be implemented later as `comparison.py` / optional `report.py`; Inspect View remains the primary interactive report UI, so do not build custom visual reporting in this MVP.
 - Do not add DeerFlow runtime adapter in this MVP.
 - Do not add LLM-as-judge scorers in this MVP.
-- The only planned real runtime adapter is DeerFlow; the mock runner exists only as the MVP test seam.
 - Keep all implementation under `backend/skill_eval/`, `backend/evals/`, `backend/cases/`, and `backend/tests/skill_eval/`.
 
 ---
@@ -36,7 +32,7 @@ Create:
 - `backend/skill_eval/__init__.py` — package marker and public module docstring.
 - `backend/skill_eval/case_schema.py` — `SkillAssertionSpec`, `SkillEvalCase`, and `AssertionName`.
 - `backend/skill_eval/trace_schema.py` — `AgentToolCall`, `SkillInvocation`, and `AgentTrace`.
-- `backend/skill_eval/agent_runner.py` — `AgentRunRequest`, `AgentRunResult`, `AgentRunner` protocol, and `run_agent()` dispatcher.
+- `backend/skill_eval/agent_runner.py` — `AgentRunResult`, `AgentRunner` protocol, and `run_agent()` dispatcher.
 - `backend/skill_eval/adapters/__init__.py` — adapter package marker.
 - `backend/skill_eval/adapters/mock.py` — deterministic mock runner for MVP evals.
 - `backend/skill_eval/assertion_engine.py` — pure assertion evaluation functions and `AssertionResult`.
@@ -44,7 +40,9 @@ Create:
 - `backend/skill_eval/inspect_solver.py` — `skill_agent_solver()`.
 - `backend/skill_eval/inspect_scorer.py` — `trace_integrity_scorer()` and `skill_assertion_scorer()`.
 - `backend/evals/__init__.py` — eval package marker.
-- `backend/evals/skills_eval.py` — parameterized Inspect task with `mode=baseline|with_skill|all_skills` and optional model-graded QA.
+- `backend/evals/skills_eval.py` — demo Inspect task with optional model-graded QA.
+- `backend/evals/baseline_eval.py` — baseline task using `skills=[]`.
+- `backend/evals/with_skill_eval.py` — with-skill task using case `candidate_skills`.
 - `backend/cases/no_write_todos.jsonl` — demo negative tool case.
 - `backend/cases/gcp_skills.jsonl` — demo output-content case.
 - `backend/tests/skill_eval/test_assertion_engine.py` — assertion engine unit tests.
@@ -149,7 +147,7 @@ def test_agent_trace_captures_normalized_evidence_and_raw_ref():
         final_answer="Done",
         success=True,
         tool_calls=[AgentToolCall(name="bash", args={"cmd": "pwd"})],
-        skill_invocations=[SkillInvocation(name="demo", loaded=True, used=True, applied=None, evidence=["read_file loaded SKILL.md"])],
+        skill_invocations=[SkillInvocation(name="demo", loaded=True, used=False)],
         messages=[{"role": "assistant", "content": "Done"}],
         steps=[{"type": "final"}],
         runtime="mock",
@@ -160,9 +158,6 @@ def test_agent_trace_captures_normalized_evidence_and_raw_ref():
     assert trace.raw_trace_ref == "artifact://trace"
     assert trace.tool_calls[0].name == "bash"
     assert trace.skill_invocations[0].loaded is True
-    assert trace.skill_invocations[0].used is True
-    assert trace.skill_invocations[0].applied is None
-    assert trace.skill_invocations[0].evidence == ["read_file loaded SKILL.md"]
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -194,16 +189,26 @@ from pydantic import BaseModel, Field
 
 
 AssertionName = Literal[
-    "tool_called",
-    "tool_not_called",
-    "output_contains",
-    "success_is_true",
-    "trace_complete",
     "skill_loaded",
     "skill_used",
     "skill_not_used",
-    "skill_applied",
-    "skill_not_applied",
+    "tool_called",
+    "tool_not_called",
+    "tool_args_contains",
+    "tool_args_match",
+    "tool_call_order",
+    "tool_error_absent",
+    "output_contains",
+    "output_not_contains",
+    "regex_match",
+    "json_valid",
+    "success_is_true",
+    "trace_complete",
+    "latency_under",
+    "tokens_under",
+    "tool_count_under",
+    "max_steps_under",
+    "no_unexpected_clarification",
 ]
 
 
@@ -247,9 +252,7 @@ class SkillInvocation(BaseModel):
     path: str | None = None
     loaded: bool = False
     used: bool = False
-    applied: bool | None = None
     trigger_reason: str | None = None
-    evidence: list[str] = Field(default_factory=list)
 
 
 class AgentTrace(BaseModel):
@@ -295,14 +298,14 @@ git commit -m "feat: add skill eval schemas"
 
 **Interfaces:**
 - Consumes: `SkillAssertionSpec`, `AgentTrace`.
-- Produces: `AssertionResult`, `ASSERTION_REGISTRY`, `register_assertion(name)`, and `evaluate_assertion(assertion, trace, final_answer)`.
+- Produces: `AssertionResult` and `evaluate_assertion(assertion, trace, final_answer)`.
 
 - [ ] **Step 1: Add failing assertion tests**
 
 Append these tests to `backend/tests/skill_eval/test_assertion_engine.py`:
 
 ```python
-from skill_eval.assertion_engine import ASSERTION_REGISTRY, evaluate_assertion
+from skill_eval.assertion_engine import evaluate_assertion
 
 
 def _valid_trace(**overrides):
@@ -314,21 +317,6 @@ def _valid_trace(**overrides):
     }
     data.update(overrides)
     return AgentTrace(**data)
-
-
-def test_mvp_assertions_are_registered():
-    assert set(ASSERTION_REGISTRY) == {
-        "tool_called",
-        "tool_not_called",
-        "output_contains",
-        "success_is_true",
-        "trace_complete",
-        "skill_loaded",
-        "skill_used",
-        "skill_not_used",
-        "skill_applied",
-        "skill_not_applied",
-    }
 
 
 def test_tool_called_passes_when_expected_tool_appears():
@@ -467,12 +455,11 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'skill_eval.assertion_
 Create `backend/skill_eval/assertion_engine.py`:
 
 ```python
-from collections.abc import Callable
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-from skill_eval.case_schema import AssertionName, SkillAssertionSpec
+from skill_eval.case_schema import SkillAssertionSpec
 from skill_eval.trace_schema import AgentTrace
 
 
@@ -483,59 +470,48 @@ class AssertionResult(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-AssertionHandler = Callable[[SkillAssertionSpec, AgentTrace, str], AssertionResult]
-ASSERTION_REGISTRY: dict[AssertionName, AssertionHandler] = {}
-
-
-def register_assertion(name: AssertionName) -> Callable[[AssertionHandler], AssertionHandler]:
-    def decorator(handler: AssertionHandler) -> AssertionHandler:
-        ASSERTION_REGISTRY[name] = handler
-        return handler
-
-    return decorator
-
-
 def evaluate_assertion(assertion: SkillAssertionSpec, trace: AgentTrace, final_answer: str) -> AssertionResult:
-    handler = ASSERTION_REGISTRY.get(assertion.name)
-    if handler is None:
-        return _fail(assertion, f"Unsupported assertion in MVP: {assertion.name}")
+    if assertion.name == "tool_called":
+        return evaluate_tool_called(assertion, trace)
+    if assertion.name == "tool_not_called":
+        return evaluate_tool_not_called(assertion, trace)
+    if assertion.name == "output_contains":
+        return evaluate_output_contains(assertion, final_answer)
+    if assertion.name == "success_is_true":
+        return evaluate_success_is_true(assertion, trace)
+    if assertion.name == "trace_complete":
+        return evaluate_trace_complete(assertion, trace)
+    return _fail(assertion, f"Unsupported assertion in MVP: {assertion.name}")
 
-    return handler(assertion, trace, final_answer)
 
-
-@register_assertion("tool_called")
-def evaluate_tool_called(assertion: SkillAssertionSpec, trace: AgentTrace, final_answer: str) -> AssertionResult:
+def evaluate_tool_called(assertion: SkillAssertionSpec, trace: AgentTrace) -> AssertionResult:
     called = any(call.name == assertion.target for call in trace.tool_calls)
     if called:
         return _pass(assertion, f"Tool `{assertion.target}` was called.")
     return _fail(assertion, f"Expected tool `{assertion.target}` to be called.")
 
 
-@register_assertion("tool_not_called")
-def evaluate_tool_not_called(assertion: SkillAssertionSpec, trace: AgentTrace, final_answer: str) -> AssertionResult:
+def evaluate_tool_not_called(assertion: SkillAssertionSpec, trace: AgentTrace) -> AssertionResult:
     called = any(call.name == assertion.target for call in trace.tool_calls)
     if not called:
         return _pass(assertion, f"Tool `{assertion.target}` was not called.")
     return _fail(assertion, f"Forbidden tool `{assertion.target}` was called.")
 
 
-@register_assertion("output_contains")
-def evaluate_output_contains(assertion: SkillAssertionSpec, trace: AgentTrace, final_answer: str) -> AssertionResult:
+def evaluate_output_contains(assertion: SkillAssertionSpec, final_answer: str) -> AssertionResult:
     target = assertion.target or ""
     if target in final_answer:
         return _pass(assertion, f"Output contained `{target}`.")
     return _fail(assertion, f"Expected output to contain `{target}`.")
 
 
-@register_assertion("success_is_true")
-def evaluate_success_is_true(assertion: SkillAssertionSpec, trace: AgentTrace, final_answer: str) -> AssertionResult:
+def evaluate_success_is_true(assertion: SkillAssertionSpec, trace: AgentTrace) -> AssertionResult:
     if trace.success is True:
         return _pass(assertion, "Trace success is true.")
     return _fail(assertion, "Trace success is not true.")
 
 
-@register_assertion("trace_complete")
-def evaluate_trace_complete(assertion: SkillAssertionSpec, trace: AgentTrace, final_answer: str) -> AssertionResult:
+def evaluate_trace_complete(assertion: SkillAssertionSpec, trace: AgentTrace) -> AssertionResult:
     failures: list[str] = []
     if not trace.input:
         failures.append("trace.input is empty")
@@ -736,8 +712,8 @@ git commit -m "feat: add skill case loader"
 - Create: `backend/tests/skill_eval/test_mock_eval.py`
 
 **Interfaces:**
-- Produces: `AgentRunRequest`, `AgentRunResult`, `AgentRunner`, `run_agent()`, `MockAgentRunner`.
-- Later solver task depends on `AgentRunRequest` and `run_agent()`.
+- Produces: `AgentRunResult`, `AgentRunner`, `run_agent()`, `MockAgentRunner`.
+- Later solver task depends on `run_agent()`.
 
 - [ ] **Step 1: Write failing mock runner tests**
 
@@ -747,15 +723,14 @@ Create `backend/tests/skill_eval/test_mock_eval.py`:
 import pytest
 
 from skill_eval.adapters.mock import MockAgentRunner
-from skill_eval.agent_runner import AgentRunRequest, run_agent
+from skill_eval.agent_runner import run_agent
 
 
 @pytest.mark.asyncio
 async def test_mock_runner_returns_agent_trace_for_cloud_run():
     runner = MockAgentRunner()
-    request = AgentRunRequest(user_input="How do I deploy a Cloud Run service?", candidate_skills=["skills/gcp-cloud-run"])
 
-    result = await runner.run(request)
+    result = await runner.run("How do I deploy a Cloud Run service?", skills=["skills/gcp-cloud-run"])
 
     assert result.success is True
     assert "gcloud run deploy" in result.final_answer
@@ -766,20 +741,17 @@ async def test_mock_runner_returns_agent_trace_for_cloud_run():
 
 @pytest.mark.asyncio
 async def test_mock_runner_records_write_todos_when_not_forbidden():
-    request = AgentRunRequest(user_input="Please write todos for this task", forced_skills=[])
-    result = await run_agent(request, runner=MockAgentRunner())
+    result = await run_agent("Please write todos for this task", skills=[], runner=MockAgentRunner())
 
     assert [call.name for call in result.trace.tool_calls] == ["write_todos"]
 
 
 @pytest.mark.asyncio
 async def test_mock_runner_avoids_write_todos_when_user_forbids_it():
-    request = AgentRunRequest(user_input="Create a plan, but do not write todos.", candidate_skills=["skills/no-write-todos-in-pro"])
-    result = await run_agent(request, runner=MockAgentRunner())
+    result = await run_agent("Create a plan, but do not write todos.", skills=["skills/no-write-todos-in-pro"], runner=MockAgentRunner())
 
     assert result.trace.tool_calls == []
     assert result.trace.skill_invocations[0].used is True
-    assert result.trace.skill_invocations[0].applied is None
 ```
 
 - [ ] **Step 2: Run mock tests to verify failure**
@@ -797,22 +769,11 @@ Expected: FAIL with `ModuleNotFoundError` for the runner modules.
 Create `backend/skill_eval/agent_runner.py`:
 
 ```python
-from typing import Any, Protocol
+from typing import Protocol
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from skill_eval.trace_schema import AgentTrace
-
-
-class AgentRunRequest(BaseModel):
-    case_id: str | None = None
-    user_input: str
-    target: str | None = None
-    required_skills: list[str] = Field(default_factory=list)
-    candidate_skills: list[str] = Field(default_factory=list)
-    forced_skills: list[str] | None = None
-    sandbox: str | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentRunResult(BaseModel):
@@ -822,17 +783,17 @@ class AgentRunResult(BaseModel):
 
 
 class AgentRunner(Protocol):
-    async def run(self, request: AgentRunRequest) -> AgentRunResult:
+    async def run(self, user_input: str, skills: list[str], sandbox: str | None = None) -> AgentRunResult:
         raise NotImplementedError
 
 
-async def run_agent(request: AgentRunRequest, runner: AgentRunner | None = None) -> AgentRunResult:
+async def run_agent(user_input: str, skills: list[str], sandbox: str | None = None, runner: AgentRunner | None = None) -> AgentRunResult:
     if runner is None:
         from skill_eval.adapters.mock import MockAgentRunner
 
         runner = MockAgentRunner()
 
-    return await runner.run(request)
+    return await runner.run(user_input=user_input, skills=skills, sandbox=sandbox)
 ```
 
 - [ ] **Step 4: Create adapter package marker**
@@ -848,16 +809,15 @@ Create `backend/skill_eval/adapters/__init__.py`:
 Create `backend/skill_eval/adapters/mock.py`:
 
 ```python
-from skill_eval.agent_runner import AgentRunRequest, AgentRunResult
+from skill_eval.agent_runner import AgentRunResult
 from skill_eval.trace_schema import AgentToolCall, AgentTrace, SkillInvocation
 
 
 class MockAgentRunner:
-    async def run(self, request: AgentRunRequest) -> AgentRunResult:
-        selected_skills = request.forced_skills if request.forced_skills is not None else request.candidate_skills
+    async def run(self, user_input: str, skills: list[str], sandbox: str | None = None) -> AgentRunResult:
         tool_calls: list[AgentToolCall] = []
         final_answer = "Mock answer."
-        lowered = request.user_input.lower()
+        lowered = user_input.lower()
 
         if "cloud run" in lowered:
             final_answer = "Use gcloud run deploy to deploy a Cloud Run service."
@@ -866,7 +826,7 @@ class MockAgentRunner:
             tool_calls.append(AgentToolCall(name="write_todos", args={"items": ["mock plan"]}))
 
         trace = AgentTrace(
-            input=request.user_input,
+            input=user_input,
             final_answer=final_answer,
             success=True,
             tool_calls=tool_calls,
@@ -875,15 +835,13 @@ class MockAgentRunner:
                     name=skill,
                     path=skill,
                     loaded=True,
-                    used=True,
-                    applied=None,
+                    used=bool(skills),
                     trigger_reason="mock runner loaded candidate skill",
-                    evidence=["mock runner selected candidate skill"],
                 )
-                for skill in selected_skills
+                for skill in skills
             ],
             messages=[
-                {"role": "user", "content": request.user_input},
+                {"role": "user", "content": user_input},
                 {"role": "assistant", "content": final_answer},
             ],
             steps=[{"type": "mock_start"}, {"type": "mock_final_answer"}],
@@ -919,8 +877,8 @@ git commit -m "feat: add mock skill eval runner"
 - Modify: `backend/tests/skill_eval/test_mock_eval.py`
 
 **Interfaces:**
-- Consumes: `AgentRunRequest`, `run_agent()`, optional injected `AgentRunner`, `TaskState`.
-- Produces: `skill_agent_solver(agent_runner=None, skills=None, sandbox="docker")`; solver converts Inspect state into a request and leaves skill-selection policy to the runner.
+- Consumes: `run_agent()`, optional injected `AgentRunner`, `TaskState`.
+- Produces: `skill_agent_solver(agent_runner=None, skills=None, sandbox="docker")`.
 
 - [ ] **Step 1: Add failing solver integration test**
 
@@ -943,7 +901,7 @@ async def test_skill_agent_solver_writes_completion_and_trace_metadata():
         target="The answer should mention gcloud run deploy.",
         messages=[],
         output=ModelOutput.from_content(model="mock-model", content=""),
-        metadata={"case": {"id": "cloud-run-001", "input": "How do I deploy a Cloud Run service?", "candidate_skills": ["skills/gcp-cloud-run"]}},
+        metadata={"case": {"candidate_skills": ["skills/gcp-cloud-run"]}},
     )
 
     async def unused_generate(inner_state):
@@ -975,26 +933,16 @@ Create `backend/skill_eval/inspect_solver.py`:
 ```python
 from inspect_ai.solver import Generate, TaskState, solver
 
-from skill_eval.agent_runner import AgentRunner, AgentRunRequest, run_agent
-from skill_eval.case_schema import SkillEvalCase
+from skill_eval.agent_runner import AgentRunner, run_agent
 
 
 @solver
 def skill_agent_solver(agent_runner: AgentRunner | None = None, skills: list[str] | None = None, sandbox: str | None = "docker"):
     async def solve(state: TaskState, generate: Generate) -> TaskState:
-        case = SkillEvalCase.model_validate(state.metadata.get("case", {}))
-        request = AgentRunRequest(
-            case_id=case.id,
-            user_input=state.input_text,
-            target=case.target,
-            required_skills=case.required_skills,
-            candidate_skills=case.candidate_skills,
-            forced_skills=skills,
-            sandbox=sandbox,
-            metadata={"inspect_sample_id": state.sample_id},
-        )
+        case = state.metadata.get("case", {})
+        selected_skills = skills if skills is not None else case.get("candidate_skills", [])
 
-        result = await run_agent(request, runner=agent_runner)
+        result = await run_agent(user_input=state.input_text, skills=selected_skills, sandbox=sandbox, runner=agent_runner)
 
         state.output.completion = result.final_answer
         state.metadata["agent_trace"] = result.trace.model_dump()
@@ -1032,8 +980,8 @@ git commit -m "feat: add inspect skill agent solver"
 - Create: `backend/tests/skill_eval/test_skill_assertion_scorer.py`
 
 **Interfaces:**
-- Consumes: `AgentTrace`, `SkillEvalCase`, `SkillAssertionSpec`, `evaluate_assertion()`.
-- Produces: `trace_integrity_scorer()` and `skill_assertion_scorer()` as thin Inspect wrappers. They parse `TaskState` metadata, delegate all pass/fail rules to `assertion_engine.py`, and format Inspect `Score` objects.
+- Consumes: `AgentTrace`, `SkillEvalCase`, `evaluate_assertion()`.
+- Produces: `trace_integrity_scorer()` and `skill_assertion_scorer()`.
 
 - [ ] **Step 1: Write trace integrity scorer tests**
 
@@ -1233,7 +1181,7 @@ from inspect_ai.scorer import Score, Target, scorer
 from inspect_ai.solver import TaskState
 
 from skill_eval.assertion_engine import evaluate_assertion
-from skill_eval.case_schema import SkillAssertionSpec, SkillEvalCase
+from skill_eval.case_schema import SkillEvalCase
 from skill_eval.trace_schema import AgentTrace
 
 
@@ -1248,17 +1196,19 @@ def trace_integrity_scorer():
         except Exception as exc:
             return Score(value=0.0, explanation=f"Invalid AgentTrace: {exc}")
 
-        result = evaluate_assertion(
-            SkillAssertionSpec(name="trace_complete"),
-            trace,
-            trace.final_answer,
-        )
+        failures: list[str] = []
+        if not trace.input:
+            failures.append("Trace input is empty.")
+        if not trace.final_answer:
+            failures.append("Trace final_answer is empty.")
+        if trace.success is None:
+            failures.append("Trace success is missing.")
+        if not trace.messages and not trace.tool_calls and not trace.steps:
+            failures.append("Trace has no messages, tool calls, or steps.")
+        if any("fatal" in error.lower() for error in trace.errors):
+            failures.append(f"Trace contains fatal errors: {trace.errors}")
 
-        return Score(
-            value=1.0 if result.passed else 0.0,
-            explanation=result.explanation,
-            metadata={"assertion_result": result.model_dump()},
-        )
+        return Score(value=0.0 if failures else 1.0, explanation="\n".join(failures) if failures else "Trace is complete.")
 
     return score
 
@@ -1309,13 +1259,15 @@ git commit -m "feat: add inspect skill eval scorers"
 **Files:**
 - Create: `backend/evals/__init__.py`
 - Create: `backend/evals/skills_eval.py`
+- Create: `backend/evals/baseline_eval.py`
+- Create: `backend/evals/with_skill_eval.py`
 - Create: `backend/cases/no_write_todos.jsonl`
 - Create: `backend/cases/gcp_skills.jsonl`
 - Modify: `backend/tests/skill_eval/test_mock_eval.py`
 
 **Interfaces:**
 - Consumes: loader, solver, scorers.
-- Produces: one runnable Inspect task with explicit `mode=baseline|with_skill|all_skills` plus demo JSONL cases.
+- Produces: runnable Inspect task definitions and demo JSONL cases.
 
 - [ ] **Step 1: Add eval package marker**
 
@@ -1339,7 +1291,7 @@ Create `backend/cases/gcp_skills.jsonl`:
 {"id":"cloud-run-001","input":"How do I deploy a Cloud Run service?","target":"The answer should mention gcloud run deploy.","required_skills":["gcp-cloud-run"],"candidate_skills":["skills/gcp-cloud-run"],"assertions":[{"name":"output_contains","target":"gcloud run deploy"},{"name":"success_is_true"},{"name":"trace_complete"}],"tags":["gcp","cloud-run","answer-quality"],"difficulty":"smoke"}
 ```
 
-- [ ] **Step 3: Implement parameterized skills eval task**
+- [ ] **Step 3: Implement main skills eval task**
 
 Create `backend/evals/skills_eval.py`:
 
@@ -1355,63 +1307,93 @@ from skill_eval.inspect_solver import skill_agent_solver
 
 
 @task
-def skills_eval(case_file: str = "cases/gcp_skills.jsonl", mode: str = "with_skill", skills_folder: str = "skills", use_model_graded_qa: bool = False):
+def skills_eval(case_file: str = "cases/gcp_skills.jsonl", skills_folder: str = "skills", use_model_graded_qa: bool = False):
     samples = load_skill_cases(case_file)
-
-    if mode == "baseline":
-        selected_skills: list[str] | None = []
-    elif mode == "with_skill":
-        selected_skills = None
-    elif mode == "all_skills":
-        skill_files = (Path.cwd() / skills_folder).rglob("SKILL.md")
-        selected_skills = [str(skill_file.parent) for skill_file in skill_files]
-    else:
-        raise ValueError("mode must be one of: baseline, with_skill, all_skills")
+    skill_files = (Path.cwd() / skills_folder).rglob("SKILL.md")
+    all_skills = [str(skill_file.parent) for skill_file in skill_files]
 
     scorers = [trace_integrity_scorer(), skill_assertion_scorer()]
     if use_model_graded_qa:
         scorers.append(model_graded_qa())
 
-    return Task(dataset=samples, solver=skill_agent_solver(skills=selected_skills, sandbox="docker"), scorer=scorers, sandbox="docker")
+    return Task(dataset=samples, solver=skill_agent_solver(skills=all_skills, sandbox="docker"), scorer=scorers, sandbox="docker")
 ```
 
-Command examples:
+- [ ] **Step 4: Implement baseline eval task**
 
-```bash
-inspect eval evals/skills_eval.py -T mode=baseline -T case_file=cases/gcp_skills.jsonl
-inspect eval evals/skills_eval.py -T mode=with_skill -T case_file=cases/gcp_skills.jsonl
-inspect eval evals/skills_eval.py -T mode=all_skills -T case_file=cases/gcp_skills.jsonl
+Create `backend/evals/baseline_eval.py`:
+
+```python
+from inspect_ai import Task, task
+
+from skill_eval.dataset_loader import load_skill_cases
+from skill_eval.inspect_scorer import skill_assertion_scorer, trace_integrity_scorer
+from skill_eval.inspect_solver import skill_agent_solver
+
+
+@task
+def baseline_eval(case_file: str = "cases/gcp_skills.jsonl"):
+    return Task(
+        dataset=load_skill_cases(case_file),
+        solver=skill_agent_solver(skills=[], sandbox="docker"),
+        scorer=[trace_integrity_scorer(), skill_assertion_scorer()],
+        sandbox="docker",
+    )
 ```
 
-- [ ] **Step 4: Add task construction tests**
+- [ ] **Step 5: Implement with-skill eval task**
+
+Create `backend/evals/with_skill_eval.py`:
+
+```python
+from inspect_ai import Task, task
+
+from skill_eval.dataset_loader import load_skill_cases
+from skill_eval.inspect_scorer import skill_assertion_scorer, trace_integrity_scorer
+from skill_eval.inspect_solver import skill_agent_solver
+
+
+@task
+def with_skill_eval(case_file: str = "cases/gcp_skills.jsonl"):
+    return Task(
+        dataset=load_skill_cases(case_file),
+        solver=skill_agent_solver(skills=None, sandbox="docker"),
+        scorer=[trace_integrity_scorer(), skill_assertion_scorer()],
+        sandbox="docker",
+    )
+```
+
+- [ ] **Step 6: Add task construction tests**
 
 Append to `backend/tests/skill_eval/test_mock_eval.py`:
 
 ```python
+from evals.baseline_eval import baseline_eval
 from evals.skills_eval import skills_eval
+from evals.with_skill_eval import with_skill_eval
 
 
-def test_demo_inspect_task_constructs_for_each_mode():
-    assert skills_eval(case_file="cases/gcp_skills.jsonl", mode="baseline").dataset
-    assert skills_eval(case_file="cases/gcp_skills.jsonl", mode="with_skill").dataset
-    assert skills_eval(case_file="cases/gcp_skills.jsonl", mode="all_skills").dataset
+def test_demo_inspect_tasks_construct():
+    assert skills_eval(case_file="cases/gcp_skills.jsonl").dataset
+    assert baseline_eval(case_file="cases/gcp_skills.jsonl").dataset
+    assert with_skill_eval(case_file="cases/gcp_skills.jsonl").dataset
 ```
 
-- [ ] **Step 5: Run demo task construction test**
+- [ ] **Step 7: Run demo task construction test**
 
 Run:
 
 ```bash
-uv run pytest tests/skill_eval/test_mock_eval.py::test_demo_inspect_task_constructs_for_each_mode -v
+uv run pytest tests/skill_eval/test_mock_eval.py::test_demo_inspect_tasks_construct -v
 ```
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add evals cases tests/skill_eval/test_mock_eval.py
-git commit -m "feat: add demo skill eval task"
+git commit -m "feat: add demo skill eval tasks"
 ```
 
 ---
@@ -1469,8 +1451,8 @@ Key boundaries:
 - `Sample.metadata["case"]` stores `SkillEvalCase` behavior expectations.
 - `state.output.completion` stores the agent final answer.
 - `state.metadata["agent_trace"]` stores `AgentTrace.model_dump()`.
-- Generic scorers read `AgentTrace`, not raw DeerFlow or LangGraph messages.
-- `MockAgentRunner` is the MVP runner for testing the Inspect integration before adding the DeerFlow adapter.
+- Generic scorers read `AgentTrace`, not raw LangChain, LangGraph, or DeerFlow messages.
+- `MockAgentRunner` is the MVP runner for testing the Inspect integration before adding a DeerFlow adapter.
 
 Focused tests live in `tests/skill_eval/` and can be run with `uv run pytest tests/skill_eval -v`.
 ```
@@ -1508,7 +1490,7 @@ git commit -m "docs: document skill eval harness"
 - Demo Inspect tasks: Task 8.
 - Mock agent runner: Task 5.
 - Unit tests: Tasks 2 through 9.
-- Baseline/with-skill/all-skills modes on the single Inspect task: Task 8.
+- Baseline/with-skill task entrypoints: Task 8.
 - DeerFlow adapter excluded from MVP: Global Constraints and task scope.
 
 ### Type Consistency
@@ -1516,59 +1498,10 @@ git commit -m "docs: document skill eval harness"
 - `SkillEvalCase.assertions` uses `list[SkillAssertionSpec]` in schema and scorer tests.
 - `AgentTrace.tool_calls` uses `list[AgentToolCall]` in schema and assertion tests.
 - `AgentTrace.skill_invocations` uses `list[SkillInvocation]` in schema and mock runner.
-- `SkillInvocation.used` means selected/activated; `SkillInvocation.applied` means behavior complied and may be `None` before assertion/comparison post-processing.
-- `run_agent()` accepts `request: AgentRunRequest` plus `runner: AgentRunner | None` and is used by `skill_agent_solver()`.
+- `run_agent()` accepts `runner: AgentRunner | None` and is used by `skill_agent_solver()`.
 - `skill_agent_solver()` writes `state.output.completion`, `state.metadata["agent_trace"]`, and `state.metadata["success"]`.
 - `skill_assertion_scorer()` returns per-assertion metadata under `assertion_results`.
 
 ### Placeholder Scan
 
 The plan intentionally contains no unresolved implementation placeholders. Deferred features are explicitly excluded from MVP and named in Global Constraints.
-
-
----
-
-## Post-MVP Roadmap
-
-The following phases are recorded for future planning; they are explicitly out of MVP scope.
-
-### Phase 2: Full Deterministic Assertions
-
-Extend `assertion_engine.py` from 10 to ~20 assertion types. No new Inspect scorers — all new assertions route through `skill_assertion_scorer()`.
-
-| Category | New Assertions |
-|---|---|
-| Tool arguments | `tool_args_contains`, `tool_args_match` |
-| Tool call order | `tool_call_order` |
-| Tool errors | `tool_error_absent` |
-| Tool results | `tool_result_contains`, `tool_result_match` |
-| Tool count | `tool_count_under` |
-| Output rules | `output_not_contains`, `regex_match`, `json_valid` |
-| Performance limits | `latency_under`, `tokens_under`, `max_steps_under` |
-| Clarification guard | `no_unexpected_clarification` |
-
-**Validation:** Unit tests cover pass and fail paths for every assertion type. Assertion result metadata includes matched tool calls, tool result snippets, observed thresholds, and failed skill invocation records.
-
-### Phase 3: DeerFlow Adapter
-
-Add `adapters/deerflow.py` containing two components:
-
-- **`DeerFlowAgentRunner`** — implements `AgentRunner` protocol, calls `DeerFlowClient.stream()` or `agent.ainvoke()` to execute the agent.
-- **`DeerFlowTraceAdapter`** — converts LangChain/LangGraph messages and tool calls into normalized `AgentTrace`, populating `tool_calls`, `skill_invocations`, `messages`, `steps`, `latency_ms`, and token counts.
-
-**Validation:** One smoke eval runs against an embedded DeerFlow client or Gateway. Tool calls and messages appear in `AgentTrace`. Skill activation produces `SkillInvocation` records.
-
-### Phase 4: Reports and Baseline Comparison
-
-Add two offline modules (not Inspect scorers, not replacements for Inspect View):
-
-- **`comparison.py`** — aligns baseline and with-skill eval logs by case id, identifies `improved` / `regressed` / `unchanged-pass` / `unchanged-fail` cases, and reports tool-level impact signals (required tool added, forbidden tool reduced, tool arguments/errors changed).
-- **`report.py`** — optional CI/markdown summary aggregating assertion failures by case, skill, tag, and assertion type.
-
-**Validation:** Single-run report aggregates per dimension. Paired baseline/with-skill report distinguishes `behavior_changed` from `behavior_improved`.
-
-### Phase 5: Optional Model-Graded Evaluation
-
-Use Inspect's `model_graded_qa()` for final-answer semantic grading when a case has a meaningful `target`. Add a custom skill-compliance judge only after deterministic assertions are insufficient for a real case family.
-
-**Validation:** Rule scorers remain usable with no judge model configured. Judge-based checks read `AgentTrace` and case metadata, not raw DeerFlow internals.
