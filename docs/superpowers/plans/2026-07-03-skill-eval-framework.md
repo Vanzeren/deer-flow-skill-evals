@@ -44,9 +44,7 @@ Create:
 - `backend/skill_eval/inspect_solver.py` — `skill_agent_solver()`.
 - `backend/skill_eval/inspect_scorer.py` — `trace_integrity_scorer()` and `skill_assertion_scorer()`.
 - `backend/evals/__init__.py` — eval package marker.
-- `backend/evals/skills_eval.py` — demo Inspect task with optional model-graded QA.
-- `backend/evals/baseline_eval.py` — baseline task using `skills=[]`.
-- `backend/evals/with_skill_eval.py` — with-skill task using case `candidate_skills`.
+- `backend/evals/skills_eval.py` — parameterized Inspect task with `mode=baseline|with_skill|all_skills` and optional model-graded QA.
 - `backend/cases/no_write_todos.jsonl` — demo negative tool case.
 - `backend/cases/gcp_skills.jsonl` — demo output-content case.
 - `backend/tests/skill_eval/test_assertion_engine.py` — assertion engine unit tests.
@@ -1320,15 +1318,13 @@ git commit -m "feat: add inspect skill eval scorers"
 **Files:**
 - Create: `backend/evals/__init__.py`
 - Create: `backend/evals/skills_eval.py`
-- Create: `backend/evals/baseline_eval.py`
-- Create: `backend/evals/with_skill_eval.py`
 - Create: `backend/cases/no_write_todos.jsonl`
 - Create: `backend/cases/gcp_skills.jsonl`
 - Modify: `backend/tests/skill_eval/test_mock_eval.py`
 
 **Interfaces:**
 - Consumes: loader, solver, scorers.
-- Produces: runnable Inspect task definitions and demo JSONL cases.
+- Produces: one runnable Inspect task with explicit `mode=baseline|with_skill|all_skills` plus demo JSONL cases.
 
 - [ ] **Step 1: Add eval package marker**
 
@@ -1352,7 +1348,7 @@ Create `backend/cases/gcp_skills.jsonl`:
 {"id":"cloud-run-001","input":"How do I deploy a Cloud Run service?","target":"The answer should mention gcloud run deploy.","required_skills":["gcp-cloud-run"],"candidate_skills":["skills/gcp-cloud-run"],"assertions":[{"name":"output_contains","target":"gcloud run deploy"},{"name":"success_is_true"},{"name":"trace_complete"}],"tags":["gcp","cloud-run","answer-quality"],"difficulty":"smoke"}
 ```
 
-- [ ] **Step 3: Implement main skills eval task**
+- [ ] **Step 3: Implement parameterized skills eval task**
 
 Create `backend/evals/skills_eval.py`:
 
@@ -1368,93 +1364,63 @@ from skill_eval.inspect_solver import skill_agent_solver
 
 
 @task
-def skills_eval(case_file: str = "cases/gcp_skills.jsonl", skills_folder: str = "skills", use_model_graded_qa: bool = False):
+def skills_eval(case_file: str = "cases/gcp_skills.jsonl", mode: str = "with_skill", skills_folder: str = "skills", use_model_graded_qa: bool = False):
     samples = load_skill_cases(case_file)
-    skill_files = (Path.cwd() / skills_folder).rglob("SKILL.md")
-    all_skills = [str(skill_file.parent) for skill_file in skill_files]
+
+    if mode == "baseline":
+        selected_skills: list[str] | None = []
+    elif mode == "with_skill":
+        selected_skills = None
+    elif mode == "all_skills":
+        skill_files = (Path.cwd() / skills_folder).rglob("SKILL.md")
+        selected_skills = [str(skill_file.parent) for skill_file in skill_files]
+    else:
+        raise ValueError("mode must be one of: baseline, with_skill, all_skills")
 
     scorers = [trace_integrity_scorer(), skill_assertion_scorer()]
     if use_model_graded_qa:
         scorers.append(model_graded_qa())
 
-    return Task(dataset=samples, solver=skill_agent_solver(skills=all_skills, sandbox="docker"), scorer=scorers, sandbox="docker")
+    return Task(dataset=samples, solver=skill_agent_solver(skills=selected_skills, sandbox="docker"), scorer=scorers, sandbox="docker")
 ```
 
-- [ ] **Step 4: Implement baseline eval task**
+Command examples:
 
-Create `backend/evals/baseline_eval.py`:
-
-```python
-from inspect_ai import Task, task
-
-from skill_eval.dataset_loader import load_skill_cases
-from skill_eval.inspect_scorer import skill_assertion_scorer, trace_integrity_scorer
-from skill_eval.inspect_solver import skill_agent_solver
-
-
-@task
-def baseline_eval(case_file: str = "cases/gcp_skills.jsonl"):
-    return Task(
-        dataset=load_skill_cases(case_file),
-        solver=skill_agent_solver(skills=[], sandbox="docker"),
-        scorer=[trace_integrity_scorer(), skill_assertion_scorer()],
-        sandbox="docker",
-    )
+```bash
+inspect eval evals/skills_eval.py -T mode=baseline -T case_file=cases/gcp_skills.jsonl
+inspect eval evals/skills_eval.py -T mode=with_skill -T case_file=cases/gcp_skills.jsonl
+inspect eval evals/skills_eval.py -T mode=all_skills -T case_file=cases/gcp_skills.jsonl
 ```
 
-- [ ] **Step 5: Implement with-skill eval task**
-
-Create `backend/evals/with_skill_eval.py`:
-
-```python
-from inspect_ai import Task, task
-
-from skill_eval.dataset_loader import load_skill_cases
-from skill_eval.inspect_scorer import skill_assertion_scorer, trace_integrity_scorer
-from skill_eval.inspect_solver import skill_agent_solver
-
-
-@task
-def with_skill_eval(case_file: str = "cases/gcp_skills.jsonl"):
-    return Task(
-        dataset=load_skill_cases(case_file),
-        solver=skill_agent_solver(skills=None, sandbox="docker"),
-        scorer=[trace_integrity_scorer(), skill_assertion_scorer()],
-        sandbox="docker",
-    )
-```
-
-- [ ] **Step 6: Add task construction tests**
+- [ ] **Step 4: Add task construction tests**
 
 Append to `backend/tests/skill_eval/test_mock_eval.py`:
 
 ```python
-from evals.baseline_eval import baseline_eval
 from evals.skills_eval import skills_eval
-from evals.with_skill_eval import with_skill_eval
 
 
-def test_demo_inspect_tasks_construct():
-    assert skills_eval(case_file="cases/gcp_skills.jsonl").dataset
-    assert baseline_eval(case_file="cases/gcp_skills.jsonl").dataset
-    assert with_skill_eval(case_file="cases/gcp_skills.jsonl").dataset
+def test_demo_inspect_task_constructs_for_each_mode():
+    assert skills_eval(case_file="cases/gcp_skills.jsonl", mode="baseline").dataset
+    assert skills_eval(case_file="cases/gcp_skills.jsonl", mode="with_skill").dataset
+    assert skills_eval(case_file="cases/gcp_skills.jsonl", mode="all_skills").dataset
 ```
 
-- [ ] **Step 7: Run demo task construction test**
+- [ ] **Step 5: Run demo task construction test**
 
 Run:
 
 ```bash
-uv run pytest tests/skill_eval/test_mock_eval.py::test_demo_inspect_tasks_construct -v
+uv run pytest tests/skill_eval/test_mock_eval.py::test_demo_inspect_task_constructs_for_each_mode -v
 ```
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add evals cases tests/skill_eval/test_mock_eval.py
-git commit -m "feat: add demo skill eval tasks"
+git commit -m "feat: add demo skill eval task"
 ```
 
 ---
@@ -1551,7 +1517,7 @@ git commit -m "docs: document skill eval harness"
 - Demo Inspect tasks: Task 8.
 - Mock agent runner: Task 5.
 - Unit tests: Tasks 2 through 9.
-- Baseline/with-skill task entrypoints: Task 8.
+- Baseline/with-skill/all-skills modes on the single Inspect task: Task 8.
 - DeerFlow adapter excluded from MVP: Global Constraints and task scope.
 
 ### Type Consistency
