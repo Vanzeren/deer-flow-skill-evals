@@ -70,10 +70,6 @@ AgentTrace
 Scorers
   - trace_integrity_scorer
   - skill_assertion_scorer
-  - tool_call_scorer
-  - output_rule_scorer
-  - performance_scorer
-  - optional model-graded scorers
         ↓
 Inspect Eval Log
         ↓
@@ -160,6 +156,8 @@ AssertionName = Literal[
     "tool_args_match",
     "tool_call_order",
     "tool_error_absent",
+    "tool_result_contains",
+    "tool_result_match",
     "output_contains",
     "output_not_contains",
     "regex_match",
@@ -483,7 +481,7 @@ The first implementation must support only these assertions:
 
 ### Later Assertions
 
-Phase 2 and 3 can add:
+Phase 2 can add the remaining deterministic assertions. These stay inside the assertion engine and are executed by `skill_assertion_scorer()` rather than by adding one scorer per concern:
 
 ```text
 skill_loaded
@@ -493,6 +491,8 @@ tool_args_contains
 tool_args_match
 tool_call_order
 tool_error_absent
+tool_result_contains
+tool_result_match
 output_not_contains
 regex_match
 json_valid
@@ -507,33 +507,57 @@ no_unexpected_clarification
 
 ## Inspect Scorers
 
-The scorer layer should be broader than the MVP implementation. The design has three scorer classes:
+The scorer layer is intentionally narrow. The framework has two core Inspect scorers:
 
-1. Rule-based scorers: deterministic checks over `AgentTrace` and final answer text.
-2. Model-graded scorers: LLM-as-judge checks for semantic quality and complex skill compliance.
-3. Comparison scorers: offline comparison across baseline and with-skill eval logs.
+1. `trace_integrity_scorer()` — validates the standardized trace is present and evaluable.
+2. `skill_assertion_scorer()` — executes every declarative `SkillAssertionSpec` through the pure assertion engine.
 
-MVP implements only the two required rule-based scorers because they prove the end-to-end harness. The framework API must still reserve clear slots for the full scorer set below so the first implementation does not collapse everything into one giant scorer.
+Tool behavior, output rules, performance limits, skill loaded/used checks, and clarification checks are assertion types, not separate scorers. This keeps the evaluation semantics in one tested place: `assertion_engine.py`.
+
+Baseline and with-skill impact analysis is also not an Inspect scorer in the MVP design. It is an offline comparison/report module that reads two eval logs or result sets and compares aligned case ids.
 
 ### Scorer Catalog
 
 | Scorer | Class | Input | Output | Implementation phase |
 |---|---|---|---|---|
-| `trace_integrity_scorer()` | Rule-based | `state.metadata["agent_trace"]` | `Score` with trace validity explanation | MVP |
-| `skill_assertion_scorer()` | Rule-based | `state.metadata["case"]`, `state.metadata["agent_trace"]` | `Score` with per-assertion results | MVP |
-| `tool_call_scorer()` | Rule-based | `AgentTrace.tool_calls` plus case assertions | Tool behavior score | Phase 2 |
-| `skill_usage_scorer()` | Rule-based | `AgentTrace.skill_invocations`, required/candidate skills | Skill loading/usage score | Phase 2 |
-| `output_rule_scorer()` | Rule-based | final answer plus output assertions | Output format/content score | Phase 2 |
-| `performance_scorer()` | Rule-based | latency, tokens, steps, tool count | Cost/loop score | Phase 2 |
-| `answer_quality_scorer()` | Model-graded | final answer and `Sample.target` | Semantic answer score | Phase 3 |
-| `skill_compliance_judge_scorer()` | Model-graded | task, skill summary, final answer, trace | Skill compliance score | Phase 3 |
-| `clarification_judge_scorer()` | Model-graded | task, final answer, trace | Clarification necessity score | Phase 3 |
-| `baseline_comparison_scorer()` | Comparison | paired baseline/with-skill records | Improvement/regression classification | Phase 4 |
-| `skill_impact_scorer()` | Comparison | paired traces and score metadata | Behavior-impact score | Phase 4 |
+| `trace_integrity_scorer()` | Rule-based Inspect scorer | `state.metadata["agent_trace"]` | `Score` with trace validity explanation | MVP |
+| `skill_assertion_scorer()` | Rule-based Inspect scorer | `state.metadata["case"]`, `state.metadata["agent_trace"]` | `Score` with per-assertion results | MVP |
 
-### Rule-based Scorers
+Optional future judge scoring should be added only when deterministic assertions cannot express the behavior being evaluated. Final-answer semantic grading can use Inspect's `model_graded_qa()` directly in task definitions; it does not need a custom wrapper in this harness.
 
-#### `trace_integrity_scorer()`
+### Assertion Coverage by Concern
+
+The assertion engine, not separate scorers, owns these checks:
+
+| Concern | Assertion names |
+|---|---|
+| Skill activation and usage | `skill_loaded`, `skill_used`, `skill_not_used` |
+| Tool invocation | `tool_called`, `tool_not_called`, `tool_call_order`, `tool_count_under` |
+| Tool input | `tool_args_contains`, `tool_args_match` |
+| Tool output and failure | `tool_result_contains`, `tool_result_match`, `tool_error_absent` |
+| Final answer rules | `output_contains`, `output_not_contains`, `regex_match`, `json_valid` |
+| Runtime cost and loop guard | `latency_under`, `tokens_under`, `max_steps_under` |
+| Run status and trace validity | `success_is_true`, `trace_complete` |
+| Clarification behavior | `no_unexpected_clarification` |
+
+This means a tool-use case and a performance case can both use the same scorer:
+
+```python
+scorer=[
+    trace_integrity_scorer(),
+    skill_assertion_scorer(),
+]
+```
+
+The difference lives in the case data:
+
+```json
+{"name": "tool_args_contains", "target": "gcloud run deploy"}
+{"name": "tool_result_contains", "target": "Deployment successful"}
+{"name": "tokens_under", "threshold": 4000}
+```
+
+### `trace_integrity_scorer()`
 
 This scorer validates that eval data is trustworthy before behavior scoring. It should be included in every task.
 
@@ -576,7 +600,7 @@ def trace_integrity_scorer():
     return score
 ```
 
-#### `skill_assertion_scorer()`
+### `skill_assertion_scorer()`
 
 This is the main business scorer. It interprets `SkillEvalCase.assertions` by delegating to `assertion_engine.evaluate_assertion()`.
 
@@ -621,203 +645,17 @@ def skill_assertion_scorer():
     return score
 ```
 
-#### `tool_call_scorer()`
+### Model-graded scoring
 
-Purpose: isolate tool behavior from general skill assertions, so tool-call diagnostics can be reported even when final-answer quality passes.
+Use Inspect's built-in `model_graded_qa()` in task definitions when `Sample.target` is a semantic final-answer reference.
 
-Supported assertions:
+Do not add custom LLM-as-judge scorers in the MVP. Add a custom judge later only when deterministic assertions cannot express a skill compliance requirement. That future judge should read the same `AgentTrace` and case metadata, not raw DeerFlow internals.
 
-```text
-tool_called
-tool_not_called
-tool_count_under
-tool_args_contains
-tool_args_match
-tool_call_order
-tool_error_absent
-```
+### Baseline comparison
 
-MVP-equivalent minimum for this scorer in Phase 2:
+Baseline comparison is handled by `comparison.py` and `report.py`, not by an Inspect scorer. It compares baseline and with-skill outputs after both eval runs finish.
 
-```python
-TOOL_ASSERTIONS = {
-    "tool_called",
-    "tool_not_called",
-    "tool_count_under",
-    "tool_error_absent",
-}
-```
-
-Behavior:
-
-- Filter `case.assertions` to tool-related assertions.
-- Evaluate them with the assertion engine.
-- Return `Score(1.0)` only if every tool assertion passes.
-- Include `tool_calls`, failing assertion names, and tool count in metadata.
-
-#### `skill_usage_scorer()`
-
-Purpose: make skill activation and usage visible as first-class metrics instead of burying them inside generic assertions.
-
-Supported checks:
-
-```text
-skill_loaded
-skill_used
-skill_not_used
-required_skill_used
-unexpected_skill_not_used
-skill_trigger_reason_present
-```
-
-Behavior:
-
-- For every `case.required_skills`, require a matching `SkillInvocation` with `loaded=True`.
-- For behavior-sensitive cases, require `used=True` either via explicit assertion or scorer option.
-- Flag skills that are used but not in `required_skills` or `candidate_skills`.
-- Report loaded-only skills separately from used skills.
-
-Initial `used` evidence policy:
-
-```text
-used=True if the adapter records explicit runtime evidence, such as slash activation, skill middleware activation, or a runtime marker.
-used=False if the skill was only passed in `candidate_skills` and no behavior evidence exists.
-```
-
-Later policy can add assertion-derived evidence, such as a skill-specific forbidden-tool assertion passing only in the with-skill run.
-
-#### `output_rule_scorer()`
-
-Purpose: deterministic final-answer checks that should not require a judge model.
-
-Supported assertions:
-
-```text
-output_contains
-output_not_contains
-regex_match
-json_valid
-markdown_contains_section
-command_contains
-```
-
-Behavior:
-
-- Evaluate only output assertions.
-- Preserve final-answer semantic quality for `answer_quality_scorer()`.
-- Use this scorer for CI gates where exact content or structure matters.
-
-#### `performance_scorer()`
-
-Purpose: detect skill-induced loops, excessive tool usage, or excessive context expansion.
-
-Supported assertions:
-
-```text
-latency_under
-tokens_under
-tool_count_under
-max_steps_under
-```
-
-Behavior:
-
-- Fail missing metrics for threshold assertions.
-- Report observed latency, token total, tool count, and step count in metadata.
-- Keep performance failure separate from behavior failure.
-
-### Model-graded Scorers
-
-Model-graded scorers should be optional and never the only source of truth for CI-critical behavior constraints.
-
-#### `answer_quality_scorer()`
-
-Use Inspect's `model_graded_qa()` when `Sample.target` is a semantic answer reference.
-
-Purpose:
-
-- Grade final-answer correctness.
-- Ignore skill usage and tool behavior.
-
-#### `skill_compliance_judge_scorer()`
-
-Purpose: judge complex skill compliance when the skill document contains nuanced process rules that are hard to encode as deterministic assertions.
-
-Inputs:
-
-```text
-user task
-skill summary or selected skill document sections
-final answer
-tool calls
-step summaries
-skill invocation records
-```
-
-Required judge output:
-
-```text
-GRADE: PASS or FAIL
-REASON: concise explanation
-VIOLATIONS: bullet list, empty when PASS
-```
-
-Judgment dimensions:
-
-- Did the agent follow required workflow steps?
-- Did the agent avoid prohibited behavior?
-- Did the agent use the skill only within its intended scope?
-- Did the agent skip a required safety or verification step?
-- Did tool behavior match the skill's instructions?
-
-#### `clarification_judge_scorer()`
-
-Purpose: determine whether a clarification request was necessary.
-
-Rule-based prefilter:
-
-```text
-Can you clarify
-Could you provide more details
-I need more information
-请澄清
-能否提供更多信息
-```
-
-Judge inputs:
-
-```text
-user task
-final answer
-trace messages
-skill instruction about clarification behavior
-```
-
-Pass condition:
-
-- The agent did not ask for clarification; or
-- The task was genuinely underspecified and clarification was required.
-
-### Comparison Scorers
-
-Comparison scorers operate after two eval runs. They are not normal single-sample Inspect scorers unless Inspect log-pair integration is added later.
-
-#### `baseline_comparison_scorer()`
-
-Purpose: classify each case as improved, regressed, unchanged pass, or unchanged fail.
-
-Inputs:
-
-```text
-baseline_score
-with_skill_score
-baseline_trace
-with_skill_trace
-baseline_assertion_results
-with_skill_assertion_results
-```
-
-Outputs:
+Comparison outputs should include:
 
 ```text
 improved
@@ -825,81 +663,32 @@ regressed
 unchanged_pass
 unchanged_fail
 behavior_changed
+behavior_improved
+impact_type: positive | negative | neutral | inconclusive
 ```
 
-#### `skill_impact_scorer()`
-
-Purpose: judge whether the skill changed behavior, independent of whether the final result passed.
-
-Signals:
+Comparison signals include:
 
 ```text
 tool-call sequence changed
 forbidden tool count changed
 required tool appeared
+tool arguments changed
+tool results improved or errors reduced
 final answer changed
 skill-specific output pattern appeared
 latency/token/tool-count changed
 assertion failure type changed
 ```
 
-Output:
-
-```text
-impact_score: 0.0 to 1.0
-impact_type: positive | negative | neutral | inconclusive
-behavior_changed: bool
-behavior_improved: bool
-```
-
-### Scorer Groups
-
-Recommended groupings:
+Recommended single-run scorer setup:
 
 ```python
-# General skill eval
 scorer=[
     trace_integrity_scorer(),
     skill_assertion_scorer(),
-    model_graded_qa(),
-]
-
-# Tool-use eval
-scorer=[
-    trace_integrity_scorer(),
-    tool_call_scorer(),
-    output_rule_scorer(),
-]
-
-# Skill activation eval
-scorer=[
-    trace_integrity_scorer(),
-    skill_usage_scorer(),
-    skill_assertion_scorer(),
-]
-
-# Complex compliance eval
-scorer=[
-    trace_integrity_scorer(),
-    skill_assertion_scorer(),
-    skill_compliance_judge_scorer(),
-]
-
-# Clarification behavior eval
-scorer=[
-    trace_integrity_scorer(),
-    skill_assertion_scorer(),
-    clarification_judge_scorer(),
-]
-
-# Performance eval
-scorer=[
-    trace_integrity_scorer(),
-    performance_scorer(),
 ]
 ```
-
-MVP still implements only `trace_integrity_scorer()` and `skill_assertion_scorer()`. That is an implementation-scope decision, not the full scorer design.
 
 ---
 
@@ -1206,12 +995,12 @@ Validation:
 
 ### Phase 2: Full Deterministic Assertions
 
-Add all rule assertions from `AssertionName`.
+Add the remaining deterministic assertion types to `assertion_engine.py`, including skill usage, tool arguments, tool results, output rules, cost limits, and clarification behavior. Do not add new Inspect scorers for these concerns.
 
 Validation:
 
-- Unit tests for each assertion pass and fail paths.
-- Assertion result metadata includes useful debug details.
+- Unit tests cover pass and fail paths for every assertion type.
+- Assertion result metadata includes useful debug details, especially matched tool calls, tool result snippets, observed thresholds, and failed skill invocation records.
 
 ### Phase 3: DeerFlow Adapter
 
@@ -1225,21 +1014,23 @@ Validation:
 
 ### Phase 4: Reports and Baseline Comparison
 
-Add `report.py` and `comparison.py`.
+Add `report.py` and `comparison.py`. These modules are offline result processors, not Inspect scorers.
 
 Validation:
 
-- Single-run report aggregates assertion failures.
-- Paired baseline/with-skill report identifies improved and regressed cases.
+- Single-run report aggregates assertion failures by case, skill, tag, and assertion type.
+- Paired baseline/with-skill report identifies improved, regressed, unchanged-pass, and unchanged-fail cases.
+- Comparison output distinguishes `behavior_changed` from `behavior_improved`.
+- Tool impact signals include required tool added, forbidden tool reduced, tool arguments changed, tool results improved, and tool errors reduced.
 
-### Phase 5: Model-graded Scorers
+### Phase 5: Optional Model-Graded Evaluation
 
-Add optional judge-based scorers.
+Use Inspect's `model_graded_qa()` for final-answer semantic grading when a case has a meaningful `target`. Add a custom skill-compliance judge only after deterministic assertions are insufficient for a real case family.
 
 Validation:
 
-- Judge prompts return structured grades.
-- Rule scorers remain usable without judge model configuration.
+- Rule scorers remain usable with no judge model configured.
+- Judge-based checks read `AgentTrace` and case metadata, not raw DeerFlow internals.
 
 ---
 
@@ -1354,7 +1145,7 @@ The MVP is complete when:
 The full framework is complete when:
 
 1. DeerFlow runs can be converted into `AgentTrace`.
-2. Rule scorers cover all listed assertion types.
-3. Optional model-graded scorers can evaluate semantic skill compliance.
+2. `skill_assertion_scorer()` covers all listed deterministic assertion types.
+3. Optional model-graded evaluation can assess semantic skill compliance when deterministic assertions are insufficient.
 4. Baseline and with-skill eval logs can be compared by case id.
 5. Reports show pass rates, assertion failure types, skill-level aggregates, improved cases, and regressions.
