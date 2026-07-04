@@ -15,7 +15,7 @@ Inspect AI provides useful eval primitives: datasets, tasks, solvers, scorers, s
 The framework must add a stable skill-eval layer that can answer these questions:
 
 1. Was the expected skill loaded into the agent runtime?
-2. Did the agent behavior show that the skill was used?
+2. Did the agent select the skill by slash activation or by reading `SKILL.md`, and did later behavior apply the skill's rules?
 3. Were required tools called?
 4. Were forbidden tools avoided?
 5. Were tool arguments and tool order consistent with the skill?
@@ -39,7 +39,7 @@ The core value is trace-level behavior evaluation, not simple final-answer gradi
 - The assertion engine is pure Python and testable without Inspect.
 - Deterministic rule scorers and LLM-as-judge scorers are separate.
 - Single-run scoring and baseline comparison are separate.
-- `skill.loaded` and `skill.used` are distinct states.
+- `skill.loaded`, `skill.used`, and `skill.applied` are distinct states: loaded means available in context, used means selected/activated, and applied means behavior complied with the skill.
 - The trace schema is the stable evaluation contract. Runtime adapters may change; generic scorers should not. Adapter-specific diagnostic scorers may inspect raw runtime data, but they must be optional and isolated under adapter modules.
 
 ---
@@ -150,6 +150,8 @@ AssertionName = Literal[
     "skill_loaded",
     "skill_used",
     "skill_not_used",
+    "skill_applied",
+    "skill_not_applied",
     "tool_called",
     "tool_not_called",
     "tool_args_contains",
@@ -197,7 +199,7 @@ Field semantics:
 
 - `input`: User task sent to the agent.
 - `target`: Final-answer reference used by final-answer scorers.
-- `required_skills`: Skills expected to be used for this case.
+- `required_skills`: Skills expected to be selected and applied for this case.
 - `candidate_skills`: Skills the solver may load for this case.
 - `assertions`: Trace-level and output-level behavior checks.
 - `tags`: Filtering and reporting dimensions such as `tool-use`, `negative`, `skill-compliance`.
@@ -223,7 +225,9 @@ class SkillInvocation(BaseModel):
     path: str | None = None
     loaded: bool = False
     used: bool = False
+    applied: bool | None = None
     trigger_reason: str | None = None
+    evidence: list[str] = Field(default_factory=list)
 
 
 class AgentTrace(BaseModel):
@@ -242,7 +246,7 @@ class AgentTrace(BaseModel):
     raw_trace_ref: str | None = None
 ```
 
-`SkillInvocation.loaded` means the skill was loaded into the agent context or runtime. `SkillInvocation.used` means the agent behavior showed evidence of that skill's workflow, policy, or constraints. A skill can be loaded but unused. `AgentTrace.messages` and `AgentTrace.steps` are normalized evaluation evidence, not raw DeerFlow/LangGraph objects. `raw_trace_ref` points to the original Inspect log, DeerFlow run id, artifact, or adapter-specific trace file when deeper debugging needs the raw runtime payload.
+`SkillInvocation.loaded` means the skill content entered the agent context. `SkillInvocation.used` means the agent selected or activated the skill, either through slash activation or a successful `read_file` of that skill's `SKILL.md`. `SkillInvocation.applied` means later behavior complied with the skill's rules; it is `None` when the adapter cannot decide and is usually derived from skill-specific assertions or baseline comparison. A skill can be loaded and used but not applied. `AgentTrace.messages` and `AgentTrace.steps` are normalized evaluation evidence, not raw DeerFlow/LangGraph objects. `raw_trace_ref` points to the original Inspect log, DeerFlow run id, artifact, or adapter-specific trace file when deeper debugging needs the raw runtime payload.
 
 ---
 
@@ -333,7 +337,9 @@ class MockAgentRunner:
                     path=skill,
                     loaded=True,
                     used=bool(skills),
+                    applied=None,
                     trigger_reason="mock runner loaded candidate skill",
+                    evidence=["mock runner selected candidate skill"],
                 )
                 for skill in skills
             ],
@@ -366,8 +372,9 @@ Potential DeerFlow sources:
 | `raw_trace_ref` | DeerFlow run id, Inspect log location, or persisted raw trace artifact. |
 | `messages` | Normalized message records derived from `DeerFlowClient.stream()` events or Gateway run messages. |
 | `tool_calls` | AIMessage tool calls plus ToolMessage outputs. |
-| `skill_invocations.loaded` | Skill activation middleware state, slash activation, loaded skill context, or solver-selected candidate skills. |
-| `skill_invocations.used` | Explicit skill activation plus behavior evidence from assertions or adapter-specific markers. |
+| `skill_invocations.loaded` | Skill content entered context through slash activation, successful skill `read_file`, loaded skill context, or solver-selected mock skill. |
+| `skill_invocations.used` | Explicit slash activation or successful `read_file` of `/mnt/skills/<skill>/SKILL.md`; in DeerFlow, reading `SKILL.md` counts as selecting/using the skill. |
+| `skill_invocations.applied` | Behavior-level conclusion from skill-specific assertions or comparison; default `None` unless there is explicit evidence. |
 | `steps` | Normalized subagent events, run event store events, or streaming custom events. |
 | `latency_ms` | Runner wall-clock timing. |
 | `input_tokens`, `output_tokens` | Token usage metadata or thread token usage API. |
@@ -487,6 +494,8 @@ Phase 2 can add the remaining deterministic assertions. These stay inside the as
 skill_loaded
 skill_used
 skill_not_used
+skill_applied
+skill_not_applied
 tool_args_contains
 tool_args_match
 tool_call_order
@@ -512,7 +521,7 @@ The scorer layer is intentionally narrow. The framework has two core Inspect sco
 1. `trace_integrity_scorer()` — validates the standardized trace is present and evaluable.
 2. `skill_assertion_scorer()` — executes every declarative `SkillAssertionSpec` through the pure assertion engine.
 
-Tool behavior, output rules, performance limits, skill loaded/used checks, and clarification checks are assertion types, not separate scorers. This keeps the evaluation semantics in one tested place: `assertion_engine.py`.
+Tool behavior, output rules, performance limits, skill loaded/used/applied checks, and clarification checks are assertion types, not separate scorers. This keeps the evaluation semantics in one tested place: `assertion_engine.py`.
 
 Baseline and with-skill impact analysis is also not an Inspect scorer in the MVP design. It is an offline comparison/report module that reads two eval logs or result sets and compares aligned case ids.
 
@@ -531,7 +540,7 @@ The assertion engine, not separate scorers, owns these checks:
 
 | Concern | Assertion names |
 |---|---|
-| Skill activation and usage | `skill_loaded`, `skill_used`, `skill_not_used` |
+| Skill activation and usage | `skill_loaded`, `skill_used`, `skill_not_used`, `skill_applied`, `skill_not_applied` |
 | Tool invocation | `tool_called`, `tool_not_called`, `tool_call_order`, `tool_count_under` |
 | Tool input | `tool_args_contains`, `tool_args_match` |
 | Tool output and failure | `tool_result_contains`, `tool_result_match`, `tool_error_absent` |
@@ -895,7 +904,7 @@ Pass rate: 80.0%
 
 By assertion:
 - tool_not_called: 19 / 20
-- skill_used: 14 / 20
+- skill_applied: 14 / 20
 - trace_complete: 20 / 20
 - success_is_true: 17 / 20
 
@@ -1104,11 +1113,11 @@ Decision: add Inspect as a backend dev dependency when implementation starts.
 
 Reason: this is an eval/test harness, not production runtime. It should not increase the core DeerFlow package runtime surface unless later promoted.
 
-### Skill `used` semantics
+### Skill `used` and `applied` semantics
 
-Decision: `used` starts as adapter-provided evidence, then later can be strengthened by assertion-derived evidence or model-graded compliance.
+Decision: `used` means the agent selected the skill, either by slash activation or by successfully reading `/mnt/skills/<skill>/SKILL.md`. `applied` means later behavior complied with the skill's rules and may be derived from skill-specific assertions or baseline comparison.
 
-Reason: `loaded` is usually observable directly; `used` is behavioral and may require runtime markers, trace evidence, and case-specific rules.
+Reason: in DeerFlow, reading `SKILL.md` is the concrete action that selects/uses a skill. Keeping `applied` separate prevents false confidence when the agent reads a skill but then violates its instructions.
 
 ### DeerFlow coupling
 
