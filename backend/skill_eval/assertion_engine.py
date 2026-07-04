@@ -239,6 +239,49 @@ def evaluate_skill_not_applied(assertion: SkillAssertionSpec, trace: AgentTrace,
     return _fail(assertion, f"Expected skill `{assertion.target}` to be explicitly not applied.")
 
 
+@register_assertion("latency_under")
+def evaluate_latency_under(assertion: SkillAssertionSpec, trace: AgentTrace, final_answer: str) -> AssertionResult:
+    error = _threshold(assertion, trace.latency_ms, "latency_ms")
+    if error is not None:
+        return error
+    assert trace.latency_ms is not None and assertion.threshold is not None
+    if trace.latency_ms < assertion.threshold:
+        return _pass(assertion, f"Latency {trace.latency_ms}ms was under {assertion.threshold}ms.", observed=trace.latency_ms, threshold=assertion.threshold)
+    return _fail(assertion, f"Latency {trace.latency_ms}ms was not under {assertion.threshold}ms.", observed=trace.latency_ms, threshold=assertion.threshold)
+
+
+@register_assertion("tokens_under")
+def evaluate_tokens_under(assertion: SkillAssertionSpec, trace: AgentTrace, final_answer: str) -> AssertionResult:
+    observed = None if trace.input_tokens is None and trace.output_tokens is None else (trace.input_tokens or 0) + (trace.output_tokens or 0)
+    error = _threshold(assertion, observed, "token count")
+    if error is not None:
+        return error
+    assert observed is not None and assertion.threshold is not None
+    if observed < assertion.threshold:
+        return _pass(assertion, f"Token count {observed} was under {assertion.threshold}.", observed=observed, threshold=assertion.threshold)
+    return _fail(assertion, f"Token count {observed} was not under {assertion.threshold}.", observed=observed, threshold=assertion.threshold)
+
+
+@register_assertion("max_steps_under")
+def evaluate_max_steps_under(assertion: SkillAssertionSpec, trace: AgentTrace, final_answer: str) -> AssertionResult:
+    observed = len(trace.steps)
+    error = _threshold(assertion, observed, "step count")
+    if error is not None:
+        return error
+    assert assertion.threshold is not None
+    if observed < assertion.threshold:
+        return _pass(assertion, f"Step count {observed} was under {assertion.threshold}.", observed=observed, threshold=assertion.threshold)
+    return _fail(assertion, f"Step count {observed} was not under {assertion.threshold}.", observed=observed, threshold=assertion.threshold)
+
+
+@register_assertion("no_unexpected_clarification")
+def evaluate_no_unexpected_clarification(assertion: SkillAssertionSpec, trace: AgentTrace, final_answer: str) -> AssertionResult:
+    clarification_calls = [call for call in trace.tool_calls if call.name == "ask_clarification"]
+    if not clarification_calls:
+        return _pass(assertion, "No unexpected clarification was requested.")
+    return _fail(assertion, "Unexpected clarification was requested.", clarification_tool_calls=[_tool_call_dump(call) for call in clarification_calls])
+
+
 def _target_skill_invocations(assertion: SkillAssertionSpec, trace: AgentTrace) -> Iterable[SkillInvocation]:
     return (invocation for invocation in trace.skill_invocations if invocation.name == assertion.target)
 
@@ -268,6 +311,14 @@ def _compile_pattern(assertion: SkillAssertionSpec) -> tuple[re.Pattern[str] | N
         return re.compile(pattern), None
     except re.error as exc:
         return None, _fail(assertion, f"Invalid regex `{pattern}`: {exc}", pattern=pattern, error=str(exc))
+
+
+def _threshold(assertion: SkillAssertionSpec, observed: int | float | None, label: str) -> AssertionResult | None:
+    if assertion.threshold is None:
+        return _fail(assertion, f"{assertion.name} requires a threshold.", observed=observed, threshold=None)
+    if observed is None:
+        return _fail(assertion, f"Trace has no observed {label} value.", observed=None, threshold=assertion.threshold)
+    return None
 
 
 def _pass(assertion: SkillAssertionSpec, explanation: str, **metadata: Any) -> AssertionResult:

@@ -23,6 +23,10 @@ AssertionName = Literal[
     "skill_not_used",
     "skill_applied",
     "skill_not_applied",
+    "latency_under",
+    "tokens_under",
+    "max_steps_under",
+    "no_unexpected_clarification",
 ]
 
 

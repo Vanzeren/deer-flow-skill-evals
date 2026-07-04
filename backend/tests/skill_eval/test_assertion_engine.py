@@ -30,6 +30,10 @@ def test_skill_assertion_accepts_only_resolved_assertion_names():
         "tool_result_contains",
         "tool_result_match",
         "tool_count_under",
+        "latency_under",
+        "tokens_under",
+        "max_steps_under",
+        "no_unexpected_clarification",
         "output_contains",
         "output_not_contains",
         "regex_match",
@@ -95,6 +99,10 @@ def test_registered_assertions_match_supported_names():
         "tool_result_contains",
         "tool_result_match",
         "tool_count_under",
+        "latency_under",
+        "tokens_under",
+        "max_steps_under",
+        "no_unexpected_clarification",
         "output_contains",
         "output_not_contains",
         "regex_match",
@@ -644,3 +652,53 @@ def test_tool_count_under_passes_and_fails():
     assert passing.metadata["observed"] == 2
     assert failing.passed is False
     assert failing.metadata["threshold"] == 2
+
+
+def test_latency_under_passes_and_fails():
+    trace = _valid_trace(latency_ms=120)
+
+    passing = evaluate_assertion(SkillAssertionSpec(name="latency_under", threshold=200), trace, trace.final_answer)
+    failing = evaluate_assertion(SkillAssertionSpec(name="latency_under", threshold=100), trace, trace.final_answer)
+
+    assert passing.passed is True
+    assert passing.metadata == {"observed": 120, "threshold": 200}
+    assert failing.passed is False
+
+
+def test_tokens_under_uses_input_plus_output_tokens():
+    trace = _valid_trace(input_tokens=30, output_tokens=20)
+
+    passing = evaluate_assertion(SkillAssertionSpec(name="tokens_under", threshold=60), trace, trace.final_answer)
+    failing = evaluate_assertion(SkillAssertionSpec(name="tokens_under", threshold=50), trace, trace.final_answer)
+
+    assert passing.passed is True
+    assert passing.metadata["observed"] == 50
+    assert failing.passed is False
+
+
+def test_max_steps_under_passes_and_fails():
+    trace = _valid_trace(steps=[{"type": "start"}, {"type": "finish"}])
+
+    passing = evaluate_assertion(SkillAssertionSpec(name="max_steps_under", threshold=3), trace, trace.final_answer)
+    failing = evaluate_assertion(SkillAssertionSpec(name="max_steps_under", threshold=2), trace, trace.final_answer)
+
+    assert passing.passed is True
+    assert passing.metadata["observed"] == 2
+    assert failing.passed is False
+
+
+def test_no_unexpected_clarification_passes_when_absent():
+    trace = _valid_trace(tool_calls=[AgentToolCall(name="bash")])
+
+    result = evaluate_assertion(SkillAssertionSpec(name="no_unexpected_clarification"), trace, trace.final_answer)
+
+    assert result.passed is True
+
+
+def test_no_unexpected_clarification_fails_for_ask_clarification_tool():
+    trace = _valid_trace(tool_calls=[AgentToolCall(name="ask_clarification", args={"question": "Which project?"})])
+
+    result = evaluate_assertion(SkillAssertionSpec(name="no_unexpected_clarification"), trace, trace.final_answer)
+
+    assert result.passed is False
+    assert result.metadata["clarification_tool_calls"][0]["name"] == "ask_clarification"
