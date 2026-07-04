@@ -2,6 +2,8 @@ import pytest
 from inspect_ai.model import ModelOutput
 from inspect_ai.solver import TaskState
 
+from evals.skills_eval import skills_eval
+
 from skill_eval.adapters.mock import MockAgentRunner
 from skill_eval.agent_runner import AgentRunRequest, run_agent
 from skill_eval.inspect_solver import skill_agent_solver
@@ -61,3 +63,9 @@ async def test_skill_agent_solver_writes_completion_and_trace_metadata():
     assert result_state.metadata["success"] is True
     assert result_state.metadata["agent_trace"]["runtime"] == "mock"
     assert result_state.metadata["agent_trace"]["skill_invocations"][0]["name"] == "skills/gcp-cloud-run"
+
+
+def test_demo_inspect_task_constructs_for_each_mode():
+    assert skills_eval(case_file="cases/gcp_skills.jsonl", mode="baseline").dataset
+    assert skills_eval(case_file="cases/gcp_skills.jsonl", mode="with_skill").dataset
+    assert skills_eval(case_file="cases/gcp_skills.jsonl", mode="all_skills").dataset
