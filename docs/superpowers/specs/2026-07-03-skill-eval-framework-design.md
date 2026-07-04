@@ -82,7 +82,7 @@ optional later: comparison.py / report.py
 |---|---|
 | `SkillEvalCase` | Data-driven user input, target answer, expected skills, assertions, tags, difficulty. |
 | Inspect dataset | Converts JSONL cases into Inspect `Sample` objects. |
-| Inspect task | Wires dataset, solver, scorers, and sandbox. |
+| Inspect task | Wires dataset, solver, scorers, sandbox, and explicit run mode (`baseline`, `with_skill`, or `all_skills`). |
 | Custom solver | Calls the configured agent runner and stores final answer plus standardized trace. |
 | Agent runner | Executes the concrete runtime for this project: mock for MVP tests, then DeerFlow for real evals. |
 | Runtime adapter | Converts runtime-native messages/events into `AgentTrace`. |
@@ -115,8 +115,6 @@ backend/skill_eval/
 
 backend/evals/
   skills_eval.py
-  baseline_eval.py
-  with_skill_eval.py
 
 backend/cases/
   no_write_todos.jsonl
@@ -787,13 +785,21 @@ from skill_eval.inspect_solver import skill_agent_solver
 @task
 def skills_eval(
     case_file: str = "cases/gcp_skills.jsonl",
+    mode: str = "with_skill",
     skills_folder: str = "skills",
     use_model_graded_qa: bool = False,
 ):
     samples = load_skill_cases(case_file)
 
-    skill_files = (Path.cwd() / skills_folder).rglob("SKILL.md")
-    all_skills = [str(skill_file.parent) for skill_file in skill_files]
+    if mode == "baseline":
+        selected_skills: list[str] | None = []
+    elif mode == "with_skill":
+        selected_skills = None
+    elif mode == "all_skills":
+        skill_files = (Path.cwd() / skills_folder).rglob("SKILL.md")
+        selected_skills = [str(skill_file.parent) for skill_file in skill_files]
+    else:
+        raise ValueError("mode must be one of: baseline, with_skill, all_skills")
 
     scorers = [
         trace_integrity_scorer(),
@@ -805,28 +811,38 @@ def skills_eval(
 
     return Task(
         dataset=samples,
-        solver=skill_agent_solver(skills=all_skills, sandbox="docker"),
+        solver=skill_agent_solver(skills=selected_skills, sandbox="docker"),
         scorer=scorers,
         sandbox="docker",
     )
 ```
 
-`baseline_eval.py` uses `skills=[]`.
+Modes are selected from the command line, not by editing JSONL cases:
 
-`with_skill_eval.py` uses `skills=None`, passing case `candidate_skills` through `AgentRunRequest` so the runner can select them.
+```bash
+inspect eval evals/skills_eval.py -T mode=baseline -T case_file=cases/gcp_skills.jsonl
+inspect eval evals/skills_eval.py -T mode=with_skill -T case_file=cases/gcp_skills.jsonl
+inspect eval evals/skills_eval.py -T mode=all_skills -T case_file=cases/gcp_skills.jsonl
+```
+
+`baseline` uses `skills=[]`.
+
+`with_skill` uses `skills=None`, passing case `candidate_skills` through `AgentRunRequest` so the runner can select them.
+
+`all_skills` scans `skills_folder` for `SKILL.md` and passes every discovered skill path to the solver.
 
 ---
 
 ## Baseline vs With-skill Comparison
 
-Single with-skill evals prove whether a skilled agent passed. They do not prove the skill caused the improvement. The framework must support paired runs:
+Single with-skill evals prove whether a skilled agent passed. They do not prove the skill caused the improvement. Later paired comparison support should use two explicit eval commands:
 
 ```text
-Run A: baseline agent, skills=[]
-Run B: with-skill agent, skills=case.candidate_skills
+Run A: inspect eval evals/skills_eval.py -T mode=baseline ...
+Run B: inspect eval evals/skills_eval.py -T mode=with_skill ...
 ```
 
-The comparison module aligns records by case id.
+The later comparison module aligns records by case id. The MVP does not auto-run both modes and does not require hand-editing cases to switch modes.
 
 ### Comparison Outcomes
 
