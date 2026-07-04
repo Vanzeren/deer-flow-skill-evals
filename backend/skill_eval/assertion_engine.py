@@ -1,3 +1,5 @@
+import json
+import re
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -56,6 +58,37 @@ def evaluate_output_contains(assertion: SkillAssertionSpec, trace: AgentTrace, f
     if target in final_answer:
         return _pass(assertion, f"Output contained `{target}`.")
     return _fail(assertion, f"Expected output to contain `{target}`.")
+
+
+@register_assertion("output_not_contains")
+def evaluate_output_not_contains(assertion: SkillAssertionSpec, trace: AgentTrace, final_answer: str) -> AssertionResult:
+    target = assertion.target or ""
+    if target not in final_answer:
+        return _pass(assertion, f"Output did not contain `{target}`.", target=target)
+    return _fail(assertion, f"Forbidden output `{target}` was present.", target=target)
+
+
+@register_assertion("regex_match")
+def evaluate_regex_match(assertion: SkillAssertionSpec, trace: AgentTrace, final_answer: str) -> AssertionResult:
+    pattern = assertion.target or ""
+    try:
+        match = re.search(pattern, final_answer)
+    except re.error as exc:
+        return _fail(assertion, f"Invalid regex `{pattern}`: {exc}", pattern=pattern, error=str(exc))
+
+    if match:
+        return _pass(assertion, f"Output matched regex `{pattern}`.", pattern=pattern, match=match.group(0))
+    return _fail(assertion, f"Expected output to match regex `{pattern}`.", pattern=pattern)
+
+
+@register_assertion("json_valid")
+def evaluate_json_valid(assertion: SkillAssertionSpec, trace: AgentTrace, final_answer: str) -> AssertionResult:
+    try:
+        parsed = json.loads(final_answer)
+    except json.JSONDecodeError as exc:
+        return _fail(assertion, f"Expected output to be valid JSON: {exc}", error=str(exc))
+
+    return _pass(assertion, "Output is valid JSON.", json_type=type(parsed).__name__)
 
 
 @register_assertion("success_is_true")
