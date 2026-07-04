@@ -801,6 +801,7 @@ Key boundaries:
 - `state.metadata["agent_trace"]` stores `AgentTrace.model_dump()`.
 - Generic scorers read `AgentTrace`, not raw DeerFlow or LangGraph messages.
 - `MockAgentRunner` is the MVP runner for testing the Inspect integration before adding the DeerFlow adapter.
+- Phase 2 deterministic assertions extend the same pure assertion engine for tool arguments/results/errors/order/count, output rules, runtime limits, and unexpected clarification checks; no additional Inspect scorers are introduced for these checks.
 
 Focused tests live in `tests/skill_eval/` and can be run with `uv run pytest tests/skill_eval -v`.
 
