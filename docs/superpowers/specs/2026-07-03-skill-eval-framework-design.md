@@ -31,7 +31,7 @@ The core value is trace-level behavior evaluation, not simple final-answer gradi
 
 - Inspect is the eval runner, not the owner of skill semantics.
 - The solver executes the agent and writes standardized trace metadata.
-- Scorers evaluate behavior from `AgentTrace`, not raw LangChain, LangGraph, or DeerFlow messages.
+- Generic scorers evaluate behavior from `AgentTrace`, not raw LangChain, LangGraph, or DeerFlow messages; raw runtime data remains adapter input and debug evidence.
 - `Sample.target` remains the final-answer reference.
 - `Sample.metadata["case"]` carries behavior expectations.
 - `state.output.completion` stores the final answer.
@@ -40,7 +40,7 @@ The core value is trace-level behavior evaluation, not simple final-answer gradi
 - Deterministic rule scorers and LLM-as-judge scorers are separate.
 - Single-run scoring and baseline comparison are separate.
 - `skill.loaded` and `skill.used` are distinct states.
-- The trace schema is the stable contract. Runtime adapters may change; scorers should not.
+- The trace schema is the stable evaluation contract. Runtime adapters may change; generic scorers should not. Adapter-specific diagnostic scorers may inspect raw runtime data, but they must be optional and isolated under adapter modules.
 
 ---
 
@@ -242,9 +242,11 @@ class AgentTrace(BaseModel):
     input_tokens: int | None = None
     output_tokens: int | None = None
     steps: list[dict[str, Any]] = Field(default_factory=list)
+    runtime: str | None = None
+    raw_trace_ref: str | None = None
 ```
 
-`SkillInvocation.loaded` means the skill was loaded into the agent context or runtime. `SkillInvocation.used` means the agent behavior showed evidence of that skill's workflow, policy, or constraints. A skill can be loaded but unused.
+`SkillInvocation.loaded` means the skill was loaded into the agent context or runtime. `SkillInvocation.used` means the agent behavior showed evidence of that skill's workflow, policy, or constraints. A skill can be loaded but unused. `AgentTrace.messages` and `AgentTrace.steps` are normalized evaluation evidence, not raw LangChain/LangGraph/DeerFlow objects. `raw_trace_ref` points to the original Inspect log, DeerFlow run id, artifact, or adapter-specific trace file when deeper debugging needs the raw runtime payload.
 
 ---
 
@@ -364,16 +366,18 @@ Potential DeerFlow sources:
 
 | `AgentTrace` field | DeerFlow source |
 |---|---|
-| `messages` | `DeerFlowClient.stream()` events or Gateway run messages. |
+| `runtime` | Constant such as `deerflow-embedded` or `deerflow-gateway`. |
+| `raw_trace_ref` | DeerFlow run id, Inspect log location, or persisted raw trace artifact. |
+| `messages` | Normalized message records derived from `DeerFlowClient.stream()` events or Gateway run messages. |
 | `tool_calls` | AIMessage tool calls plus ToolMessage outputs. |
 | `skill_invocations.loaded` | Skill activation middleware state, slash activation, loaded skill context, or solver-selected candidate skills. |
 | `skill_invocations.used` | Explicit skill activation plus behavior evidence from assertions or adapter-specific markers. |
-| `steps` | Subagent events, run event store events, or streaming custom events. |
+| `steps` | Normalized subagent events, run event store events, or streaming custom events. |
 | `latency_ms` | Runner wall-clock timing. |
 | `input_tokens`, `output_tokens` | Token usage metadata or thread token usage API. |
 | `errors` | Tool errors, model errors, run failures. |
 
-The scorer must not read these DeerFlow-native structures directly.
+Generic scorers must not parse DeerFlow-native structures directly. If a DeerFlow-only diagnostic check needs raw payloads, it belongs in an optional adapter-specific module such as `skill_eval/adapters/deerflow_scorer.py`, not in the generic scorer set.
 
 ---
 
@@ -1322,6 +1326,12 @@ Reason: `loaded` is usually observable directly; `used` is behavioral and may re
 Decision: keep DeerFlow coupling inside `skill_eval/adapters/deerflow.py`.
 
 Reason: scorers must remain reusable for LangChain or other agents.
+
+### AgentTrace versus raw runtime messages
+
+Decision: generic scorers read `AgentTrace`; raw LangChain, LangGraph, and DeerFlow payloads are preserved by reference through `raw_trace_ref` and may be used only by optional adapter-specific diagnostics.
+
+Reason: `AgentTrace` keeps rule scorers portable across runtimes and makes baseline comparison possible across different agent implementations. Raw runtime payloads are still needed for debugging and adapter validation, but making them the primary scorer interface would couple evaluation semantics to one agent framework.
 
 ### Baseline comparison timing
 
