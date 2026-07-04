@@ -36,7 +36,7 @@ Create:
 - `backend/skill_eval/__init__.py` — package marker and public module docstring.
 - `backend/skill_eval/case_schema.py` — `SkillAssertionSpec`, `SkillEvalCase`, and `AssertionName`.
 - `backend/skill_eval/trace_schema.py` — `AgentToolCall`, `SkillInvocation`, and `AgentTrace`.
-- `backend/skill_eval/agent_runner.py` — `AgentRunResult`, `AgentRunner` protocol, and `run_agent()` dispatcher.
+- `backend/skill_eval/agent_runner.py` — `AgentRunRequest`, `AgentRunResult`, `AgentRunner` protocol, and `run_agent()` dispatcher.
 - `backend/skill_eval/adapters/__init__.py` — adapter package marker.
 - `backend/skill_eval/adapters/mock.py` — deterministic mock runner for MVP evals.
 - `backend/skill_eval/assertion_engine.py` — pure assertion evaluation functions and `AssertionResult`.
@@ -725,8 +725,8 @@ git commit -m "feat: add skill case loader"
 - Create: `backend/tests/skill_eval/test_mock_eval.py`
 
 **Interfaces:**
-- Produces: `AgentRunResult`, `AgentRunner`, `run_agent()`, `MockAgentRunner`.
-- Later solver task depends on `run_agent()`.
+- Produces: `AgentRunRequest`, `AgentRunResult`, `AgentRunner`, `run_agent()`, `MockAgentRunner`.
+- Later solver task depends on `AgentRunRequest` and `run_agent()`.
 
 - [ ] **Step 1: Write failing mock runner tests**
 
@@ -736,14 +736,15 @@ Create `backend/tests/skill_eval/test_mock_eval.py`:
 import pytest
 
 from skill_eval.adapters.mock import MockAgentRunner
-from skill_eval.agent_runner import run_agent
+from skill_eval.agent_runner import AgentRunRequest, run_agent
 
 
 @pytest.mark.asyncio
 async def test_mock_runner_returns_agent_trace_for_cloud_run():
     runner = MockAgentRunner()
+    request = AgentRunRequest(user_input="How do I deploy a Cloud Run service?", candidate_skills=["skills/gcp-cloud-run"])
 
-    result = await runner.run("How do I deploy a Cloud Run service?", skills=["skills/gcp-cloud-run"])
+    result = await runner.run(request)
 
     assert result.success is True
     assert "gcloud run deploy" in result.final_answer
@@ -754,14 +755,16 @@ async def test_mock_runner_returns_agent_trace_for_cloud_run():
 
 @pytest.mark.asyncio
 async def test_mock_runner_records_write_todos_when_not_forbidden():
-    result = await run_agent("Please write todos for this task", skills=[], runner=MockAgentRunner())
+    request = AgentRunRequest(user_input="Please write todos for this task", forced_skills=[])
+    result = await run_agent(request, runner=MockAgentRunner())
 
     assert [call.name for call in result.trace.tool_calls] == ["write_todos"]
 
 
 @pytest.mark.asyncio
 async def test_mock_runner_avoids_write_todos_when_user_forbids_it():
-    result = await run_agent("Create a plan, but do not write todos.", skills=["skills/no-write-todos-in-pro"], runner=MockAgentRunner())
+    request = AgentRunRequest(user_input="Create a plan, but do not write todos.", candidate_skills=["skills/no-write-todos-in-pro"])
+    result = await run_agent(request, runner=MockAgentRunner())
 
     assert result.trace.tool_calls == []
     assert result.trace.skill_invocations[0].used is True
@@ -783,11 +786,22 @@ Expected: FAIL with `ModuleNotFoundError` for the runner modules.
 Create `backend/skill_eval/agent_runner.py`:
 
 ```python
-from typing import Protocol
+from typing import Any, Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from skill_eval.trace_schema import AgentTrace
+
+
+class AgentRunRequest(BaseModel):
+    case_id: str | None = None
+    user_input: str
+    target: str | None = None
+    required_skills: list[str] = Field(default_factory=list)
+    candidate_skills: list[str] = Field(default_factory=list)
+    forced_skills: list[str] | None = None
+    sandbox: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentRunResult(BaseModel):
@@ -797,17 +811,17 @@ class AgentRunResult(BaseModel):
 
 
 class AgentRunner(Protocol):
-    async def run(self, user_input: str, skills: list[str], sandbox: str | None = None) -> AgentRunResult:
+    async def run(self, request: AgentRunRequest) -> AgentRunResult:
         raise NotImplementedError
 
 
-async def run_agent(user_input: str, skills: list[str], sandbox: str | None = None, runner: AgentRunner | None = None) -> AgentRunResult:
+async def run_agent(request: AgentRunRequest, runner: AgentRunner | None = None) -> AgentRunResult:
     if runner is None:
         from skill_eval.adapters.mock import MockAgentRunner
 
         runner = MockAgentRunner()
 
-    return await runner.run(user_input=user_input, skills=skills, sandbox=sandbox)
+    return await runner.run(request)
 ```
 
 - [ ] **Step 4: Create adapter package marker**
@@ -823,15 +837,16 @@ Create `backend/skill_eval/adapters/__init__.py`:
 Create `backend/skill_eval/adapters/mock.py`:
 
 ```python
-from skill_eval.agent_runner import AgentRunResult
+from skill_eval.agent_runner import AgentRunRequest, AgentRunResult
 from skill_eval.trace_schema import AgentToolCall, AgentTrace, SkillInvocation
 
 
 class MockAgentRunner:
-    async def run(self, user_input: str, skills: list[str], sandbox: str | None = None) -> AgentRunResult:
+    async def run(self, request: AgentRunRequest) -> AgentRunResult:
+        selected_skills = request.forced_skills if request.forced_skills is not None else request.candidate_skills
         tool_calls: list[AgentToolCall] = []
         final_answer = "Mock answer."
-        lowered = user_input.lower()
+        lowered = request.user_input.lower()
 
         if "cloud run" in lowered:
             final_answer = "Use gcloud run deploy to deploy a Cloud Run service."
@@ -840,7 +855,7 @@ class MockAgentRunner:
             tool_calls.append(AgentToolCall(name="write_todos", args={"items": ["mock plan"]}))
 
         trace = AgentTrace(
-            input=user_input,
+            input=request.user_input,
             final_answer=final_answer,
             success=True,
             tool_calls=tool_calls,
@@ -849,15 +864,15 @@ class MockAgentRunner:
                     name=skill,
                     path=skill,
                     loaded=True,
-                    used=bool(skills),
+                    used=True,
                     applied=None,
                     trigger_reason="mock runner loaded candidate skill",
                     evidence=["mock runner selected candidate skill"],
                 )
-                for skill in skills
+                for skill in selected_skills
             ],
             messages=[
-                {"role": "user", "content": user_input},
+                {"role": "user", "content": request.user_input},
                 {"role": "assistant", "content": final_answer},
             ],
             steps=[{"type": "mock_start"}, {"type": "mock_final_answer"}],
@@ -893,8 +908,8 @@ git commit -m "feat: add mock skill eval runner"
 - Modify: `backend/tests/skill_eval/test_mock_eval.py`
 
 **Interfaces:**
-- Consumes: `run_agent()`, optional injected `AgentRunner`, `TaskState`.
-- Produces: `skill_agent_solver(agent_runner=None, skills=None, sandbox="docker")`.
+- Consumes: `AgentRunRequest`, `run_agent()`, optional injected `AgentRunner`, `TaskState`.
+- Produces: `skill_agent_solver(agent_runner=None, skills=None, sandbox="docker")`; solver converts Inspect state into a request and leaves skill-selection policy to the runner.
 
 - [ ] **Step 1: Add failing solver integration test**
 
@@ -917,7 +932,7 @@ async def test_skill_agent_solver_writes_completion_and_trace_metadata():
         target="The answer should mention gcloud run deploy.",
         messages=[],
         output=ModelOutput.from_content(model="mock-model", content=""),
-        metadata={"case": {"candidate_skills": ["skills/gcp-cloud-run"]}},
+        metadata={"case": {"id": "cloud-run-001", "input": "How do I deploy a Cloud Run service?", "candidate_skills": ["skills/gcp-cloud-run"]}},
     )
 
     async def unused_generate(inner_state):
@@ -949,16 +964,26 @@ Create `backend/skill_eval/inspect_solver.py`:
 ```python
 from inspect_ai.solver import Generate, TaskState, solver
 
-from skill_eval.agent_runner import AgentRunner, run_agent
+from skill_eval.agent_runner import AgentRunner, AgentRunRequest, run_agent
+from skill_eval.case_schema import SkillEvalCase
 
 
 @solver
 def skill_agent_solver(agent_runner: AgentRunner | None = None, skills: list[str] | None = None, sandbox: str | None = "docker"):
     async def solve(state: TaskState, generate: Generate) -> TaskState:
-        case = state.metadata.get("case", {})
-        selected_skills = skills if skills is not None else case.get("candidate_skills", [])
+        case = SkillEvalCase.model_validate(state.metadata.get("case", {}))
+        request = AgentRunRequest(
+            case_id=case.id,
+            user_input=state.input_text,
+            target=case.target,
+            required_skills=case.required_skills,
+            candidate_skills=case.candidate_skills,
+            forced_skills=skills,
+            sandbox=sandbox,
+            metadata={"inspect_sample_id": state.sample_id},
+        )
 
-        result = await run_agent(user_input=state.input_text, skills=selected_skills, sandbox=sandbox, runner=agent_runner)
+        result = await run_agent(request, runner=agent_runner)
 
         state.output.completion = result.final_answer
         state.metadata["agent_trace"] = result.trace.model_dump()
@@ -1515,7 +1540,7 @@ git commit -m "docs: document skill eval harness"
 - `AgentTrace.tool_calls` uses `list[AgentToolCall]` in schema and assertion tests.
 - `AgentTrace.skill_invocations` uses `list[SkillInvocation]` in schema and mock runner.
 - `SkillInvocation.used` means selected/activated; `SkillInvocation.applied` means behavior complied and may be `None` before assertion/comparison post-processing.
-- `run_agent()` accepts `runner: AgentRunner | None` and is used by `skill_agent_solver()`.
+- `run_agent()` accepts `request: AgentRunRequest` plus `runner: AgentRunner | None` and is used by `skill_agent_solver()`.
 - `skill_agent_solver()` writes `state.output.completion`, `state.metadata["agent_trace"]`, and `state.metadata["success"]`.
 - `skill_assertion_scorer()` returns per-assertion metadata under `assertion_results`.
 
