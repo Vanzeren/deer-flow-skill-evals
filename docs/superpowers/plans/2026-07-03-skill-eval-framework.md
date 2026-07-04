@@ -1524,3 +1524,51 @@ git commit -m "docs: document skill eval harness"
 ### Placeholder Scan
 
 The plan intentionally contains no unresolved implementation placeholders. Deferred features are explicitly excluded from MVP and named in Global Constraints.
+
+
+---
+
+## Post-MVP Roadmap
+
+The following phases are recorded for future planning; they are explicitly out of MVP scope.
+
+### Phase 2: Full Deterministic Assertions
+
+Extend `assertion_engine.py` from 10 to ~20 assertion types. No new Inspect scorers — all new assertions route through `skill_assertion_scorer()`.
+
+| Category | New Assertions |
+|---|---|
+| Tool arguments | `tool_args_contains`, `tool_args_match` |
+| Tool call order | `tool_call_order` |
+| Tool errors | `tool_error_absent` |
+| Tool results | `tool_result_contains`, `tool_result_match` |
+| Tool count | `tool_count_under` |
+| Output rules | `output_not_contains`, `regex_match`, `json_valid` |
+| Performance limits | `latency_under`, `tokens_under`, `max_steps_under` |
+| Clarification guard | `no_unexpected_clarification` |
+
+**Validation:** Unit tests cover pass and fail paths for every assertion type. Assertion result metadata includes matched tool calls, tool result snippets, observed thresholds, and failed skill invocation records.
+
+### Phase 3: DeerFlow Adapter
+
+Add `adapters/deerflow.py` containing two components:
+
+- **`DeerFlowAgentRunner`** — implements `AgentRunner` protocol, calls `DeerFlowClient.stream()` or `agent.ainvoke()` to execute the agent.
+- **`DeerFlowTraceAdapter`** — converts LangChain/LangGraph messages and tool calls into normalized `AgentTrace`, populating `tool_calls`, `skill_invocations`, `messages`, `steps`, `latency_ms`, and token counts.
+
+**Validation:** One smoke eval runs against an embedded DeerFlow client or Gateway. Tool calls and messages appear in `AgentTrace`. Skill activation produces `SkillInvocation` records.
+
+### Phase 4: Reports and Baseline Comparison
+
+Add two offline modules (not Inspect scorers, not replacements for Inspect View):
+
+- **`comparison.py`** — aligns baseline and with-skill eval logs by case id, identifies `improved` / `regressed` / `unchanged-pass` / `unchanged-fail` cases, and reports tool-level impact signals (required tool added, forbidden tool reduced, tool arguments/errors changed).
+- **`report.py`** — optional CI/markdown summary aggregating assertion failures by case, skill, tag, and assertion type.
+
+**Validation:** Single-run report aggregates per dimension. Paired baseline/with-skill report distinguishes `behavior_changed` from `behavior_improved`.
+
+### Phase 5: Optional Model-Graded Evaluation
+
+Use Inspect's `model_graded_qa()` for final-answer semantic grading when a case has a meaningful `target`. Add a custom skill-compliance judge only after deterministic assertions are insufficient for a real case family.
+
+**Validation:** Rule scorers remain usable with no judge model configured. Judge-based checks read `AgentTrace` and case metadata, not raw DeerFlow internals.
