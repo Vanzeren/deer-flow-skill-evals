@@ -19,6 +19,8 @@
 - Assertion engine MUST be pure Python and testable without Inspect.
 - MVP assertions are exactly `tool_called`, `tool_not_called`, `output_contains`, `success_is_true`, and `trace_complete`.
 - MVP scorers are exactly `skill_assertion_scorer()` and `trace_integrity_scorer()`.
+- Tool behavior, tool input/output, skill usage, output rules, performance limits, and clarification behavior MUST be modeled as assertion types evaluated by `skill_assertion_scorer()`, not as separate MVP scorers.
+- Baseline vs with-skill impact analysis MUST be implemented later as `comparison.py` / `report.py`, not as an Inspect scorer.
 - Do not add DeerFlow runtime adapter in this MVP.
 - Do not add LLM-as-judge scorers in this MVP.
 - The only planned real runtime adapter is DeerFlow; the mock runner exists only as the MVP test seam.
