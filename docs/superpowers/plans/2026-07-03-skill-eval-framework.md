@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Generic scorers MUST evaluate `AgentTrace`, not raw LangChain, LangGraph, or DeerFlow messages.
+- Generic scorers MUST evaluate `AgentTrace`, not raw DeerFlow or LangGraph messages.
 - Raw runtime data MUST remain adapter input or debug evidence through `AgentTrace.raw_trace_ref`.
 - `Sample.target` MUST hold final-answer reference text.
 - `Sample.metadata["case"]` MUST hold behavior expectations.
@@ -21,6 +21,7 @@
 - MVP scorers are exactly `skill_assertion_scorer()` and `trace_integrity_scorer()`.
 - Do not add DeerFlow runtime adapter in this MVP.
 - Do not add LLM-as-judge scorers in this MVP.
+- The only planned real runtime adapter is DeerFlow; the mock runner exists only as the MVP test seam.
 - Keep all implementation under `backend/skill_eval/`, `backend/evals/`, `backend/cases/`, and `backend/tests/skill_eval/`.
 
 ---
@@ -1451,8 +1452,8 @@ Key boundaries:
 - `Sample.metadata["case"]` stores `SkillEvalCase` behavior expectations.
 - `state.output.completion` stores the agent final answer.
 - `state.metadata["agent_trace"]` stores `AgentTrace.model_dump()`.
-- Generic scorers read `AgentTrace`, not raw LangChain, LangGraph, or DeerFlow messages.
-- `MockAgentRunner` is the MVP runner for testing the Inspect integration before adding a DeerFlow adapter.
+- Generic scorers read `AgentTrace`, not raw DeerFlow or LangGraph messages.
+- `MockAgentRunner` is the MVP runner for testing the Inspect integration before adding the DeerFlow adapter.
 
 Focused tests live in `tests/skill_eval/` and can be run with `uv run pytest tests/skill_eval -v`.
 ```
