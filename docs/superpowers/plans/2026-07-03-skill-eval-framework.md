@@ -1021,8 +1021,8 @@ git commit -m "feat: add inspect skill agent solver"
 - Create: `backend/tests/skill_eval/test_skill_assertion_scorer.py`
 
 **Interfaces:**
-- Consumes: `AgentTrace`, `SkillEvalCase`, `evaluate_assertion()`.
-- Produces: `trace_integrity_scorer()` and `skill_assertion_scorer()`.
+- Consumes: `AgentTrace`, `SkillEvalCase`, `SkillAssertionSpec`, `evaluate_assertion()`.
+- Produces: `trace_integrity_scorer()` and `skill_assertion_scorer()` as thin Inspect wrappers. They parse `TaskState` metadata, delegate all pass/fail rules to `assertion_engine.py`, and format Inspect `Score` objects.
 
 - [ ] **Step 1: Write trace integrity scorer tests**
 
@@ -1222,7 +1222,7 @@ from inspect_ai.scorer import Score, Target, scorer
 from inspect_ai.solver import TaskState
 
 from skill_eval.assertion_engine import evaluate_assertion
-from skill_eval.case_schema import SkillEvalCase
+from skill_eval.case_schema import SkillAssertionSpec, SkillEvalCase
 from skill_eval.trace_schema import AgentTrace
 
 
@@ -1237,19 +1237,17 @@ def trace_integrity_scorer():
         except Exception as exc:
             return Score(value=0.0, explanation=f"Invalid AgentTrace: {exc}")
 
-        failures: list[str] = []
-        if not trace.input:
-            failures.append("Trace input is empty.")
-        if not trace.final_answer:
-            failures.append("Trace final_answer is empty.")
-        if trace.success is None:
-            failures.append("Trace success is missing.")
-        if not trace.messages and not trace.tool_calls and not trace.steps:
-            failures.append("Trace has no messages, tool calls, or steps.")
-        if any("fatal" in error.lower() for error in trace.errors):
-            failures.append(f"Trace contains fatal errors: {trace.errors}")
+        result = evaluate_assertion(
+            SkillAssertionSpec(name="trace_complete"),
+            trace,
+            trace.final_answer,
+        )
 
-        return Score(value=0.0 if failures else 1.0, explanation="\n".join(failures) if failures else "Trace is complete.")
+        return Score(
+            value=1.0 if result.passed else 0.0,
+            explanation=result.explanation,
+            metadata={"assertion_result": result.model_dump()},
+        )
 
     return score
 

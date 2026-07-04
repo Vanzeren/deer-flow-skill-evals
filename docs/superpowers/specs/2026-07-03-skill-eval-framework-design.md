@@ -509,12 +509,14 @@ no_unexpected_clarification
 
 ## Inspect Scorers
 
-The scorer layer is intentionally narrow. The framework has two core Inspect scorers:
+The scorer layer is intentionally narrow. Inspect scorers are framework wrappers only: they read `TaskState`, validate/parse metadata, call the pure assertion engine, and convert `AssertionResult` objects into Inspect `Score` objects.
 
-1. `trace_integrity_scorer()` — validates the standardized trace is present and evaluable.
+The framework has two core Inspect wrappers:
+
+1. `trace_integrity_scorer()` — evaluates the built-in `trace_complete` assertion against `state.metadata["agent_trace"]`.
 2. `skill_assertion_scorer()` — executes every declarative `SkillAssertionSpec` through the pure assertion engine.
 
-Tool behavior, output rules, performance limits, skill loaded/used/applied checks, and clarification checks are assertion types, not separate scorers. This keeps the evaluation semantics in one tested place: `assertion_engine.py`.
+Tool behavior, output rules, performance limits, skill loaded/used/applied checks, trace completeness, and clarification checks are assertion types, not scorer business logic. This keeps evaluation semantics in one tested place: `assertion_engine.py`.
 
 Baseline and with-skill impact analysis is also not an Inspect scorer in the MVP design. It is an offline comparison/report module that reads two eval logs or result sets and compares aligned case ids.
 
@@ -561,12 +563,14 @@ The difference lives in the case data:
 
 ### `trace_integrity_scorer()`
 
-This scorer validates that eval data is trustworthy before behavior scoring. It should be included in every task.
+This scorer is a convenience wrapper for the `trace_complete` assertion. It should be included in every task, but it must not duplicate trace validation rules outside the assertion engine.
 
 ```python
 from inspect_ai.scorer import Score, Target, scorer
 from inspect_ai.solver import TaskState
 
+from skill_eval.assertion_engine import evaluate_assertion
+from skill_eval.case_schema import SkillAssertionSpec
 from skill_eval.trace_schema import AgentTrace
 
 
@@ -581,22 +585,16 @@ def trace_integrity_scorer():
         except Exception as exc:
             return Score(value=0.0, explanation=f"Invalid AgentTrace: {exc}")
 
-        failures = []
-
-        if not trace.input:
-            failures.append("Trace input is empty.")
-        if not trace.final_answer:
-            failures.append("Trace final_answer is empty.")
-        if trace.success is None:
-            failures.append("Trace success is missing.")
-        if not trace.messages and not trace.tool_calls and not trace.steps:
-            failures.append("Trace has no messages, tool calls, or steps.")
-        if any("fatal" in error.lower() for error in trace.errors):
-            failures.append(f"Trace contains fatal errors: {trace.errors}")
+        result = evaluate_assertion(
+            SkillAssertionSpec(name="trace_complete"),
+            trace,
+            trace.final_answer,
+        )
 
         return Score(
-            value=0.0 if failures else 1.0,
-            explanation="\n".join(failures) if failures else "Trace is complete.",
+            value=1.0 if result.passed else 0.0,
+            explanation=result.explanation,
+            metadata={"assertion_result": result.model_dump()},
         )
 
     return score
@@ -604,7 +602,7 @@ def trace_integrity_scorer():
 
 ### `skill_assertion_scorer()`
 
-This is the main business scorer. It interprets `SkillEvalCase.assertions` by delegating to `assertion_engine.evaluate_assertion()`.
+This scorer is the Inspect adapter for case assertions. It contains framework glue only: metadata parsing, assertion-engine dispatch, and `Score` formatting.
 
 ```python
 from inspect_ai.scorer import Score, Target, scorer
