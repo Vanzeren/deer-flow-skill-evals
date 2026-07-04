@@ -24,6 +24,9 @@ def test_skill_assertion_accepts_only_resolved_mvp_and_skill_names():
         "tool_called",
         "tool_not_called",
         "output_contains",
+        "output_not_contains",
+        "regex_match",
+        "json_valid",
         "success_is_true",
         "trace_complete",
         "skill_loaded",
@@ -37,7 +40,7 @@ def test_skill_assertion_accepts_only_resolved_mvp_and_skill_names():
     assert SkillAssertionSpec(name="skill_used").name == "skill_used"
 
     with pytest.raises(ValidationError):
-        SkillAssertionSpec(name="regex_match")
+        SkillAssertionSpec(name="unknown_assertion")
 
 
 def test_agent_trace_captures_normalized_evidence_and_raw_ref():
@@ -78,6 +81,9 @@ def test_mvp_assertions_are_registered():
         "tool_called",
         "tool_not_called",
         "output_contains",
+        "output_not_contains",
+        "regex_match",
+        "json_valid",
         "success_is_true",
         "trace_complete",
         "skill_loaded",
