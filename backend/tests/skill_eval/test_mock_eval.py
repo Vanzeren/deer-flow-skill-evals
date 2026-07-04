@@ -3,10 +3,10 @@ from inspect_ai.model import ModelOutput
 from inspect_ai.solver import TaskState
 
 from evals.skills_eval import skills_eval
-
 from skill_eval.adapters.mock import MockAgentRunner
 from skill_eval.agent_runner import AgentRunRequest, run_agent
 from skill_eval.inspect_solver import skill_agent_solver
+
 
 @pytest.mark.asyncio
 async def test_mock_runner_returns_agent_trace_for_cloud_run():

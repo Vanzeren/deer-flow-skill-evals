@@ -790,6 +790,20 @@ make test
 PYTHONPATH=. uv run pytest tests/test_<feature>.py -v
 ```
 
+### Skill Evaluation Harness
+
+`skill_eval/` is a backend-local Inspect AI evaluation harness for skill-based agent behavior. It is not part of the publishable `deerflow-harness` package. The MVP path is JSONL cases → Inspect `Sample` → `skill_agent_solver()` → `AgentRunResult` → normalized `AgentTrace` → rule scorers.
+
+Key boundaries:
+- `Sample.target` stores final-answer references.
+- `Sample.metadata["case"]` stores `SkillEvalCase` behavior expectations.
+- `state.output.completion` stores the agent final answer.
+- `state.metadata["agent_trace"]` stores `AgentTrace.model_dump()`.
+- Generic scorers read `AgentTrace`, not raw DeerFlow or LangGraph messages.
+- `MockAgentRunner` is the MVP runner for testing the Inspect integration before adding the DeerFlow adapter.
+
+Focused tests live in `tests/skill_eval/` and can be run with `uv run pytest tests/skill_eval -v`.
+
 ### Running the Full Application
 
 From the **project root** directory:

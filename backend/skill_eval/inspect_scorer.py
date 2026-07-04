@@ -31,6 +31,7 @@ def trace_integrity_scorer():
 
     return score
 
+
 @scorer(metrics=[])
 def skill_assertion_scorer():
     async def score(state: TaskState, target: Target) -> Score:
