@@ -419,14 +419,17 @@ def skill_agent_solver(
 
 ## Assertion Engine
 
-`assertion_engine.py` is pure Python. It accepts `SkillAssertionSpec`, `AgentTrace`, and final answer text, then returns an `AssertionResult`.
+`assertion_engine.py` is pure Python. It accepts `SkillAssertionSpec`, `AgentTrace`, and final answer text, then returns an `AssertionResult`. Assertion dispatch uses a simple static registry so adding an assertion means adding a handler plus a registration decorator, not editing a central `if/elif` chain.
+
+This is intentionally not a full expression DSL: no `AND`/`OR` parser, no dynamic plugin discovery, and no per-skill runtime registration in the MVP.
 
 ```python
+from collections.abc import Callable
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-from skill_eval.case_schema import SkillAssertionSpec
+from skill_eval.case_schema import AssertionName, SkillAssertionSpec
 from skill_eval.trace_schema import AgentTrace
 
 
@@ -437,26 +440,32 @@ class AssertionResult(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+AssertionHandler = Callable[[SkillAssertionSpec, AgentTrace, str], AssertionResult]
+ASSERTION_REGISTRY: dict[AssertionName, AssertionHandler] = {}
+
+
+def register_assertion(name: AssertionName) -> Callable[[AssertionHandler], AssertionHandler]:
+    def decorator(handler: AssertionHandler) -> AssertionHandler:
+        ASSERTION_REGISTRY[name] = handler
+        return handler
+
+    return decorator
+
+
 def evaluate_assertion(
     assertion: SkillAssertionSpec,
     trace: AgentTrace,
     final_answer: str,
 ) -> AssertionResult:
-    if assertion.name == "tool_called":
-        return evaluate_tool_called(assertion, trace)
-    if assertion.name == "tool_not_called":
-        return evaluate_tool_not_called(assertion, trace)
-    if assertion.name == "output_contains":
-        return evaluate_output_contains(assertion, final_answer)
-    if assertion.name == "success_is_true":
-        return evaluate_success_is_true(assertion, trace)
-    if assertion.name == "trace_complete":
-        return evaluate_trace_complete(assertion, trace)
-    return AssertionResult(
-        name=assertion.name,
-        passed=False,
-        explanation=f"Unsupported assertion in MVP: {assertion.name}",
-    )
+    handler = ASSERTION_REGISTRY.get(assertion.name)
+    if handler is None:
+        return AssertionResult(
+            name=assertion.name,
+            passed=False,
+            explanation=f"Unsupported assertion in MVP: {assertion.name}",
+        )
+
+    return handler(assertion, trace, final_answer)
 ```
 
 ### MVP Assertions
@@ -470,6 +479,8 @@ The first implementation must support only these assertions:
 | `output_contains` | `target in final_answer`. |
 | `success_is_true` | `trace.success is True`. |
 | `trace_complete` | Required trace fields are present and no fatal errors. |
+
+Each MVP rule is implemented as an `@register_assertion("<name>")` handler. `evaluate_assertion()` is only the registry lookup and unsupported-assertion fallback.
 
 `trace_complete` passes when:
 
