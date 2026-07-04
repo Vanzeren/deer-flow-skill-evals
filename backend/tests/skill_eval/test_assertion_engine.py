@@ -575,6 +575,19 @@ def test_tool_error_absent_passes_and_fails():
     assert failing.metadata["errored_tool_calls"][0]["error"] == "permission denied"
 
 
+def test_tool_error_absent_ignores_unrelated_errors_when_target_absent():
+    trace = _valid_trace(tool_calls=[AgentToolCall(name="read_file", error="file missing")])
+
+    result = evaluate_assertion(
+        SkillAssertionSpec(name="tool_error_absent", target="bash"),
+        trace,
+        trace.final_answer,
+    )
+
+    assert result.passed is True
+    assert result.metadata["checked_tool_calls"] == []
+
+
 def test_tool_result_contains_passes_and_fails():
     trace = _valid_trace(tool_calls=[AgentToolCall(name="bash", result="Deployment successful")])
 
