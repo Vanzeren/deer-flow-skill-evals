@@ -5,6 +5,13 @@ from pydantic import BaseModel, Field
 AssertionName = Literal[
     "tool_called",
     "tool_not_called",
+    "tool_args_contains",
+    "tool_args_match",
+    "tool_call_order",
+    "tool_error_absent",
+    "tool_result_contains",
+    "tool_result_match",
+    "tool_count_under",
     "output_contains",
     "output_not_contains",
     "regex_match",

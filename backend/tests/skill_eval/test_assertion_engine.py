@@ -19,10 +19,17 @@ def test_skill_eval_case_defaults():
     assert case.difficulty == "normal"
 
 
-def test_skill_assertion_accepts_only_resolved_mvp_and_skill_names():
+def test_skill_assertion_accepts_only_resolved_assertion_names():
     allowed_names = {
         "tool_called",
         "tool_not_called",
+        "tool_args_contains",
+        "tool_args_match",
+        "tool_call_order",
+        "tool_error_absent",
+        "tool_result_contains",
+        "tool_result_match",
+        "tool_count_under",
         "output_contains",
         "output_not_contains",
         "regex_match",
@@ -37,7 +44,8 @@ def test_skill_assertion_accepts_only_resolved_mvp_and_skill_names():
     }
 
     assert set(get_args(AssertionName)) == allowed_names
-    assert SkillAssertionSpec(name="skill_used").name == "skill_used"
+    for assertion_name in allowed_names:
+        assert SkillAssertionSpec(name=assertion_name).name == assertion_name
 
     with pytest.raises(ValidationError):
         SkillAssertionSpec(name="unknown_assertion")
@@ -76,10 +84,17 @@ def _valid_trace(**overrides):
     return AgentTrace(**data)
 
 
-def test_mvp_assertions_are_registered():
+def test_registered_assertions_match_supported_names():
     assert set(ASSERTION_REGISTRY) == {
         "tool_called",
         "tool_not_called",
+        "tool_args_contains",
+        "tool_args_match",
+        "tool_call_order",
+        "tool_error_absent",
+        "tool_result_contains",
+        "tool_result_match",
+        "tool_count_under",
         "output_contains",
         "output_not_contains",
         "regex_match",
@@ -475,3 +490,144 @@ def test_json_valid_passes_and_fails():
     assert passing.metadata["json_type"] == "dict"
     assert failing.passed is False
     assert "error" in failing.metadata
+
+
+def test_tool_args_contains_passes_and_fails():
+    trace = _valid_trace(tool_calls=[AgentToolCall(name="bash", args={"cmd": "gcloud run deploy app"})])
+
+    passing = evaluate_assertion(
+        SkillAssertionSpec(name="tool_args_contains", target="gcloud run deploy"),
+        trace,
+        trace.final_answer,
+    )
+    failing = evaluate_assertion(
+        SkillAssertionSpec(name="tool_args_contains", target="kubectl apply"),
+        trace,
+        trace.final_answer,
+    )
+
+    assert passing.passed is True
+    assert passing.metadata["matched_tool_call"]["name"] == "bash"
+    assert failing.passed is False
+
+
+def test_tool_args_match_passes_and_fails():
+    trace = _valid_trace(tool_calls=[AgentToolCall(name="bash", args={"cmd": "gcloud run deploy app"})])
+
+    passing = evaluate_assertion(
+        SkillAssertionSpec(name="tool_args_match", target=r"gcloud\s+run\s+deploy"),
+        trace,
+        trace.final_answer,
+    )
+    failing = evaluate_assertion(
+        SkillAssertionSpec(name="tool_args_match", target=r"kubectl\s+apply"),
+        trace,
+        trace.final_answer,
+    )
+
+    assert passing.passed is True
+    assert passing.metadata["pattern"] == r"gcloud\s+run\s+deploy"
+    assert failing.passed is False
+
+
+def test_tool_call_order_passes_and_fails():
+    trace = _valid_trace(
+        tool_calls=[
+            AgentToolCall(name="read_file"),
+            AgentToolCall(name="bash"),
+            AgentToolCall(name="present_files"),
+        ]
+    )
+
+    passing = evaluate_assertion(
+        SkillAssertionSpec(name="tool_call_order", target="read_file,bash"),
+        trace,
+        trace.final_answer,
+    )
+    failing = evaluate_assertion(
+        SkillAssertionSpec(name="tool_call_order", target="bash,read_file"),
+        trace,
+        trace.final_answer,
+    )
+
+    assert passing.passed is True
+    assert passing.metadata["observed_order"] == ["read_file", "bash", "present_files"]
+    assert failing.passed is False
+
+
+def test_tool_error_absent_passes_and_fails():
+    clean_trace = _valid_trace(tool_calls=[AgentToolCall(name="bash", error=None)])
+    failing_trace = _valid_trace(tool_calls=[AgentToolCall(name="bash", error="permission denied")])
+
+    passing = evaluate_assertion(
+        SkillAssertionSpec(name="tool_error_absent", target="bash"),
+        clean_trace,
+        clean_trace.final_answer,
+    )
+    failing = evaluate_assertion(
+        SkillAssertionSpec(name="tool_error_absent", target="bash"),
+        failing_trace,
+        failing_trace.final_answer,
+    )
+
+    assert passing.passed is True
+    assert failing.passed is False
+    assert failing.metadata["errored_tool_calls"][0]["error"] == "permission denied"
+
+
+def test_tool_result_contains_passes_and_fails():
+    trace = _valid_trace(tool_calls=[AgentToolCall(name="bash", result="Deployment successful")])
+
+    passing = evaluate_assertion(
+        SkillAssertionSpec(name="tool_result_contains", target="successful"),
+        trace,
+        trace.final_answer,
+    )
+    failing = evaluate_assertion(
+        SkillAssertionSpec(name="tool_result_contains", target="failed"),
+        trace,
+        trace.final_answer,
+    )
+
+    assert passing.passed is True
+    assert passing.metadata["matched_tool_call"]["name"] == "bash"
+    assert failing.passed is False
+
+
+def test_tool_result_match_passes_and_fails():
+    trace = _valid_trace(tool_calls=[AgentToolCall(name="bash", result="revision rev-42 ready")])
+
+    passing = evaluate_assertion(
+        SkillAssertionSpec(name="tool_result_match", target=r"rev-\d+"),
+        trace,
+        trace.final_answer,
+    )
+    failing = evaluate_assertion(
+        SkillAssertionSpec(name="tool_result_match", target=r"error:\s+"),
+        trace,
+        trace.final_answer,
+    )
+
+    assert passing.passed is True
+    assert passing.metadata["match"] == "rev-42"
+    assert failing.passed is False
+
+
+def test_tool_count_under_passes_and_fails():
+    trace = _valid_trace(tool_calls=[AgentToolCall(name="bash"), AgentToolCall(name="read_file")])
+
+    passing = evaluate_assertion(
+        SkillAssertionSpec(name="tool_count_under", threshold=3),
+        trace,
+        trace.final_answer,
+    )
+    failing = evaluate_assertion(
+        SkillAssertionSpec(name="tool_count_under", threshold=2),
+        trace,
+        trace.final_answer,
+    )
+
+    assert passing.passed is True
+    assert passing.metadata["observed"] == 2
+    assert failing.passed is False
+    assert failing.metadata["threshold"] == 2
