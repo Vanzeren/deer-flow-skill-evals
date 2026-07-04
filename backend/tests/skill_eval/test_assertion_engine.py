@@ -396,3 +396,76 @@ def test_skill_not_applied_fails_when_target_invocation_is_absent():
     )
 
     assert result.passed is False
+
+
+def test_output_not_contains_passes_and_fails():
+    trace = _valid_trace(final_answer="Safe deployment complete")
+
+    passing = evaluate_assertion(
+        SkillAssertionSpec(name="output_not_contains", target="password"),
+        trace,
+        trace.final_answer,
+    )
+    failing = evaluate_assertion(
+        SkillAssertionSpec(name="output_not_contains", target="deployment"),
+        trace,
+        trace.final_answer,
+    )
+
+    assert passing.passed is True
+    assert failing.passed is False
+    assert failing.metadata["target"] == "deployment"
+
+
+def test_regex_match_passes_and_fails():
+    trace = _valid_trace(final_answer="Run id: abc-123")
+
+    passing = evaluate_assertion(
+        SkillAssertionSpec(name="regex_match", target=r"[a-z]+-\d+"),
+        trace,
+        trace.final_answer,
+    )
+    failing = evaluate_assertion(
+        SkillAssertionSpec(name="regex_match", target=r"^done$"),
+        trace,
+        trace.final_answer,
+    )
+
+    assert passing.passed is True
+    assert passing.metadata["pattern"] == r"[a-z]+-\d+"
+    assert failing.passed is False
+
+
+def test_regex_match_fails_invalid_pattern():
+    trace = _valid_trace(final_answer="answer")
+
+    result = evaluate_assertion(
+        SkillAssertionSpec(name="regex_match", target="["),
+        trace,
+        trace.final_answer,
+    )
+
+    assert result.passed is False
+    assert "Invalid regex" in result.explanation
+    assert "error" in result.metadata
+
+
+def test_json_valid_passes_and_fails():
+    valid_trace = _valid_trace(final_answer='{"status":"ok"}')
+    invalid_trace = _valid_trace(final_answer="not json")
+
+    passing = evaluate_assertion(
+        SkillAssertionSpec(name="json_valid"),
+        valid_trace,
+        valid_trace.final_answer,
+    )
+    failing = evaluate_assertion(
+        SkillAssertionSpec(name="json_valid"),
+        invalid_trace,
+        invalid_trace.final_answer,
+    )
+
+    assert passing.passed is True
+    assert passing.metadata["json_type"] == "dict"
+    assert failing.passed is False
+    assert "error" in failing.metadata
