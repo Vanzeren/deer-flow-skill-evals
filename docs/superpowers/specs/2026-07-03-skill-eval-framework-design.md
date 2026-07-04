@@ -73,7 +73,7 @@ Scorers
         ↓
 Inspect Eval Log
         ↓
-report.py / comparison.py
+optional later: comparison.py / report.py
 ```
 
 ### Layer Responsibilities
@@ -89,8 +89,8 @@ report.py / comparison.py
 | `AgentTrace` | Stable representation of messages, tool calls, skill invocation, steps, errors, latency, tokens. |
 | Assertion engine | Converts declarative assertions into pass/fail results. |
 | Inspect scorer | Converts assertion results into Inspect `Score`. |
-| Report module | Aggregates scores, failures, assertion pass rates, and skill pass rates. |
-| Comparison module | Aligns baseline and with-skill runs by case id and reports impact. |
+| Optional offline report module | Later-only CI/markdown summary over Inspect eval logs; not a replacement for Inspect View. |
+| Optional comparison module | Later-only alignment of baseline and with-skill runs by case id to report impact. |
 
 ---
 
@@ -106,8 +106,8 @@ backend/skill_eval/
   dataset_loader.py
   inspect_solver.py
   inspect_scorer.py
-  report.py
-  comparison.py
+  report.py        # later: offline CI/markdown summaries, not MVP visualization
+  comparison.py    # later: baseline vs with-skill diffing
   adapters/
     __init__.py
     mock.py
@@ -529,7 +529,7 @@ The framework has two core Inspect wrappers:
 
 Tool behavior, output rules, performance limits, skill loaded/used/applied checks, trace completeness, and clarification checks are assertion types, not scorer business logic. This keeps evaluation semantics in one tested place: `assertion_engine.py`.
 
-Baseline and with-skill impact analysis is also not an Inspect scorer in the MVP design. It is an offline comparison/report module that reads two eval logs or result sets and compares aligned case ids.
+Baseline and with-skill impact analysis is also not an Inspect scorer in the MVP design. Inspect's own log viewer remains the primary interactive report UI for scorer output; later `comparison.py` / `report.py` may read two eval logs or result sets to produce offline CI summaries and aligned baseline deltas.
 
 ### Scorer Catalog
 
@@ -664,7 +664,7 @@ Do not add custom LLM-as-judge scorers in the MVP. Add a custom judge later only
 
 ### Baseline comparison
 
-Baseline comparison is handled by `comparison.py` and `report.py`, not by an Inspect scorer. It compares baseline and with-skill outputs after both eval runs finish.
+Later baseline comparison is handled by `comparison.py`; optional `report.py` can format its outputs for CI or markdown summaries. Neither is an MVP Inspect scorer.
 
 Comparison outputs should include:
 
@@ -894,6 +894,10 @@ most_common_with_skill_failures
 
 ## Report Design
 
+Inspect already provides the primary interactive report surface: `inspect view` can visualize eval logs, sample transcripts, scoring decisions, and metadata written by solvers/scorers. Do not build a duplicate visual report layer for MVP.
+
+`report.py` is a later optional offline summarizer for CI or saved markdown/text summaries. It reads Inspect eval logs or comparison outputs and aggregates skill-specific failure patterns that are awkward to compare manually across runs.
+
 ### Single Eval Report
 
 ```text
@@ -1025,7 +1029,7 @@ Validation:
 
 ### Phase 4: Reports and Baseline Comparison
 
-Add `report.py` and `comparison.py`. These modules are offline result processors, not Inspect scorers.
+Add `comparison.py`; add `report.py` only if CI or saved markdown summaries are needed. These modules are offline result processors, not Inspect scorers and not replacements for Inspect View.
 
 Validation:
 

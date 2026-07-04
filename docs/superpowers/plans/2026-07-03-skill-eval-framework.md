@@ -21,7 +21,7 @@
 - MVP scorers are exactly `skill_assertion_scorer()` and `trace_integrity_scorer()`.
 - Tool behavior, tool input/output, skill usage, output rules, performance limits, and clarification behavior MUST be modeled as assertion types evaluated by `skill_assertion_scorer()`, not as separate MVP scorers.
 - `SkillInvocation.used` MUST mean the skill was selected/activated, including a successful `read_file` of `SKILL.md`; `SkillInvocation.applied` MUST mean behavior complied with the skill and MAY be `None` when unknown.
-- Baseline vs with-skill impact analysis MUST be implemented later as `comparison.py` / `report.py`, not as an Inspect scorer.
+- Baseline vs with-skill impact analysis MUST be implemented later as `comparison.py` / optional `report.py`; Inspect View remains the primary interactive report UI, so do not build custom visual reporting in this MVP.
 - Do not add DeerFlow runtime adapter in this MVP.
 - Do not add LLM-as-judge scorers in this MVP.
 - The only planned real runtime adapter is DeerFlow; the mock runner exists only as the MVP test seam.
