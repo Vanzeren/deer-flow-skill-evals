@@ -257,7 +257,7 @@ def _stringify(value: Any) -> str:
 
 
 def _target_tool_calls(assertion: SkillAssertionSpec, trace: AgentTrace) -> list[AgentToolCall]:
-    if not assertion.target or assertion.target not in {call.name for call in trace.tool_calls}:
+    if not assertion.target:
         return trace.tool_calls
     return [call for call in trace.tool_calls if call.name == assertion.target]
 
