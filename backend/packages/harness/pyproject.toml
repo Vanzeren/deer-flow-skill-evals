@@ -31,6 +31,7 @@ dependencies = [
     "tiktoken>=0.8.0",
     "ddgs>=9.10.0",
     "duckdb>=1.4.4",
+    "boxlite>=0.9.7",
     "langchain-google-genai>=4.2.1",
     "langgraph-checkpoint-sqlite>=3.0.3",
     "langgraph-sdk>=0.1.51",
