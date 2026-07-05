@@ -355,6 +355,12 @@ sandbox:
       PYTHONUNBUFFERED: "1"
 ```
 
+Install the optional runtime before selecting this provider:
+
+```bash
+pip install "deerflow-harness[boxlite]"
+```
+
 BoxLite boxes are named from the effective `(user_id, thread_id)` scope and are
 released into an in-process warm pool after each turn. The same user/thread can
 reclaim its warm VM on the next acquire; different threads cannot share a VM.

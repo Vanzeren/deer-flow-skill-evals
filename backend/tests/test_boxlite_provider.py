@@ -68,7 +68,7 @@ def _no_boxlite(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_import_simplebox_missing_raises_actionable(monkeypatch: pytest.MonkeyPatch) -> None:
     _no_boxlite(monkeypatch)
-    with pytest.raises(ImportError, match=r"pip install boxlite"):
+    with pytest.raises(ImportError, match=r"deerflow-harness\[boxlite\]"):
         _import_simplebox()
 
 
@@ -80,7 +80,7 @@ def test_acquire_without_boxlite_raises_and_shuts_down_cleanly(monkeypatch: pyte
 
     provider = BoxliteProvider()
     try:
-        with pytest.raises(ImportError, match=r"pip install boxlite"):
+        with pytest.raises(ImportError, match=r"deerflow-harness\[boxlite\]"):
             provider.acquire("thread-1", user_id="u")
     finally:
         provider.shutdown()  # must not raise even though no box was ever created

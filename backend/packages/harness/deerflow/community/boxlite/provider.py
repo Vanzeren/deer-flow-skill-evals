@@ -58,7 +58,7 @@ def _import_simplebox() -> type[SimpleBox]:
     try:
         from boxlite import SimpleBox
     except ImportError as e:  # pragma: no cover - depends on the optional dependency
-        raise ImportError("BoxliteProvider requires the 'boxlite' package. Install it with: pip install boxlite.") from e
+        raise ImportError("BoxliteProvider requires the optional 'boxlite' dependency. Install it with: pip install 'deerflow-harness[boxlite]' or pip install boxlite.") from e
     return SimpleBox
 
 

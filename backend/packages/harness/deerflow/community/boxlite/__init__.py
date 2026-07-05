@@ -22,8 +22,9 @@ Configuration example (``config.yaml``)::
       environment:                 # injected into every command
         PYTHONUNBUFFERED: "1"
 
-The ``boxlite`` runtime is bundled as a ``deerflow-harness`` dependency; no
-separate install step is needed once this provider is selected.
+Install the optional runtime before selecting this provider::
+
+    pip install "deerflow-harness[boxlite]"
 
 Host requirement: BoxLite boots micro-VMs, so a Linux host needs KVM (nested
 virtualization when DeerFlow itself runs inside a cloud VM); macOS uses

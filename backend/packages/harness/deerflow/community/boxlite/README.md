@@ -22,8 +22,11 @@ sandbox:
     PYTHONUNBUFFERED: "1"
 ```
 
-`boxlite` is bundled as a `deerflow-harness` dependency; no separate install
-step is needed once the BoxLite provider is selected.
+Install the optional runtime before selecting this provider:
+
+```bash
+pip install "deerflow-harness[boxlite]"
+```
 
 **Host requirement:** BoxLite boots micro-VMs, so a Linux host needs KVM — i.e.
 nested virtualization when DeerFlow runs inside a cloud VM. macOS uses
