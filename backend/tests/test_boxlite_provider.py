@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 import types
 
 import pytest
@@ -290,3 +291,176 @@ def test_warm_pool_reclaim_failed_health_check_creates_new(monkeypatch):
     sid2 = provider.acquire("thread-1", user_id="u1")
     assert sid2 == sid1  # Same deterministic ID
     assert sid2 in provider._boxes
+
+
+# ── Task 6: Idle reaper ───────────────────────────────────────────────
+
+
+def test_idle_reaper_destroys_expired_warm_boxes(monkeypatch):
+    """Idle reaper daemon destroys warm pool boxes that exceed the idle timeout."""
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config(),
+    )
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider._import_simplebox",
+        lambda: _FakeBox,
+    )
+
+    # Use a very short check interval so the reaper runs quickly
+    BoxliteProvider.IDLE_CHECK_INTERVAL = 0.1
+
+    provider = BoxliteProvider()
+    provider._loop.run = _fake_run
+
+    # Acquire and release a box into the warm pool
+    sid = provider.acquire("thread-1", user_id="u1")
+    box, _ = provider._warm_pool.get(sid, (None, None)) if sid in provider._warm_pool else (None, None)
+    provider.release(sid)
+
+    assert sid in provider._warm_pool
+
+    # Backdate the warm-pool timestamp so it appears long-expired
+    warm_box = provider._warm_pool[sid][0]
+    provider._warm_pool[sid] = (warm_box, time.time() - 9999)
+
+    # Wait long enough for the reaper to detect and destroy it
+    time.sleep(0.3)
+
+    # Box should be gone from warm pool and closed
+    assert sid not in provider._warm_pool
+    assert warm_box._closed
+
+    provider.shutdown()
+
+
+# ── Task 7: Replica enforcement ───────────────────────────────────────
+
+
+def test_replica_enforcement_evicts_oldest_warm(monkeypatch):
+    """When warm pool exceeds replica limit, the oldest box is evicted."""
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config({"replicas": 2}),
+    )
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider._import_simplebox",
+        lambda: _FakeBox,
+    )
+
+    provider = BoxliteProvider()
+    provider._loop.run = _fake_run
+
+    # Fill warm pool with 2 boxes from different threads
+    sid_a = provider.acquire("thread-a", user_id="u1")
+    provider.release(sid_a)
+
+    sid_b = provider.acquire("thread-b", user_id="u1")
+    provider.release(sid_b)
+
+    assert len(provider._warm_pool) == 2
+    assert sid_a in provider._warm_pool
+    assert sid_b in provider._warm_pool
+
+    # Make sid_a definitely older by backdating its timestamp
+    box_a = provider._warm_pool[sid_a][0]
+    provider._warm_pool[sid_a] = (box_a, time.time() - 100)
+    # Refresh sid_b's timestamp so it's newer
+    box_b = provider._warm_pool[sid_b][0]
+    provider._warm_pool[sid_b] = (box_b, time.time())
+
+    # Acquiring a third thread triggers replica enforcement:
+    # warm pool count (2) >= replicas (2) → evict oldest (sid_a)
+    sid_c = provider.acquire("thread-c", user_id="u1")
+
+    # Oldest (sid_a) should be evicted (gone from warm pool, closed)
+    assert sid_a not in provider._warm_pool
+    assert box_a._closed
+    # Newer (sid_b) should remain in warm pool
+    assert sid_b in provider._warm_pool
+    # New box (sid_c) should be active
+    assert sid_c in provider._boxes
+    assert sid_c not in provider._warm_pool
+
+    provider.shutdown()
+
+
+# ── Task 8: Shutdown and reset including warm pool ────────────────────
+
+
+def test_shutdown_stops_idle_reaper_and_destroys_all_boxes(monkeypatch):
+    """shutdown stops the idle reaper thread and destroys all active + warm boxes."""
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config(),
+    )
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider._import_simplebox",
+        lambda: _FakeBox,
+    )
+
+    provider = BoxliteProvider()
+    provider._loop.run = _fake_run
+
+    # Create one active box (thread-1) and one warm pool box (thread-2 released)
+    sid_active = provider.acquire("thread-1", user_id="u1")
+    sid_warm = provider.acquire("thread-2", user_id="u1")
+    provider.release(sid_warm)
+
+    assert sid_active in provider._boxes
+    assert sid_warm in provider._warm_pool
+
+    # Get box references before shutdown
+    box_active = provider._boxes[sid_active]
+    box_warm = provider._warm_pool[sid_warm][0]
+
+    # Remember the idle checker thread
+    checker_thread = provider._idle_checker_thread
+
+    provider.shutdown()
+
+    # Idle checker should be stopped
+    assert provider._idle_checker_stop.is_set()
+    assert checker_thread is not None
+    assert not checker_thread.is_alive()
+
+    # All boxes (active + warm) should be closed
+    assert box_active._closed
+    assert box_warm._closed
+
+    # All collections should be empty
+    assert len(provider._boxes) == 0
+    assert len(provider._warm_pool) == 0
+    assert len(provider._thread_boxes) == 0
+
+
+def test_reset_clears_warm_pool(monkeypatch):
+    """reset clears warm pool in addition to boxes and thread_boxes."""
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config(),
+    )
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider._import_simplebox",
+        lambda: _FakeBox,
+    )
+
+    provider = BoxliteProvider()
+    provider._loop.run = _fake_run
+
+    # Create one active box and one warm pool box
+    sid_active = provider.acquire("thread-1", user_id="u1")
+    sid_warm = provider.acquire("thread-2", user_id="u1")
+    provider.release(sid_warm)
+
+    assert sid_active in provider._boxes
+    assert sid_warm in provider._warm_pool
+
+    provider.reset()
+
+    # All collections should be cleared
+    assert len(provider._boxes) == 0
+    assert len(provider._warm_pool) == 0
+    assert len(provider._thread_boxes) == 0
+
+    provider.shutdown()

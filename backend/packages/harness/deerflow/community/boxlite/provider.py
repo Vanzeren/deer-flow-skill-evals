@@ -122,6 +122,10 @@ class BoxliteProvider(SandboxProvider):
         self._config = self._load_config()
         self._loop = _EventLoopThread()
         atexit.register(self.shutdown)
+        self._idle_checker_thread = threading.Thread(
+            target=self._idle_reaper_loop, name="boxlite-idle-reaper", daemon=True
+        )
+        self._idle_checker_thread.start()
 
     def _load_config(self) -> dict[str, Any]:
         sandbox_config = get_app_config().sandbox
@@ -143,6 +147,60 @@ class BoxliteProvider(SandboxProvider):
     @staticmethod
     def _thread_key(thread_id: str, user_id: str | None) -> tuple[str, str]:
         return (user_id or "", thread_id)
+
+    # ── Idle reaper (Task 6) ─────────────────────────────────────────────
+
+    def _idle_reaper_loop(self) -> None:
+        """Daemon thread that periodically reaps expired warm-pool boxes."""
+        while not self._idle_checker_stop.wait(self.IDLE_CHECK_INTERVAL):
+            self._reap_expired_warm()
+
+    def _reap_expired_warm(self) -> None:
+        """Destroy warm-pool boxes that have been idle longer than the timeout."""
+        now = time.time()
+        timeout = self._config["idle_timeout"]
+        expired: list[tuple[str, BoxliteBox]] = []
+        with self._lock:
+            for sid, (box, ts) in self._warm_pool.items():
+                if now - ts > timeout:
+                    expired.append((sid, box))
+            for sid, _ in expired:
+                self._warm_pool.pop(sid, None)
+
+        for sid, box in expired:
+            try:
+                box.close()
+                logger.info("Idle reaper destroyed expired warm-pool box %s", sid)
+            except Exception as e:
+                logger.warning("Error closing expired BoxLite box %s: %s", sid, e)
+
+    # ── Replica enforcement (Task 7) ─────────────────────────────────────
+
+    def _replica_count(self) -> int:
+        """Return the number of boxes currently in the warm pool."""
+        with self._lock:
+            return len(self._warm_pool)
+
+    def _evict_oldest_warm(self) -> None:
+        """Evict and destroy the oldest warm-pool box (by timestamp).
+
+        Only evicts from the warm pool — active boxes are never touched.
+        """
+        box = None
+        with self._lock:
+            if not self._warm_pool:
+                return
+            oldest_sid = min(self._warm_pool, key=lambda sid: self._warm_pool[sid][1])
+            box, _ = self._warm_pool.pop(oldest_sid)
+
+        if box is not None:
+            try:
+                box.close()
+                logger.info("Replica enforcement evicted oldest warm-pool box %s", box.id)
+            except Exception as e:
+                logger.warning("Error closing evicted BoxLite box %s: %s", box.id, e)
+
+    # ── Acquire / release ────────────────────────────────────────────────
 
     def acquire(self, thread_id: str | None = None, *, user_id: str | None = None) -> str:
         if thread_id is not None:
@@ -171,6 +229,10 @@ class BoxliteProvider(SandboxProvider):
         return box.id
 
     def _create_box(self, sandbox_id: str) -> BoxliteBox:
+        # Enforce replica limit: evict oldest warm-pool box if at capacity
+        if self._replica_count() >= self._config["replicas"]:
+            self._evict_oldest_warm()
+
         simplebox_cls = _import_simplebox()
         mkdir_cmd = "mkdir -p " + " ".join(_VIRTUAL_DIRS)
 
@@ -252,18 +314,26 @@ class BoxliteProvider(SandboxProvider):
     def reset(self) -> None:
         with self._lock:
             self._boxes.clear()
+            self._warm_pool.clear()
             self._thread_boxes.clear()
 
     def shutdown(self) -> None:
+        # Stop idle checker first
+        self._idle_checker_stop.set()
+        if self._idle_checker_thread is not None:
+            self._idle_checker_thread.join(timeout=5)
+
         with self._lock:
             if self._shutdown_called:
                 return
             self._shutdown_called = True
             active = list(self._boxes.values())
+            warm = [box for box, _ in self._warm_pool.values()]
             self._boxes.clear()
+            self._warm_pool.clear()
             self._thread_boxes.clear()
 
-        for box in active:
+        for box in active + warm:
             try:
                 box.close()
             except Exception as e:  # pragma: no cover - defensive
