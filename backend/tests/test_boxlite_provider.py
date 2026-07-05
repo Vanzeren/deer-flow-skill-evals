@@ -180,3 +180,113 @@ def test_create_box_passes_sandbox_id_as_name(monkeypatch):
     assert len(created_boxes) == 1
     assert created_boxes[0]["name"] == "test-sandbox-id"
     assert box.id == "test-sandbox-id"  # box.id comes from fake box name
+
+
+def test_release_parks_in_warm_pool(monkeypatch):
+    """After release, box is in warm pool, not destroyed."""
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config(),
+    )
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider._import_simplebox",
+        lambda: _FakeBox,
+    )
+
+    provider = BoxliteProvider()
+    provider._loop.run = _fake_run
+
+    # Acquire a box
+    sid = provider.acquire("thread-1", user_id="u1")
+
+    # Verify box is active
+    assert sid in provider._boxes
+    assert sid not in provider._warm_pool
+
+    # Release
+    provider.release(sid)
+
+    # Verify box is in warm pool, not active
+    assert sid not in provider._boxes
+    assert sid in provider._warm_pool
+    box, ts = provider._warm_pool[sid]
+    assert isinstance(box, BoxliteBox)
+    assert not box._box._stopped  # VM not destroyed
+
+
+def test_acquire_reclaims_from_warm_pool(monkeypatch):
+    """acquire reclaims a warm pool box for the same thread."""
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config(),
+    )
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider._import_simplebox",
+        lambda: _FakeBox,
+    )
+
+    provider = BoxliteProvider()
+    provider._loop.run = _fake_run
+
+    # First acquire → create
+    sid1 = provider.acquire("thread-1", user_id="u1")
+    provider.release(sid1)
+
+    # Second acquire → should reclaim from warm pool
+    sid2 = provider.acquire("thread-1", user_id="u1")
+    assert sid1 == sid2  # Same deterministic ID
+    assert sid2 in provider._boxes
+    assert sid2 not in provider._warm_pool
+
+
+def test_acquire_different_threads_dont_reclaim_each_other(monkeypatch):
+    """Thread A's box can't be reclaimed by thread B."""
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config(),
+    )
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider._import_simplebox",
+        lambda: _FakeBox,
+    )
+
+    provider = BoxliteProvider()
+    provider._loop.run = _fake_run
+
+    sid_a = provider.acquire("thread-a", user_id="u1")
+    provider.release(sid_a)
+
+    # Thread B acquires — should NOT get thread A's box
+    sid_b = provider.acquire("thread-b", user_id="u1")
+    assert sid_b != sid_a  # Different deterministic ID
+    assert sid_a in provider._warm_pool  # A's box still in warm pool
+    assert sid_b in provider._boxes  # B's box is new
+
+
+def test_warm_pool_reclaim_failed_health_check_creates_new(monkeypatch):
+    """Dead warm pool box is evicted and a new one created."""
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config(),
+    )
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider._import_simplebox",
+        lambda: _FakeBox,
+    )
+
+    provider = BoxliteProvider()
+    provider._loop.run = _fake_run
+
+    sid1 = provider.acquire("thread-1", user_id="u1")
+    provider.release(sid1)
+    assert sid1 in provider._warm_pool
+
+    # Corrupt the warm pool box: close it so health check fails
+    box, _ = provider._warm_pool[sid1]
+    box.close()  # Stop VM, marks _closed=True
+
+    # Re-acquire — health check should fail on the dead box
+    # A new box is created with the same deterministic ID
+    sid2 = provider.acquire("thread-1", user_id="u1")
+    assert sid2 == sid1  # Same deterministic ID
+    assert sid2 in provider._boxes

@@ -18,6 +18,7 @@ import atexit
 import hashlib
 import logging
 import threading
+import time
 import uuid
 from collections.abc import Awaitable
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -151,6 +152,15 @@ class BoxliteProvider(SandboxProvider):
                 if existing is not None and existing in self._boxes:
                     return existing
 
+            # Try warm pool reclaim
+            sandbox_id = self._sandbox_id(thread_id, user_id)
+            reclaimed = self._reclaim_warm_pool(sandbox_id)
+            if reclaimed is not None:
+                with self._lock:
+                    self._thread_boxes[key] = reclaimed
+                return reclaimed
+
+        # No existing box — create new
         sandbox_id = self._sandbox_id(thread_id, user_id) if thread_id else str(uuid.uuid4())[:8]
         box = self._create_box(sandbox_id)
 
@@ -185,12 +195,59 @@ class BoxliteProvider(SandboxProvider):
             return self._boxes.get(sandbox_id)
 
     def release(self, sandbox_id: str) -> None:
+        """Release a sandbox into the warm pool — VM stays running.
+
+        The box is moved from _boxes to _warm_pool; _thread_boxes entries are
+        cleared so the thread no longer holds an active reference. The VM is
+        NOT stopped — only eviction or idle timeout destroys it.
+        """
+        box = None
         with self._lock:
             box = self._boxes.pop(sandbox_id, None)
             for key in [k for k, sid in self._thread_boxes.items() if sid == sandbox_id]:
                 self._thread_boxes.pop(key, None)
+
         if box is not None:
+            with self._lock:
+                self._warm_pool[sandbox_id] = (box, time.time())
+            logger.info("Released sandbox %s to warm pool (VM still running)", sandbox_id)
+
+    def _reclaim_warm_pool(self, sandbox_id: str) -> str | None:
+        """Try to reclaim a warm-pool box by sandbox_id.
+
+        Returns sandbox_id on success, None if not found or dead.
+        """
+        with self._lock:
+            if sandbox_id not in self._warm_pool:
+                return None
+            box, _ = self._warm_pool[sandbox_id]
+
+        # Health check: run a simple command to verify the VM is alive
+        try:
+            result = box.execute_command("echo ok")
+            if "ok" not in result:
+                logger.warning("Warm pool box %s health check failed: %s", sandbox_id, result)
+                with self._lock:
+                    self._warm_pool.pop(sandbox_id, None)
+                box.close()
+                return None
+        except Exception as e:
+            logger.warning("Warm pool box %s health check error: %s", sandbox_id, e)
+            with self._lock:
+                self._warm_pool.pop(sandbox_id, None)
             box.close()
+            return None
+
+        # Promote from warm pool to active
+        with self._lock:
+            warm_entry = self._warm_pool.pop(sandbox_id, None)
+            if warm_entry is None:
+                return None  # Raced with another thread
+            box, _ = warm_entry
+            self._boxes[sandbox_id] = box
+
+        logger.info("Reclaimed warm-pool box %s", sandbox_id)
+        return sandbox_id
 
     def reset(self) -> None:
         with self._lock:
