@@ -151,3 +151,32 @@ def test_sandbox_id_different_threads(monkeypatch):
     id_a = provider._sandbox_id("thread-1", "user-a")
     id_b = provider._sandbox_id("thread-2", "user-a")
     assert id_a != id_b
+
+
+def test_create_box_passes_sandbox_id_as_name(monkeypatch):
+    """_create_box passes sandbox_id as name= to SimpleBox."""
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config(),
+    )
+    # Inject fake SimpleBox and fake loop runner
+    created_boxes = []
+
+    class _RecordingBox(_FakeBox):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            created_boxes.append(kwargs)
+
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider._import_simplebox",
+        lambda: _RecordingBox,
+    )
+
+    provider = BoxliteProvider()
+    # Replace _loop.run with our sync runner
+    provider._loop.run = _fake_run
+
+    box = provider._create_box("test-sandbox-id")
+    assert len(created_boxes) == 1
+    assert created_boxes[0]["name"] == "test-sandbox-id"
+    assert box.id == "test-sandbox-id"  # box.id comes from fake box name

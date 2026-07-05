@@ -18,6 +18,7 @@ import atexit
 import hashlib
 import logging
 import threading
+import uuid
 from collections.abc import Awaitable
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -150,7 +151,8 @@ class BoxliteProvider(SandboxProvider):
                 if existing is not None and existing in self._boxes:
                     return existing
 
-        box = self._create_box()
+        sandbox_id = self._sandbox_id(thread_id, user_id) if thread_id else str(uuid.uuid4())[:8]
+        box = self._create_box(sandbox_id)
 
         with self._lock:
             self._boxes[box.id] = box
@@ -158,12 +160,13 @@ class BoxliteProvider(SandboxProvider):
                 self._thread_boxes[self._thread_key(thread_id, user_id)] = box.id
         return box.id
 
-    def _create_box(self) -> BoxliteBox:
+    def _create_box(self, sandbox_id: str) -> BoxliteBox:
         simplebox_cls = _import_simplebox()
         mkdir_cmd = "mkdir -p " + " ".join(_VIRTUAL_DIRS)
 
         async def _make() -> SimpleBox:
             box = simplebox_cls(
+                name=sandbox_id,
                 image=self._config["image"],
                 memory_mib=self._config["memory_mib"],
                 cpus=self._config["cpus"],
