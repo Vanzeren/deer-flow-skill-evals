@@ -114,3 +114,40 @@ def test_execute_command_rejects_invalid_env_key() -> None:
     box = BoxliteBox("box-id", box=object(), run=_fail_run)
     with pytest.raises(ValueError, match=r"POSIX"):
         box.execute_command("echo hi", env={"BAD KEY": "x"})
+
+
+def test_sandbox_id_deterministic(monkeypatch):
+    """_sandbox_id produces the same id for the same inputs."""
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config(),
+    )
+    provider = BoxliteProvider()
+    id1 = provider._sandbox_id("thread-1", "user-a")
+    id2 = provider._sandbox_id("thread-1", "user-a")
+    assert id1 == id2
+    assert len(id1) == 8
+
+
+def test_sandbox_id_different_users(monkeypatch):
+    """Different users produce different ids for the same thread."""
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config(),
+    )
+    provider = BoxliteProvider()
+    id_a = provider._sandbox_id("thread-1", "user-a")
+    id_b = provider._sandbox_id("thread-1", "user-b")
+    assert id_a != id_b
+
+
+def test_sandbox_id_different_threads(monkeypatch):
+    """Different threads produce different ids for the same user."""
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config(),
+    )
+    provider = BoxliteProvider()
+    id_a = provider._sandbox_id("thread-1", "user-a")
+    id_b = provider._sandbox_id("thread-2", "user-a")
+    assert id_a != id_b

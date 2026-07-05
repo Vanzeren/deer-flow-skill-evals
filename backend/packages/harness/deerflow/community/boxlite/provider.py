@@ -8,13 +8,14 @@ Config is read off :class:`SandboxConfig` (``extra="allow"``), so BoxLite keys
 may appear under ``sandbox:`` in ``config.yaml`` even though they are not declared
 on the model — see this package's ``__init__`` docstring for the full set. The
 provider creates one micro-VM per ``(user, thread)`` and reuses it within the
-process; warm pooling, idle reaping and remote modes are out of scope for now.
+process.
 """
 
 from __future__ import annotations
 
 import asyncio
 import atexit
+import hashlib
 import logging
 import threading
 from collections.abc import Awaitable
@@ -91,10 +92,30 @@ class BoxliteProvider(SandboxProvider):
     uses_thread_data_mounts = False
     needs_upload_permission_adjustment = True
 
+    # ── Warm pool constants (mirrors AioSandboxProvider) ─────────────────
+
+    DEFAULT_IDLE_TIMEOUT = 600
+    IDLE_CHECK_INTERVAL = 60
+    DEFAULT_REPLICAS = 3
+
+    @staticmethod
+    def _sandbox_id(thread_id: str, user_id: str) -> str:
+        """Deterministic sandbox ID from user/thread scope.
+
+        Includes user_id so a box created for one user's bucket cannot be
+        reclaimed by another user's thread with the same thread_id.
+        """
+        return hashlib.sha256(f"{user_id}:{thread_id}".encode()).hexdigest()[:8]
+
+    # ── Provider ────────────────────────────────────────────────────────
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._boxes: dict[str, BoxliteBox] = {}
         self._thread_boxes: dict[tuple[str, str], str] = {}
+        self._warm_pool: dict[str, tuple[BoxliteBox, float]] = {}
+        self._idle_checker_stop = threading.Event()
+        self._idle_checker_thread: threading.Thread | None = None
         self._shutdown_called = False
         self._config = self._load_config()
         self._loop = _EventLoopThread()
@@ -113,6 +134,8 @@ class BoxliteProvider(SandboxProvider):
             "memory_mib": _opt("memory_mib"),
             "cpus": _opt("cpus"),
             "environment": dict(_opt("environment") or {}),
+            "replicas": _opt("replicas") or self.DEFAULT_REPLICAS,
+            "idle_timeout": _opt("idle_timeout") or self.DEFAULT_IDLE_TIMEOUT,
         }
 
     @staticmethod
