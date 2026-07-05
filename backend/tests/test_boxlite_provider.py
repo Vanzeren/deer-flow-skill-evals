@@ -1,11 +1,12 @@
 """Unit tests for the BoxLite community provider.
-
 These run in CI without BoxLite installed: they cover the lazy-import error path,
-provider lifecycle, and the path-safety guards — none of which need a live box.
+provider lifecycle, the path-safety guards, and the warm pool lifecycle — none of
+which need a live box.
 """
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import types
 
@@ -13,6 +14,49 @@ import pytest
 
 from deerflow.community.boxlite.box import BoxliteBox
 from deerflow.community.boxlite.provider import BoxliteProvider, _import_simplebox
+
+# ── Fake BoxLite SDK ──────────────────────────────────────────────────
+
+
+class _FakeBox:
+    """A fake SimpleBox that records lifecycle calls without starting real VMs."""
+
+    def __init__(self, *, image=None, name=None, memory_mib=None, cpus=None, **kwargs):
+        self.id = name or "auto-gen-id"
+        self.name = name
+        self._image = image
+        self._started = False
+        self._stopped = False
+        self._exec_history: list[tuple] = []
+
+    async def start(self):
+        self._started = True
+
+    async def exec(self, *argv, env=None, timeout=None):
+        self._exec_history.append((argv, env, timeout))
+        _FakeResult = type("_FakeResult", (), {"stdout": "", "stderr": "", "exit_code": 0})
+        # Health check: box.execute_command("echo ok") → exec("sh", "-lc", "echo ok")
+        if len(argv) >= 3 and argv[0] == "sh" and argv[1] == "-lc" and argv[2] == "echo ok":
+            return type("_FakeResult", (), {"stdout": "ok\n", "stderr": "", "exit_code": 0})()
+        return _FakeResult()
+
+    async def stop(self):
+        self._stopped = True
+
+
+def _fake_run(coro, *, timeout=None):
+    """Sync runner that executes coroutines on a temporary event loop (no daemon thread)."""
+    return asyncio.run(coro)
+
+
+# ── Config stub ───────────────────────────────────────────────────────
+
+
+def _stub_config(sandbox_attrs=None):
+    """Stub get_app_config to return a config with given sandbox attrs."""
+    attrs = sandbox_attrs or {}
+    stub = types.SimpleNamespace(sandbox=types.SimpleNamespace(**attrs))
+    return stub
 
 
 def _no_boxlite(monkeypatch: pytest.MonkeyPatch) -> None:
