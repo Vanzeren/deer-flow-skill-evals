@@ -29,6 +29,7 @@ from deerflow.constants import DEFAULT_SKILLS_CONTAINER_PATH
 from deerflow.sandbox.sandbox import Sandbox
 from deerflow.sandbox.sandbox_provider import SandboxProvider
 
+from ..warm_pool_lifecycle import WarmPoolLifecycleMixin
 from .box import BoxliteBox
 
 if TYPE_CHECKING:
@@ -39,6 +40,7 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 DEFAULT_IMAGE = "python:3.12-slim"
+_BOX_NAME_PREFIX = "deer-flow-boxlite-"
 # DeerFlow's virtual prefixes, materialised on the box rootfs at start so the
 # Sandbox file APIs (which address /mnt/user-data/...) resolve natively.
 _VIRTUAL_DIRS = (
@@ -62,6 +64,15 @@ def _import_simplebox() -> type[SimpleBox]:
     return SimpleBox
 
 
+def _import_sync_boxlite_runtime():
+    """Import BoxLite's sync runtime lazily for startup reconciliation."""
+    try:
+        from boxlite import SyncBoxlite
+    except ImportError as e:  # pragma: no cover - depends on the optional dependency
+        raise ImportError("BoxliteProvider requires the optional 'boxlite' dependency. Install it with: pip install 'deerflow-harness[boxlite]' or pip install boxlite.") from e
+    return SyncBoxlite
+
+
 class _EventLoopThread:
     """A private asyncio event loop running on a dedicated daemon thread.
 
@@ -74,31 +85,80 @@ class _EventLoopThread:
     """
 
     def __init__(self) -> None:
-        self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(target=self._loop.run_forever, name="boxlite-loop", daemon=True)
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._run_forever, name="boxlite-loop", daemon=True)
         self._thread.start()
+        self._ready.wait(timeout=5)
+
+    def _run_forever(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._loop.call_soon(self._ready.set)
+        self._loop.run_forever()
 
     def run(self, coro: Awaitable[T], *, timeout: float | None = None) -> T:
+        if self._loop is None:
+            raise RuntimeError("BoxLite event loop is not ready")
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout)
 
     def close(self) -> None:
+        if self._loop is None:
+            return
         self._loop.call_soon_threadsafe(self._loop.stop)
+        wake = getattr(self._loop, "_write_to_self", None)
+        if wake is not None:
+            wake()
         self._thread.join(timeout=5)
         if not self._loop.is_running():
             self._loop.close()
 
 
-class BoxliteProvider(SandboxProvider):
+class _SyncBoxAdapter:
+    """Adapt a sync BoxLite ``Box`` handle to the async ``SimpleBox`` methods we use."""
+
+    def __init__(self, runtime: Any, box: Any) -> None:
+        self._runtime = runtime
+        self._box = box
+
+    async def exec(
+        self,
+        cmd: str,
+        *args: str,
+        env: dict[str, str] | None = None,
+        user: str | None = None,
+        timeout: float | None = None,
+        cwd: str | None = None,
+    ) -> Any:
+        return self._box.exec(
+            cmd,
+            *args,
+            env=env,
+            user=user,
+            timeout=timeout,
+            cwd=cwd,
+        )
+
+    async def stop(self) -> None:
+        try:
+            self._box.stop()
+        finally:
+            self._runtime.stop()
+
+
+def _run_sync_adapter[T](coro: Awaitable[T], *, timeout: float | None = None) -> T:
+    """Run sync-adapter coroutines without using the BoxLite async loop."""
+    if timeout is None:
+        return asyncio.run(coro)
+    return asyncio.run(asyncio.wait_for(coro, timeout=timeout))
+
+
+class BoxliteProvider(WarmPoolLifecycleMixin[BoxliteBox], SandboxProvider):
     """Run each DeerFlow sandbox as a BoxLite micro-VM."""
 
     uses_thread_data_mounts = False
     needs_upload_permission_adjustment = True
-
-    # ── Warm pool constants (mirrors AioSandboxProvider) ─────────────────
-
-    DEFAULT_IDLE_TIMEOUT = 600
-    IDLE_CHECK_INTERVAL = 60
-    DEFAULT_REPLICAS = 3
+    _idle_checker_thread_name = "boxlite-idle-reaper"
 
     @staticmethod
     def _sandbox_id(thread_id: str, user_id: str) -> str:
@@ -123,9 +183,8 @@ class BoxliteProvider(SandboxProvider):
         self._config = self._load_config()
         self._loop = _EventLoopThread()
         atexit.register(self.shutdown)
-        if self._config["idle_timeout"] > 0:
-            self._idle_checker_thread = threading.Thread(target=self._idle_reaper_loop, name="boxlite-idle-reaper", daemon=True)
-            self._idle_checker_thread.start()
+        self._reconcile_orphans()
+        self._start_idle_checker()
 
     def _load_config(self) -> dict[str, Any]:
         sandbox_config = get_app_config().sandbox
@@ -150,6 +209,17 @@ class BoxliteProvider(SandboxProvider):
     def _thread_key(thread_id: str, user_id: str | None) -> tuple[str, str]:
         return (user_id or "", thread_id)
 
+    @staticmethod
+    def _box_name(sandbox_id: str) -> str:
+        return f"{_BOX_NAME_PREFIX}{sandbox_id}"
+
+    @staticmethod
+    def _sandbox_id_from_box_name(name: str | None) -> str | None:
+        if not name or not name.startswith(_BOX_NAME_PREFIX):
+            return None
+        sandbox_id = name[len(_BOX_NAME_PREFIX) :]
+        return sandbox_id or None
+
     def _lock_for_sandbox(self, sandbox_id: str) -> threading.Lock:
         """Return the per-sandbox acquire lock for a deterministic sandbox id."""
         with self._lock:
@@ -159,60 +229,93 @@ class BoxliteProvider(SandboxProvider):
                 self._acquire_locks[sandbox_id] = lock
             return lock
 
-    # ── Idle reaper (Task 6) ─────────────────────────────────────────────
-
-    def _idle_reaper_loop(self) -> None:
-        """Daemon thread that periodically reaps expired warm-pool boxes."""
-        while not self._idle_checker_stop.wait(self.IDLE_CHECK_INTERVAL):
-            self._reap_expired_warm()
-
-    def _reap_expired_warm(self) -> None:
-        """Destroy warm-pool boxes that have been idle longer than the timeout."""
-        timeout = self._config["idle_timeout"]
-        if timeout <= 0:
+    def _start_idle_checker(self) -> None:
+        """Start idle cleanup when enabled; idle_timeout=0 keeps it disabled."""
+        if self._config["idle_timeout"] <= 0:
             return
-        now = time.time()
-        expired: list[tuple[str, BoxliteBox]] = []
-        with self._lock:
-            for sid, (box, ts) in self._warm_pool.items():
-                if now - ts > timeout:
-                    expired.append((sid, box))
-            for sid, _ in expired:
-                self._warm_pool.pop(sid, None)
+        super()._start_idle_checker()
 
-        for sid, box in expired:
-            try:
-                box.close()
-                logger.info("Idle reaper destroyed expired warm-pool box %s", sid)
-            except Exception as e:
-                logger.warning("Error closing expired BoxLite box %s: %s", sid, e)
+    def _active_count_locked(self) -> int:
+        """Return active BoxLite box count while ``_lock`` is held."""
+        return len(self._boxes)
 
-    # ── Replica enforcement (Task 7) ─────────────────────────────────────
-
-    def _replica_count(self) -> tuple[int, int]:
-        """Return configured replicas and current active + warm box count."""
-        replicas = self._config.get("replicas", self.DEFAULT_REPLICAS)
-        with self._lock:
-            total = len(self._boxes) + len(self._warm_pool)
-        return replicas, total
-
-    def _evict_oldest_warm(self) -> str | None:
-        """Evict and destroy the oldest warm-pool box (by timestamp).
-
-        Only evicts from the warm pool — active boxes are never touched.
-        """
-        with self._lock:
-            if not self._warm_pool:
-                return None
-            oldest_sid = min(self._warm_pool, key=lambda sid: self._warm_pool[sid][1])
-            box, _ = self._warm_pool.pop(oldest_sid)
-
+    def _destroy_warm_entry(self, sandbox_id: str, entry: BoxliteBox, *, reason: str) -> None:
+        """Close a removed warm-pool entry and log with context."""
         try:
-            box.close()
-            logger.info("Replica enforcement evicted oldest warm-pool box %s", box.id)
+            entry.close()
+            if reason == "idle_timeout":
+                logger.info("Idle reaper destroyed expired warm-pool box %s", sandbox_id)
+            elif reason == "replica_enforcement":
+                logger.info("Replica enforcement evicted oldest warm-pool box %s", sandbox_id)
+            else:
+                logger.info("Destroyed warm-pool box %s (reason=%s)", sandbox_id, reason)
         except Exception as e:
-            logger.warning("Error closing evicted BoxLite box %s: %s", box.id, e)
-        return oldest_sid
+            if reason == "idle_timeout":
+                logger.warning("Error closing expired BoxLite box %s: %s", sandbox_id, e)
+            elif reason == "replica_enforcement":
+                logger.warning("Error closing evicted BoxLite box %s: %s", sandbox_id, e)
+            else:
+                logger.warning("Error closing BoxLite box %s (reason=%s): %s", sandbox_id, reason, e)
+
+    def _reconcile_orphans(self) -> None:
+        """Adopt DeerFlow-owned BoxLite boxes left by a previous provider/process.
+
+        BoxLite boxes are discovered by a DeerFlow-specific name prefix. Adopted
+        boxes enter the warm pool so the normal idle reaper can reclaim them.
+        """
+        try:
+            adopted = self._adopt_existing_boxes()
+        except ImportError:
+            logger.debug("BoxLite is not installed; skipping startup reconciliation")
+            return
+        except Exception as e:
+            logger.warning("Failed to reconcile existing BoxLite boxes: %s", e)
+            return
+
+        if adopted:
+            logger.info("Startup reconciliation adopted %s BoxLite box(es)", adopted)
+
+    def _adopt_existing_boxes(self) -> int:
+        runtime_cls = _import_sync_boxlite_runtime()
+        now = time.time()
+        adopted = 0
+
+        list_runtime = runtime_cls.default().start()
+        try:
+            infos = list_runtime.list_info()
+        finally:
+            list_runtime.stop()
+
+        for info in infos:
+            name = getattr(info, "name", None)
+            sandbox_id = self._sandbox_id_from_box_name(name)
+            if sandbox_id is None:
+                continue
+            with self._lock:
+                if sandbox_id in self._boxes or sandbox_id in self._warm_pool:
+                    continue
+
+            box_runtime = runtime_cls.default().start()
+            try:
+                box = box_runtime.get(name)
+            except Exception as e:
+                box_runtime.stop()
+                logger.warning("Failed to retrieve existing BoxLite box %s: %s", name, e)
+                continue
+            if box is None:
+                box_runtime.stop()
+                continue
+
+            wrapped = BoxliteBox(sandbox_id, _SyncBoxAdapter(box_runtime, box), _run_sync_adapter, default_env=self._config["environment"])
+            with self._lock:
+                if sandbox_id in self._boxes or sandbox_id in self._warm_pool:
+                    box_runtime.stop()
+                    continue
+                self._warm_pool[sandbox_id] = (wrapped, now)
+                adopted += 1
+            logger.info("Adopted existing BoxLite box %s (%s) into warm pool", sandbox_id, name)
+
+        return adopted
 
     # ── Acquire / release ────────────────────────────────────────────────
 
@@ -250,14 +353,13 @@ class BoxliteProvider(SandboxProvider):
         replicas, total = self._replica_count()
         if total >= replicas:
             evicted = self._evict_oldest_warm()
-            if evicted is None:
-                logger.warning("All %s replica slots are in active use; creating BoxLite box %s beyond the soft limit", replicas, sandbox_id)
+            self._log_replicas_soft_cap(replicas, sandbox_id, evicted)
         simplebox_cls = _import_simplebox()
         mkdir_cmd = "mkdir -p " + " ".join(_VIRTUAL_DIRS)
 
         async def _make() -> SimpleBox:
             box = simplebox_cls(
-                name=sandbox_id,
+                name=self._box_name(sandbox_id),
                 image=self._config["image"],
                 memory_mib=self._config["memory_mib"],
                 cpus=self._config["cpus"],
@@ -268,8 +370,8 @@ class BoxliteProvider(SandboxProvider):
             return box
 
         box = self._loop.run(_make())
-        logger.info("Created BoxLite box %s (image=%s)", box.id, self._config["image"])
-        return BoxliteBox(box.id, box, self._loop.run, default_env=self._config["environment"])
+        logger.info("Created BoxLite box %s (name=%s, image=%s)", sandbox_id, self._box_name(sandbox_id), self._config["image"])
+        return BoxliteBox(sandbox_id, box, self._loop.run, default_env=self._config["environment"])
 
     def get(self, sandbox_id: str) -> Sandbox | None:
         with self._lock:
@@ -312,7 +414,7 @@ class BoxliteProvider(SandboxProvider):
 
         # Health check: run a simple command to verify the VM is alive
         try:
-            result = box.execute_command("echo ok")
+            result = box.execute_command("echo ok", timeout=5)
             if "ok" not in result:
                 logger.warning("Warm pool box %s health check failed: %s", sandbox_id, result)
                 with self._lock:
@@ -338,7 +440,21 @@ class BoxliteProvider(SandboxProvider):
         return sandbox_id
 
     def reset(self) -> None:
-        self.shutdown()
+        """Release tracked BoxLite VMs to this instance's warm-pool cleanup.
+
+        ``reset_sandbox_provider()`` drops the provider singleton and calls this
+        lightweight hook so config changes take effect on the next provider
+        construction. Teardown belongs to ``shutdown()``; reset intentionally
+        leaves running VMs alive, but keeps them visible to this instance's idle
+        reaper and atexit shutdown instead of orphaning them.
+        """
+        with self._lock:
+            now = time.time()
+            for sandbox_id, box in self._boxes.items():
+                self._warm_pool.setdefault(sandbox_id, (box, now))
+            self._boxes.clear()
+            self._thread_boxes.clear()
+            self._acquire_locks.clear()
 
     def shutdown(self) -> None:
         with self._lock:
@@ -346,9 +462,7 @@ class BoxliteProvider(SandboxProvider):
                 return
             self._shutdown_called = True
 
-        self._idle_checker_stop.set()
-        if self._idle_checker_thread is not None:
-            self._idle_checker_thread.join(timeout=5)
+        self._stop_idle_checker()
 
         with self._lock:
             active = list(self._boxes.values())

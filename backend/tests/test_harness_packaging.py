@@ -6,7 +6,8 @@ from pathlib import Path
 
 def test_boxlite_is_optional_harness_dependency() -> None:
     """BoxLite should not make core harness installs platform-dependent."""
-    pyproject = tomllib.loads(Path("packages/harness/pyproject.toml").read_text(encoding="utf-8"))
+    pyproject_path = Path(__file__).resolve().parents[1] / "packages" / "harness" / "pyproject.toml"
+    pyproject = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
 
     core_dependencies = pyproject["project"]["dependencies"]
     optional_dependencies = pyproject["project"]["optional-dependencies"]

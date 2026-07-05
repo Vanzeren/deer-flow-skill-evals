@@ -66,6 +66,28 @@ def _no_boxlite(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "boxlite", None)
 
 
+@pytest.fixture(autouse=True)
+def _no_existing_boxlite_boxes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep provider startup reconciliation isolated from the real SDK state."""
+
+    class _EmptyRuntime:
+        def start(self):
+            return self
+
+        def stop(self):
+            pass
+
+        def list_info(self):
+            return []
+
+    class _EmptyBoxlite:
+        @staticmethod
+        def default():
+            return _EmptyRuntime()
+
+    monkeypatch.setattr("deerflow.community.boxlite.provider._import_sync_boxlite_runtime", lambda: _EmptyBoxlite)
+
+
 def test_import_simplebox_missing_raises_actionable(monkeypatch: pytest.MonkeyPatch) -> None:
     _no_boxlite(monkeypatch)
     with pytest.raises(ImportError, match=r"deerflow-harness\[boxlite\]"):
@@ -116,6 +138,24 @@ def test_execute_command_rejects_invalid_env_key() -> None:
     box = BoxliteBox("box-id", box=object(), run=_fail_run)
     with pytest.raises(ValueError, match=r"POSIX"):
         box.execute_command("echo hi", env={"BAD KEY": "x"})
+
+
+def test_execute_command_forwards_timeout_to_sdk_and_loop_runner() -> None:
+    """Command timeout must bound both BoxLite exec and the loop bridge future."""
+    run_timeouts: list[float | None] = []
+
+    def _recording_run(coro, *, timeout=None):
+        run_timeouts.append(timeout)
+        return asyncio.run(coro)
+
+    fake = _FakeBox(name="box-id")
+    box = BoxliteBox("box-id", box=fake, run=_recording_run)
+
+    output = box.execute_command("echo ok", timeout=5)
+
+    assert "ok" in output
+    assert fake._exec_history[-1] == (("sh", "-lc", "echo ok"), None, 5)
+    assert run_timeouts == [5]
 
 
 def test_sandbox_id_deterministic(monkeypatch):
@@ -169,8 +209,8 @@ def test_idle_timeout_zero_is_preserved_and_disables_reaper(monkeypatch):
     provider.shutdown()
 
 
-def test_create_box_passes_sandbox_id_as_name(monkeypatch):
-    """_create_box passes sandbox_id as name= to SimpleBox."""
+def test_create_box_passes_prefixed_sandbox_id_as_name(monkeypatch):
+    """_create_box gives BoxLite a DeerFlow-owned name prefix."""
     monkeypatch.setattr(
         "deerflow.community.boxlite.provider.get_app_config",
         lambda: _stub_config(),
@@ -194,8 +234,56 @@ def test_create_box_passes_sandbox_id_as_name(monkeypatch):
 
     box = provider._create_box("test-sandbox-id")
     assert len(created_boxes) == 1
-    assert created_boxes[0]["name"] == "test-sandbox-id"
-    assert box.id == "test-sandbox-id"  # box.id comes from fake box name
+    assert created_boxes[0]["name"] == "deer-flow-boxlite-test-sandbox-id"
+    assert box.id == "test-sandbox-id"
+
+
+def test_startup_reconciliation_adopts_prefixed_existing_boxes(monkeypatch):
+    """Existing DeerFlow-named BoxLite boxes are adopted into the warm pool."""
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config(),
+    )
+    stopped: list[str] = []
+
+    class _NativeBox:
+        def stop(self):
+            stopped.append("adopted")
+
+    class _Runtime:
+        def start(self):
+            return self
+
+        def stop(self):
+            pass
+
+        def list_info(self):
+            return [
+                types.SimpleNamespace(name="deer-flow-boxlite-adopted"),
+                types.SimpleNamespace(name="unrelated-box"),
+                types.SimpleNamespace(name=None),
+            ]
+
+        def get(self, name):
+            if name == "deer-flow-boxlite-adopted":
+                return _NativeBox()
+            raise AssertionError(f"unexpected box lookup: {name}")
+
+    class _Boxlite:
+        @staticmethod
+        def default():
+            return _Runtime()
+
+    monkeypatch.setattr("deerflow.community.boxlite.provider._import_sync_boxlite_runtime", lambda: _Boxlite)
+
+    provider = BoxliteProvider()
+
+    assert list(provider._warm_pool) == ["adopted"]
+    adopted_box = provider._warm_pool["adopted"][0]
+    assert adopted_box.id == "adopted"
+
+    provider.shutdown()
+    assert stopped == ["adopted"]
 
 
 def test_release_parks_in_warm_pool(monkeypatch):
@@ -379,6 +467,82 @@ def test_release_during_shutdown_closes_instead_of_reparking(monkeypatch):
     provider._loop.close()
 
 
+def test_reset_parks_running_resources_for_later_cleanup(monkeypatch):
+    """reset() stops thread reuse but leaves VMs tracked for cleanup."""
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config(),
+    )
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider._import_simplebox",
+        lambda: _FakeBox,
+    )
+
+    provider = BoxliteProvider()
+    provider._loop.run = _fake_run
+
+    sid_active = provider.acquire("thread-active", user_id="u1")
+    sid_warm = provider.acquire("thread-warm", user_id="u1")
+    provider.release(sid_warm)
+    active_box = provider._boxes[sid_active]
+    warm_box = provider._warm_pool[sid_warm][0]
+    checker_thread = provider._idle_checker_thread
+    loop_thread = provider._loop._thread
+
+    provider.reset()
+
+    assert provider._boxes == {}
+    assert provider._warm_pool[sid_active][0] is active_box
+    assert provider._warm_pool[sid_warm][0] is warm_box
+    assert provider._thread_boxes == {}
+    assert provider._acquire_locks == {}
+    assert not active_box._closed
+    assert not warm_box._closed
+    assert not provider._shutdown_called
+    assert not provider._idle_checker_stop.is_set()
+    assert checker_thread is not None
+    assert checker_thread.is_alive()
+    assert loop_thread.is_alive()
+
+    provider.shutdown()
+    assert active_box._closed
+    assert warm_box._closed
+    assert provider._idle_checker_stop.is_set()
+    assert not checker_thread.is_alive()
+
+
+def test_reset_parked_resources_are_reaped_after_idle_timeout(monkeypatch):
+    """VMs parked by reset remain visible to warm-pool idle cleanup."""
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config(),
+    )
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider._import_simplebox",
+        lambda: _FakeBox,
+    )
+
+    provider = BoxliteProvider()
+    provider._loop.run = _fake_run
+
+    sid_active = provider.acquire("thread-active", user_id="u1")
+    sid_warm = provider.acquire("thread-warm", user_id="u1")
+    provider.release(sid_warm)
+    active_box = provider._boxes[sid_active]
+    warm_box = provider._warm_pool[sid_warm][0]
+
+    provider.reset()
+
+    provider._warm_pool[sid_active] = (active_box, time.time() - 9999)
+    provider._warm_pool[sid_warm] = (warm_box, time.time() - 9999)
+    provider._reap_expired_warm(idle_timeout=1)
+
+    assert provider._warm_pool == {}
+    assert active_box._closed
+    assert warm_box._closed
+    provider.shutdown()
+
+
 # ── Task 6: Idle reaper ───────────────────────────────────────────────
 
 
@@ -544,45 +708,3 @@ def test_shutdown_stops_idle_reaper_and_destroys_all_boxes(monkeypatch):
     assert len(provider._boxes) == 0
     assert len(provider._warm_pool) == 0
     assert len(provider._thread_boxes) == 0
-
-
-def test_reset_stops_background_lifecycle(monkeypatch):
-    """reset shuts down boxes, idle reaper, and private event loop."""
-    monkeypatch.setattr(
-        "deerflow.community.boxlite.provider.get_app_config",
-        lambda: _stub_config(),
-    )
-    monkeypatch.setattr(
-        "deerflow.community.boxlite.provider._import_simplebox",
-        lambda: _FakeBox,
-    )
-
-    provider = BoxliteProvider()
-    provider._loop.run = _fake_run
-
-    # Create one active box and one warm pool box
-    sid_active = provider.acquire("thread-1", user_id="u1")
-    sid_warm = provider.acquire("thread-2", user_id="u1")
-    provider.release(sid_warm)
-    active_box = provider._boxes[sid_active]
-    warm_box = provider._warm_pool[sid_warm][0]
-    checker_thread = provider._idle_checker_thread
-    loop_thread = provider._loop._thread
-
-    assert sid_active in provider._boxes
-    assert sid_warm in provider._warm_pool
-
-    provider.reset()
-
-    # All collections should be cleared
-    assert len(provider._boxes) == 0
-    assert len(provider._warm_pool) == 0
-    assert len(provider._thread_boxes) == 0
-    assert active_box._closed
-    assert warm_box._closed
-    assert provider._idle_checker_stop.is_set()
-    assert checker_thread is not None
-    assert not checker_thread.is_alive()
-    assert not loop_thread.is_alive()
-
-    provider.shutdown()
