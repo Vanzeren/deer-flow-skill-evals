@@ -400,7 +400,6 @@ def test_idle_reaper_destroys_expired_warm_boxes(monkeypatch):
 
     # Acquire and release a box into the warm pool
     sid = provider.acquire("thread-1", user_id="u1")
-    box, _ = provider._warm_pool.get(sid, (None, None)) if sid in provider._warm_pool else (None, None)
     provider.release(sid)
 
     assert sid in provider._warm_pool
