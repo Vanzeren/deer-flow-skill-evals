@@ -28,6 +28,12 @@ Install the optional runtime before selecting this provider:
 pip install "deerflow-harness[boxlite]"
 ```
 
+The `boxlite` package is an optional DeerFlow harness extra, not part of the
+default install. It is also limited to the host platforms and architectures
+where BoxLite publishes wheels and can boot micro-VMs. Unsupported development
+hosts, such as Windows, should use another sandbox provider or run DeerFlow from
+a supported Linux/macOS environment.
+
 **Host requirement:** BoxLite boots micro-VMs, so a Linux host needs KVM — i.e.
 nested virtualization when DeerFlow runs inside a cloud VM. macOS uses
 Hypervisor.framework. This is the main deployment constraint to weigh vs. the
