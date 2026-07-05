@@ -245,12 +245,13 @@ class BoxliteProvider(SandboxProvider):
                 self._thread_boxes[key] = box.id
             return box.id
 
-    def _create_box(self, sandbox_id: str) -> BoxliteBox:
-        # Enforce replica limit: evict oldest warm-pool box if active + warm boxes are at capacity.
-        replicas, total = self._replica_count()
-        if total >= replicas:
-            self._evict_oldest_warm()
-
+def _create_box(self, sandbox_id: str) -> BoxliteBox:
+    # Enforce replica limit: evict oldest warm-pool box if active + warm boxes are at capacity.
+    replicas, total = self._replica_count()
+    if total >= replicas:
+        evicted = self._evict_oldest_warm()
+        if evicted is None:
+            logger.warning("All %s replica slots are in active use; creating BoxLite box %s beyond the soft limit", replicas, sandbox_id)
         simplebox_cls = _import_simplebox()
         mkdir_cmd = "mkdir -p " + " ".join(_VIRTUAL_DIRS)
 
