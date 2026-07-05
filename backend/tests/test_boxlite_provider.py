@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 import time
 import types
 
@@ -154,6 +155,20 @@ def test_sandbox_id_different_threads(monkeypatch):
     assert id_a != id_b
 
 
+def test_idle_timeout_zero_is_preserved_and_disables_reaper(monkeypatch):
+    """idle_timeout=0 is a valid config value and disables the reaper thread."""
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config({"idle_timeout": 0}),
+    )
+
+    provider = BoxliteProvider()
+
+    assert provider._config["idle_timeout"] == 0
+    assert provider._idle_checker_thread is None
+    provider.shutdown()
+
+
 def test_create_box_passes_sandbox_id_as_name(monkeypatch):
     """_create_box passes sandbox_id as name= to SimpleBox."""
     monkeypatch.setattr(
@@ -293,6 +308,77 @@ def test_warm_pool_reclaim_failed_health_check_creates_new(monkeypatch):
     assert sid2 in provider._boxes
 
 
+def test_concurrent_same_thread_acquire_creates_one_box(monkeypatch):
+    """Concurrent acquires for one thread serialize before creating a named box."""
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config(),
+    )
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider._import_simplebox",
+        lambda: _FakeBox,
+    )
+
+    provider = BoxliteProvider()
+    provider._loop.run = _fake_run
+    original_create_box = provider._create_box
+    create_started = threading.Event()
+    created: list[str] = []
+
+    def slow_create_box(sandbox_id: str) -> BoxliteBox:
+        create_started.set()
+        time.sleep(0.1)
+        created.append(sandbox_id)
+        return original_create_box(sandbox_id)
+
+    provider._create_box = slow_create_box  # type: ignore[method-assign]
+    results: list[str] = []
+
+    def acquire() -> None:
+        results.append(provider.acquire("thread-1", user_id="u1"))
+
+    first = threading.Thread(target=acquire)
+    second = threading.Thread(target=acquire)
+    first.start()
+    assert create_started.wait(timeout=2)
+    second.start()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert len(results) == 2
+    assert results[0] == results[1]
+    assert len(created) == 1
+    assert results[0] in provider._boxes
+    provider.shutdown()
+
+
+def test_release_during_shutdown_closes_instead_of_reparking(monkeypatch):
+    """release() must not park a VM after shutdown has begun."""
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config(),
+    )
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider._import_simplebox",
+        lambda: _FakeBox,
+    )
+
+    provider = BoxliteProvider()
+    provider._loop.run = _fake_run
+
+    sid = provider.acquire("thread-1", user_id="u1")
+    box = provider._boxes[sid]
+    with provider._lock:
+        provider._shutdown_called = True
+
+    provider.release(sid)
+
+    assert sid not in provider._boxes
+    assert sid not in provider._warm_pool
+    assert box._closed
+    provider._loop.close()
+
+
 # ── Task 6: Idle reaper ───────────────────────────────────────────────
 
 
@@ -308,8 +394,7 @@ def test_idle_reaper_destroys_expired_warm_boxes(monkeypatch):
     )
 
     # Use a very short check interval so the reaper runs quickly
-    BoxliteProvider.IDLE_CHECK_INTERVAL = 0.1
-
+    monkeypatch.setattr(BoxliteProvider, "IDLE_CHECK_INTERVAL", 0.1)
     provider = BoxliteProvider()
     provider._loop.run = _fake_run
 
@@ -385,6 +470,34 @@ def test_replica_enforcement_evicts_oldest_warm(monkeypatch):
     provider.shutdown()
 
 
+def test_replica_enforcement_counts_active_and_warm(monkeypatch):
+    """replicas caps active + warm boxes, not warm boxes alone."""
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config({"replicas": 2}),
+    )
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider._import_simplebox",
+        lambda: _FakeBox,
+    )
+
+    provider = BoxliteProvider()
+    provider._loop.run = _fake_run
+
+    sid_active = provider.acquire("thread-active", user_id="u1")
+    sid_warm = provider.acquire("thread-warm", user_id="u1")
+    provider.release(sid_warm)
+    warm_box = provider._warm_pool[sid_warm][0]
+
+    sid_new = provider.acquire("thread-new", user_id="u1")
+
+    assert sid_active in provider._boxes
+    assert sid_new in provider._boxes
+    assert sid_warm not in provider._warm_pool
+    assert warm_box._closed
+    provider.shutdown()
+
+
 # ── Task 8: Shutdown and reset including warm pool ────────────────────
 
 
@@ -452,6 +565,8 @@ def test_reset_clears_warm_pool(monkeypatch):
     sid_active = provider.acquire("thread-1", user_id="u1")
     sid_warm = provider.acquire("thread-2", user_id="u1")
     provider.release(sid_warm)
+    active_box = provider._boxes[sid_active]
+    warm_box = provider._warm_pool[sid_warm][0]
 
     assert sid_active in provider._boxes
     assert sid_warm in provider._warm_pool
@@ -462,5 +577,7 @@ def test_reset_clears_warm_pool(monkeypatch):
     assert len(provider._boxes) == 0
     assert len(provider._warm_pool) == 0
     assert len(provider._thread_boxes) == 0
+    assert active_box._closed
+    assert warm_box._closed
 
     provider.shutdown()

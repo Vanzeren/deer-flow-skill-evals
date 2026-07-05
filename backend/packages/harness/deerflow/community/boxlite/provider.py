@@ -116,16 +116,16 @@ class BoxliteProvider(SandboxProvider):
         self._boxes: dict[str, BoxliteBox] = {}
         self._thread_boxes: dict[tuple[str, str], str] = {}
         self._warm_pool: dict[str, tuple[BoxliteBox, float]] = {}
+        self._acquire_locks: dict[str, threading.Lock] = {}
         self._idle_checker_stop = threading.Event()
         self._idle_checker_thread: threading.Thread | None = None
         self._shutdown_called = False
         self._config = self._load_config()
         self._loop = _EventLoopThread()
         atexit.register(self.shutdown)
-        self._idle_checker_thread = threading.Thread(
-            target=self._idle_reaper_loop, name="boxlite-idle-reaper", daemon=True
-        )
-        self._idle_checker_thread.start()
+        if self._config["idle_timeout"] > 0:
+            self._idle_checker_thread = threading.Thread(target=self._idle_reaper_loop, name="boxlite-idle-reaper", daemon=True)
+            self._idle_checker_thread.start()
 
     def _load_config(self) -> dict[str, Any]:
         sandbox_config = get_app_config().sandbox
@@ -135,18 +135,29 @@ class BoxliteProvider(SandboxProvider):
 
         # $VARS in config.yaml are already resolved by AppConfig.resolve_env_variables
         # (which raises on a missing var), so the environment dict is used as-is.
+        replicas = _opt("replicas")
+        idle_timeout = _opt("idle_timeout")
         return {
             "image": _opt("image") or DEFAULT_IMAGE,
             "memory_mib": _opt("memory_mib"),
             "cpus": _opt("cpus"),
             "environment": dict(_opt("environment") or {}),
-            "replicas": _opt("replicas") or self.DEFAULT_REPLICAS,
-            "idle_timeout": _opt("idle_timeout") or self.DEFAULT_IDLE_TIMEOUT,
+            "replicas": replicas if replicas is not None else self.DEFAULT_REPLICAS,
+            "idle_timeout": idle_timeout if idle_timeout is not None else self.DEFAULT_IDLE_TIMEOUT,
         }
 
     @staticmethod
     def _thread_key(thread_id: str, user_id: str | None) -> tuple[str, str]:
         return (user_id or "", thread_id)
+
+    def _lock_for_sandbox(self, sandbox_id: str) -> threading.Lock:
+        """Return the per-sandbox acquire lock for a deterministic sandbox id."""
+        with self._lock:
+            lock = self._acquire_locks.get(sandbox_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._acquire_locks[sandbox_id] = lock
+            return lock
 
     # ── Idle reaper (Task 6) ─────────────────────────────────────────────
 
@@ -157,8 +168,10 @@ class BoxliteProvider(SandboxProvider):
 
     def _reap_expired_warm(self) -> None:
         """Destroy warm-pool boxes that have been idle longer than the timeout."""
-        now = time.time()
         timeout = self._config["idle_timeout"]
+        if timeout <= 0:
+            return
+        now = time.time()
         expired: list[tuple[str, BoxliteBox]] = []
         with self._lock:
             for sid, (box, ts) in self._warm_pool.items():
@@ -176,61 +189,66 @@ class BoxliteProvider(SandboxProvider):
 
     # ── Replica enforcement (Task 7) ─────────────────────────────────────
 
-    def _replica_count(self) -> int:
-        """Return the number of boxes currently in the warm pool."""
+    def _replica_count(self) -> tuple[int, int]:
+        """Return configured replicas and current active + warm box count."""
+        replicas = self._config.get("replicas", self.DEFAULT_REPLICAS)
         with self._lock:
-            return len(self._warm_pool)
+            total = len(self._boxes) + len(self._warm_pool)
+        return replicas, total
 
-    def _evict_oldest_warm(self) -> None:
+    def _evict_oldest_warm(self) -> str | None:
         """Evict and destroy the oldest warm-pool box (by timestamp).
 
         Only evicts from the warm pool — active boxes are never touched.
         """
-        box = None
         with self._lock:
             if not self._warm_pool:
-                return
+                return None
             oldest_sid = min(self._warm_pool, key=lambda sid: self._warm_pool[sid][1])
             box, _ = self._warm_pool.pop(oldest_sid)
 
-        if box is not None:
-            try:
-                box.close()
-                logger.info("Replica enforcement evicted oldest warm-pool box %s", box.id)
-            except Exception as e:
-                logger.warning("Error closing evicted BoxLite box %s: %s", box.id, e)
+        try:
+            box.close()
+            logger.info("Replica enforcement evicted oldest warm-pool box %s", box.id)
+        except Exception as e:
+            logger.warning("Error closing evicted BoxLite box %s: %s", box.id, e)
+        return oldest_sid
 
     # ── Acquire / release ────────────────────────────────────────────────
 
     def acquire(self, thread_id: str | None = None, *, user_id: str | None = None) -> str:
-        if thread_id is not None:
-            key = self._thread_key(thread_id, user_id)
+        if thread_id is None:
+            sandbox_id = str(uuid.uuid4())[:8]
+            box = self._create_box(sandbox_id)
+            with self._lock:
+                self._boxes[box.id] = box
+            return box.id
+
+        key = self._thread_key(thread_id, user_id)
+        sandbox_id = self._sandbox_id(thread_id, user_id)
+        acquire_lock = self._lock_for_sandbox(sandbox_id)
+        with acquire_lock:
             with self._lock:
                 existing = self._thread_boxes.get(key)
                 if existing is not None and existing in self._boxes:
                     return existing
 
-            # Try warm pool reclaim
-            sandbox_id = self._sandbox_id(thread_id, user_id)
             reclaimed = self._reclaim_warm_pool(sandbox_id)
             if reclaimed is not None:
                 with self._lock:
                     self._thread_boxes[key] = reclaimed
                 return reclaimed
 
-        # No existing box — create new
-        sandbox_id = self._sandbox_id(thread_id, user_id) if thread_id else str(uuid.uuid4())[:8]
-        box = self._create_box(sandbox_id)
-
-        with self._lock:
-            self._boxes[box.id] = box
-            if thread_id is not None:
-                self._thread_boxes[self._thread_key(thread_id, user_id)] = box.id
-        return box.id
+            box = self._create_box(sandbox_id)
+            with self._lock:
+                self._boxes[box.id] = box
+                self._thread_boxes[key] = box.id
+            return box.id
 
     def _create_box(self, sandbox_id: str) -> BoxliteBox:
-        # Enforce replica limit: evict oldest warm-pool box if at capacity
-        if self._replica_count() >= self._config["replicas"]:
+        # Enforce replica limit: evict oldest warm-pool box if active + warm boxes are at capacity.
+        replicas, total = self._replica_count()
+        if total >= replicas:
             self._evict_oldest_warm()
 
         simplebox_cls = _import_simplebox()
@@ -261,17 +279,24 @@ class BoxliteProvider(SandboxProvider):
 
         The box is moved from _boxes to _warm_pool; _thread_boxes entries are
         cleared so the thread no longer holds an active reference. The VM is
-        NOT stopped — only eviction or idle timeout destroys it.
+        NOT stopped unless shutdown has already begun.
         """
-        box = None
+        close_box: BoxliteBox | None = None
         with self._lock:
             box = self._boxes.pop(sandbox_id, None)
             for key in [k for k, sid in self._thread_boxes.items() if sid == sandbox_id]:
                 self._thread_boxes.pop(key, None)
-
-        if box is not None:
-            with self._lock:
+            if box is None:
+                return
+            if self._shutdown_called:
+                close_box = box
+            else:
                 self._warm_pool[sandbox_id] = (box, time.time())
+
+        if close_box is not None:
+            close_box.close()
+            logger.info("Closed released sandbox %s because shutdown is in progress", sandbox_id)
+        else:
             logger.info("Released sandbox %s to warm pool (VM still running)", sandbox_id)
 
     def _reclaim_warm_pool(self, sandbox_id: str) -> str | None:
@@ -313,25 +338,36 @@ class BoxliteProvider(SandboxProvider):
 
     def reset(self) -> None:
         with self._lock:
-            self._boxes.clear()
-            self._warm_pool.clear()
-            self._thread_boxes.clear()
-
-    def shutdown(self) -> None:
-        # Stop idle checker first
-        self._idle_checker_stop.set()
-        if self._idle_checker_thread is not None:
-            self._idle_checker_thread.join(timeout=5)
-
-        with self._lock:
-            if self._shutdown_called:
-                return
-            self._shutdown_called = True
             active = list(self._boxes.values())
             warm = [box for box, _ in self._warm_pool.values()]
             self._boxes.clear()
             self._warm_pool.clear()
             self._thread_boxes.clear()
+            self._acquire_locks.clear()
+
+        for box in active + warm:
+            try:
+                box.close()
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("Error closing BoxLite box during reset", exc_info=True)
+
+    def shutdown(self) -> None:
+        with self._lock:
+            if self._shutdown_called:
+                return
+            self._shutdown_called = True
+
+        self._idle_checker_stop.set()
+        if self._idle_checker_thread is not None:
+            self._idle_checker_thread.join(timeout=5)
+
+        with self._lock:
+            active = list(self._boxes.values())
+            warm = [box for box, _ in self._warm_pool.values()]
+            self._boxes.clear()
+            self._warm_pool.clear()
+            self._thread_boxes.clear()
+            self._acquire_locks.clear()
 
         for box in active + warm:
             try:
