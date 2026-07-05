@@ -245,13 +245,13 @@ class BoxliteProvider(SandboxProvider):
                 self._thread_boxes[key] = box.id
             return box.id
 
-def _create_box(self, sandbox_id: str) -> BoxliteBox:
-    # Enforce replica limit: evict oldest warm-pool box if active + warm boxes are at capacity.
-    replicas, total = self._replica_count()
-    if total >= replicas:
-        evicted = self._evict_oldest_warm()
-        if evicted is None:
-            logger.warning("All %s replica slots are in active use; creating BoxLite box %s beyond the soft limit", replicas, sandbox_id)
+    def _create_box(self, sandbox_id: str) -> BoxliteBox:
+        # Enforce replica limit: evict oldest warm-pool box if active + warm boxes are at capacity.
+        replicas, total = self._replica_count()
+        if total >= replicas:
+            evicted = self._evict_oldest_warm()
+            if evicted is None:
+                logger.warning("All %s replica slots are in active use; creating BoxLite box %s beyond the soft limit", replicas, sandbox_id)
         simplebox_cls = _import_simplebox()
         mkdir_cmd = "mkdir -p " + " ".join(_VIRTUAL_DIRS)
 
@@ -338,19 +338,7 @@ def _create_box(self, sandbox_id: str) -> BoxliteBox:
         return sandbox_id
 
     def reset(self) -> None:
-        with self._lock:
-            active = list(self._boxes.values())
-            warm = [box for box, _ in self._warm_pool.values()]
-            self._boxes.clear()
-            self._warm_pool.clear()
-            self._thread_boxes.clear()
-            self._acquire_locks.clear()
-
-        for box in active + warm:
-            try:
-                box.close()
-            except Exception:  # pragma: no cover - defensive
-                logger.debug("Error closing BoxLite box during reset", exc_info=True)
+        self.shutdown()
 
     def shutdown(self) -> None:
         with self._lock:

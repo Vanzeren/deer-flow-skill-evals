@@ -547,8 +547,8 @@ def test_shutdown_stops_idle_reaper_and_destroys_all_boxes(monkeypatch):
     assert len(provider._thread_boxes) == 0
 
 
-def test_reset_clears_warm_pool(monkeypatch):
-    """reset clears warm pool in addition to boxes and thread_boxes."""
+def test_reset_stops_background_lifecycle(monkeypatch):
+    """reset shuts down boxes, idle reaper, and private event loop."""
     monkeypatch.setattr(
         "deerflow.community.boxlite.provider.get_app_config",
         lambda: _stub_config(),
@@ -567,6 +567,8 @@ def test_reset_clears_warm_pool(monkeypatch):
     provider.release(sid_warm)
     active_box = provider._boxes[sid_active]
     warm_box = provider._warm_pool[sid_warm][0]
+    checker_thread = provider._idle_checker_thread
+    loop_thread = provider._loop._thread
 
     assert sid_active in provider._boxes
     assert sid_warm in provider._warm_pool
@@ -579,5 +581,9 @@ def test_reset_clears_warm_pool(monkeypatch):
     assert len(provider._thread_boxes) == 0
     assert active_box._closed
     assert warm_box._closed
+    assert provider._idle_checker_stop.is_set()
+    assert checker_thread is not None
+    assert not checker_thread.is_alive()
+    assert not loop_thread.is_alive()
 
     provider.shutdown()
