@@ -70,6 +70,42 @@ def test_compare_snapshots_reports_text_file_changes(tmp_path):
     assert changes["/mnt/user-data/workspace/old.txt"].status == "deleted"
 
 
+def test_compare_snapshots_treats_utf16_markdown_as_text(tmp_path):
+    roots = _roots(tmp_path)
+    workspace = roots[0].host_path
+
+    before = scan_workspace_roots(roots)
+    (workspace / "guide.md").write_bytes("# 标题\n\nhello\n".encode("utf-16"))
+    after = scan_workspace_roots(roots)
+
+    result = compare_snapshots(before, after)
+
+    change = result.files[0]
+    assert change.path == "/mnt/user-data/workspace/guide.md"
+    assert change.binary is False
+    assert change.diff_unavailable_reason is None
+    assert "+# 标题" in change.diff
+
+
+def test_compare_snapshots_reads_cached_utf16_markdown_baseline(tmp_path):
+    roots = _roots(tmp_path)
+    workspace = roots[0].host_path
+    cache_dir = tmp_path / "cache"
+
+    (workspace / "guide.md").write_bytes("# 标题\n\nhello\n".encode("utf-16"))
+    before = scan_workspace_roots(roots, text_cache_dir=cache_dir)
+    (workspace / "guide.md").write_bytes("# 标题\n\nupdated\n".encode("utf-16"))
+    after = scan_workspace_roots(roots)
+
+    result = compare_snapshots(before, after)
+
+    change = result.files[0]
+    assert change.binary is False
+    assert change.diff_unavailable_reason is None
+    assert "-hello" in change.diff
+    assert "+updated" in change.diff
+
+
 def test_count_diff_lines_ignores_only_real_headers():
     from deerflow.workspace_changes.diff import _count_diff_lines
 
