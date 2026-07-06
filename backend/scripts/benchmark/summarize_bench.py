@@ -3,9 +3,9 @@
 
 Usage::
 
-    python scripts/summarize_bench.py results.jsonl
-    python scripts/summarize_bench.py results/*.jsonl --group provider,scenario,workload
-    python scripts/summarize_bench.py results.jsonl --csv > summary.csv
+    python scripts/benchmark/summarize_bench.py results.jsonl
+    python scripts/benchmark/summarize_bench.py results/*.jsonl --group provider,scenario,workload
+    python scripts/benchmark/summarize_bench.py results.jsonl --csv > summary.csv
 """
 
 from __future__ import annotations
@@ -22,22 +22,30 @@ def _p(arr: list[float], pct: float) -> float:
     if not arr:
         return 0.0
     s = sorted(arr)
-    idx = max(0, min(len(s) - 1, int(len(s) * pct / 100)))
-    return s[idx]
+    if len(s) == 1:
+        return s[0]
+    rank = (len(s) - 1) * (pct / 100)
+    lower = int(rank)
+    upper = min(lower + 1, len(s) - 1)
+    weight = rank - lower
+    return s[lower] * (1 - weight) + s[upper] * weight
 
 
 def _load_jsonl(paths: list[Path]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    errors: list[str] = []
     for p in paths:
         with p.open("r", encoding="utf-8") as f:
-            for line in f:
+            for line_no, line in enumerate(f, start=1):
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
                 try:
                     rows.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+                except json.JSONDecodeError as exc:
+                    errors.append(f"{p}:{line_no}: {exc.msg}")
+    if errors:
+        raise ValueError("Malformed JSONL row(s):\n" + "\n".join(errors))
     return rows
 
 
@@ -161,7 +169,11 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     paths = [Path(i) for i in args.inputs]
-    rows = _load_jsonl(paths)
+    try:
+        rows = _load_jsonl(paths)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     if not rows:
         print("No valid JSONL rows found.", file=sys.stderr)
         return 1

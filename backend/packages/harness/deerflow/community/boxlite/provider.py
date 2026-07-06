@@ -196,6 +196,7 @@ class BoxliteProvider(WarmPoolLifecycleMixin[BoxliteBox], SandboxProvider):
         # (which raises on a missing var), so the environment dict is used as-is.
         replicas = _opt("replicas")
         idle_timeout = _opt("idle_timeout")
+        health_check_skip_seconds = _opt("health_check_skip_seconds")
         return {
             "image": _opt("image") or DEFAULT_IMAGE,
             "memory_mib": _opt("memory_mib"),
@@ -203,7 +204,7 @@ class BoxliteProvider(WarmPoolLifecycleMixin[BoxliteBox], SandboxProvider):
             "environment": dict(_opt("environment") or {}),
             "replicas": replicas if replicas is not None else self.DEFAULT_REPLICAS,
             "idle_timeout": idle_timeout if idle_timeout is not None else self.DEFAULT_IDLE_TIMEOUT,
-            "health_check_skip_seconds": float(_opt("health_check_skip_seconds") or 5.0),
+            "health_check_skip_seconds": float(health_check_skip_seconds if health_check_skip_seconds is not None else 5.0),
         }
 
     @staticmethod

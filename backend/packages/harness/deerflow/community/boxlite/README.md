@@ -16,7 +16,7 @@ sandbox:
   image: python:3.12-slim         # any OCI image (default: python:3.12-slim)
   memory_mib: 1024                # per-box memory cap (optional)
   cpus: 2                         # per-box vCPUs (optional)
-  replicas: 3                     # active + warm VM cap (default: 3)
+  replicas: 3                     # active + warm VM cap per gateway process (default: 3)
   idle_timeout: 600               # warm VM idle seconds before stop; 0 disables
   health_check_skip_seconds: 5.0  # skip health check on reclaim if box was
                                   #   released within this many seconds (default: 5.0)

@@ -6,7 +6,7 @@ workloads, and concurrency levels.  Outputs JSONL for aggregation.
 
 Usage::
 
-    python scripts/bench_sandbox_provider.py \\
+    python scripts/benchmark/bench_sandbox_provider.py \\
         --provider boxlite \\
         --scenario warm_same_thread \\
         --workload noop \\
@@ -14,7 +14,7 @@ Usage::
         --concurrency 4 \\
         --output results.jsonl
 
-    python scripts/bench_sandbox_provider.py \\
+    python scripts/benchmark/bench_sandbox_provider.py \\
         --provider boxlite \\
         --scenario cold_unique_thread \\
         --no-warmpool \\
@@ -153,7 +153,6 @@ def _make_boxlite_provider(config: dict[str, Any]) -> tuple[Any, dict[str, Any]]
     )
 
     # -- BoxLite 0.9.7 shim permission workaround --
-    _orig_create_box = BoxliteProvider._create_box
 
     def _patched_create_box(self: Any, sandbox_id: str) -> Any:
         from deerflow.community.boxlite.box import BoxliteBox
@@ -168,6 +167,10 @@ def _make_boxlite_provider(config: dict[str, Any]) -> tuple[Any, dict[str, Any]]
         boxes_dir = os.path.expanduser("~/.boxlite/boxes")
 
         replicas, total = self._replica_count()
+
+        if total >= replicas:
+            evicted = self._evict_oldest_warm()
+            self._log_replicas_soft_cap(replicas, sandbox_id, evicted)
 
         async def _make():
             box = simplebox_cls(
@@ -214,8 +217,14 @@ def _make_aio_provider(config: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
     from deerflow.community.aio_sandbox.aio_sandbox_provider import AioSandboxProvider
 
     sandbox_attrs = {
+        "image": config.get("image"),
+        "port": config.get("port"),
+        "container_prefix": config.get("container_prefix"),
         "replicas": config.get("replicas", 3),
         "idle_timeout": config.get("idle_timeout", 600),
+        "mounts": config.get("mounts", []),
+        "environment": config.get("environment", {}),
+        "provisioner_url": config.get("provisioner_url", ""),
     }
 
     monkeypatch = __import__("pytest").MonkeyPatch()
@@ -525,6 +534,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.workload == "state_reuse" and (args.scenario != "warm_same_thread" or args.concurrency != 1):
+        raise SystemExit("state_reuse requires --scenario warm_same_thread --concurrency 1")
+
     output_path = Path(args.output)
 
     config: dict[str, Any] = {
@@ -548,18 +560,19 @@ def main(argv: list[str] | None = None) -> int:
                 f"Warming up ({args.warmup_iterations} turn(s))...",
                 file=sys.stderr,
             )
-            _run_one_turn(
-                provider=provider,
-                provider_name=args.provider,
-                scenario="warmup",
-                workload_name="noop",
-                command="true",
-                iteration=-1,
-                concurrency=1,
-                user_id="bench-user",
-                thread_id="warmup",
-                no_warmpool=args.no_warmpool,
-            )
+            for i in range(args.warmup_iterations):
+                _run_one_turn(
+                    provider=provider,
+                    provider_name=args.provider,
+                    scenario="warmup",
+                    workload_name="noop",
+                    command="true",
+                    iteration=-(args.warmup_iterations - i),
+                    concurrency=1,
+                    user_id="bench-user",
+                    thread_id="warmup",
+                    no_warmpool=args.no_warmpool,
+                )
 
         # --- Idle-timeout scenario: special handling ---
         if args.scenario == "idle_timeout":
