@@ -445,14 +445,24 @@ class BoxliteProvider(WarmPoolLifecycleMixin[BoxliteBox], SandboxProvider):
 
         skip_seconds = self._config.get("health_check_skip_seconds", 5.0)
         if skip_eligible and skip_seconds > 0 and (time.time() - released_at) < skip_seconds:
-            # Recently released by this provider — promote directly without health check
+            # Recently released by this provider — promote directly without a
+            # health-check round trip, but never return an adapter that this
+            # process already knows is closed.
             with self._lock:
                 warm_entry = self._warm_pool.pop(sandbox_id, None)
                 if warm_entry is None:
                     return None  # Raced with another thread
                 self._skip_health_check_warm_ids.discard(sandbox_id)
                 box, _ = warm_entry
-                self._boxes[sandbox_id] = box
+                if box.is_closed:
+                    logger.warning("Warm-pool box %s was closed before skipped health check reclaim", sandbox_id)
+                    close_box = box
+                else:
+                    close_box = None
+                    self._boxes[sandbox_id] = box
+            if close_box is not None:
+                close_box.close()
+                return None
             logger.debug(
                 "Reclaimed warm-pool box %s (skipped health check, age=%.1fs)",
                 sandbox_id,

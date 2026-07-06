@@ -136,7 +136,7 @@ def _make_boxlite_provider(config: dict[str, Any]) -> tuple[Any, dict[str, Any]]
     from deerflow.community.boxlite.provider import BoxliteProvider
 
     sandbox_attrs = {
-        "image": config.get("image", "python:3.12-slim"),
+        "image": config.get("image") or "python:3.12-slim",
         "replicas": config.get("replicas", 3),
         "idle_timeout": config.get("idle_timeout", 600),
     }
@@ -247,6 +247,38 @@ PROVIDER_FACTORIES: dict[str, Callable] = {
 
 
 # ── Warm-hit tracking ───────────────────────────────────────────────────
+_WARM_HIT_STATE = threading.local()
+
+
+def _install_warm_hit_tracking(provider: Any) -> None:
+    """Record warm-pool reclaims from inside the provider acquire path."""
+    if getattr(provider, "_bench_warm_hit_tracking_installed", False):
+        return
+
+    installed = False
+    for method_name in ("_reclaim_warm_pool", "_reclaim_warm_pool_sandbox"):
+        original = getattr(provider, method_name, None)
+        if original is None:
+            continue
+
+        def _wrapped(*args: Any, _original: Callable = original, **kwargs: Any):
+            result = _original(*args, **kwargs)
+            if result is not None:
+                _WARM_HIT_STATE.value = True
+            return result
+
+        setattr(provider, method_name, _wrapped)
+        installed = True
+
+    setattr(provider, "_bench_warm_hit_tracking_installed", installed)
+
+
+def _reset_warm_hit_tracking() -> None:
+    _WARM_HIT_STATE.value = False
+
+
+def _warm_hit_from_acquire() -> bool:
+    return bool(getattr(_WARM_HIT_STATE, "value", False))
 
 
 def _compute_sandbox_id(provider: Any, thread_id: str, user_id: str) -> str:
@@ -298,13 +330,26 @@ def _run_one_turn(
     t0 = time.perf_counter()
     sandbox_id = _compute_sandbox_id(provider, thread_id, user_id)
 
+    sid: str | None = None
+    warm_hit: bool | None = None
+    acquire_ms = 0.0
+    run_ms = 0.0
+    release_ms = 0.0
+    release_needed = False
+
     try:
-        # Detect warm hit BEFORE acquire
-        warm_hit = _was_warm_hit(provider, sandbox_id)
+        tracked_warm_hit = getattr(provider, "_bench_warm_hit_tracking_installed", False)
+        _reset_warm_hit_tracking()
+        if not tracked_warm_hit:
+            warm_hit = _was_warm_hit(provider, sandbox_id)
 
         t_a = time.perf_counter()
         sid = provider.acquire(thread_id, user_id=user_id)
         t_b = time.perf_counter()
+        if tracked_warm_hit:
+            warm_hit = _warm_hit_from_acquire()
+        acquire_ms = (t_b - t_a) * 1000
+        release_needed = True
 
         sandbox = provider.get(sid)
         if sandbox is None:
@@ -319,6 +364,9 @@ def _run_one_turn(
         t_c = time.perf_counter()
         output = sandbox.execute_command(cmd, timeout=30)
         t_d = time.perf_counter()
+        run_ms = (t_d - t_c) * 1000
+        if output.startswith("Error:"):
+            raise RuntimeError(output)
 
         if expected_state is not None:
             if expected_state.strip() not in output.strip():
@@ -326,7 +374,9 @@ def _run_one_turn(
 
         t_e = time.perf_counter()
         provider.release(sid)
+        release_needed = False
         t_f = time.perf_counter()
+        release_ms = (t_f - t_e) * 1000
 
         if no_warmpool:
             _evict_from_warm(provider, sid)
@@ -339,9 +389,9 @@ def _run_one_turn(
             concurrency=concurrency,
             thread_id=thread_id,
             user_id=user_id,
-            acquire_ms=(t_b - t_a) * 1000,
-            run_ms=(t_d - t_c) * 1000,
-            release_ms=(t_f - t_e) * 1000,
+            acquire_ms=acquire_ms,
+            run_ms=run_ms,
+            release_ms=release_ms,
             total_ms=(t_f - t0) * 1000,
             warm_hit=warm_hit,
             success=True,
@@ -349,6 +399,20 @@ def _run_one_turn(
         )
 
     except Exception as exc:
+        release_error: str | None = None
+        if sid is not None and release_needed:
+            t_release = time.perf_counter()
+            try:
+                provider.release(sid)
+                if no_warmpool:
+                    _evict_from_warm(provider, sid)
+            except Exception as release_exc:
+                release_error = repr(release_exc)
+            finally:
+                release_ms = (time.perf_counter() - t_release) * 1000
+        error = str(exc) if str(exc).startswith("Error:") else repr(exc)
+        if release_error is not None:
+            error = f"{error}; release_error={release_error}"
         return BenchResult(
             provider=provider_name,
             scenario=scenario,
@@ -357,13 +421,13 @@ def _run_one_turn(
             concurrency=concurrency,
             thread_id=thread_id,
             user_id=user_id,
-            acquire_ms=0,
-            run_ms=0,
-            release_ms=0,
+            acquire_ms=acquire_ms,
+            run_ms=run_ms,
+            release_ms=release_ms,
             total_ms=(time.perf_counter() - t0) * 1000,
-            warm_hit=None,
+            warm_hit=warm_hit,
             success=False,
-            error=repr(exc),
+            error=error,
             no_warmpool=no_warmpool,
         )
 
@@ -555,8 +619,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--image",
-        default="python:3.12-slim",
-        help="OCI image for BoxLite (default: python:3.12-slim)",
+        default=None,
+        help="OCI image override (default: provider-specific)",
     )
     p.add_argument(
         "--warmup-iterations",
@@ -592,6 +656,7 @@ def main(argv: list[str] | None = None) -> int:
 
     factory = PROVIDER_FACTORIES[args.provider]
     provider, config_used = factory(config)
+    _install_warm_hit_tracking(provider)
 
     if output_path.exists():
         header = f"# provider={args.provider} scenario={args.scenario} workload={args.workload} concurrency={args.concurrency} iterations={args.iterations} no_warmpool={args.no_warmpool}\n"

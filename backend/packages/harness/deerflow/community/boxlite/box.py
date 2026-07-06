@@ -109,7 +109,7 @@ class BoxliteBox(Sandbox):
                 box = self._box
             return self._run(box.exec(*argv, env=env, timeout=timeout), timeout=timeout)
         except Exception as e:
-            if self._on_terminal_failure is not None and ("sandbox has been closed" in str(e) or self._is_terminal_box_failure(e)):
+            if self._on_terminal_failure is not None and self._is_terminal_box_failure(e):
                 try:
                     self._on_terminal_failure(self.id, str(e))
                 except Exception:
@@ -133,6 +133,11 @@ class BoxliteBox(Sandbox):
             self._run(self._box.stop())
         except Exception as e:
             logger.warning("Error stopping BoxLite box %s: %s", self.id, e)
+
+    @property
+    def is_closed(self) -> bool:
+        with self._lock:
+            return self._closed
 
     # ── path safety (mirrors community/e2b_sandbox) ─────────────────────
 

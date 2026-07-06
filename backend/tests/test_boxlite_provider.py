@@ -548,6 +548,46 @@ def test_dead_active_box_is_invalidated_after_command_failure(monkeypatch):
     provider.shutdown()
 
 
+def test_stale_closed_adapter_cannot_invalidate_recreated_box(monkeypatch):
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config({"health_check_skip_seconds": 5}),
+    )
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider._import_simplebox",
+        lambda: _FakeBox,
+    )
+
+    provider = BoxliteProvider()
+    provider._loop.run = _fake_run
+
+    sid = provider.acquire("thread-1", user_id="u1")
+    stale_box = provider.get(sid)
+    assert stale_box is not None
+
+    def _dead_run(coro, *, timeout=None):
+        coro.close()
+        raise RuntimeError("vsock disconnected")
+
+    stale_box._run = _dead_run
+    stale_box.execute_command("echo hi")
+    assert provider.get(sid) is None
+
+    provider._loop.run = _fake_run
+    sid2 = provider.acquire("thread-1", user_id="u1")
+    replacement = provider.get(sid2)
+    assert sid2 == sid
+    assert replacement is not None
+    assert replacement is not stale_box
+
+    stale_box.execute_command("echo again")
+
+    assert provider.get(sid) is replacement
+    assert replacement._closed is False
+
+    provider.shutdown()
+
+
 def test_acquire_different_threads_dont_reclaim_each_other(monkeypatch):
     """Thread A's box can't be reclaimed by thread B."""
     monkeypatch.setattr(
@@ -599,6 +639,10 @@ def test_warm_pool_reclaim_failed_health_check_creates_new(monkeypatch):
     sid2 = provider.acquire("thread-1", user_id="u1")
     assert sid2 == sid1  # Same deterministic ID
     assert sid2 in provider._boxes
+    replacement = provider.get(sid2)
+    assert replacement is not None
+    assert replacement is not box
+    assert replacement._closed is False
 
 
 def test_concurrent_same_thread_acquire_creates_one_box(monkeypatch):

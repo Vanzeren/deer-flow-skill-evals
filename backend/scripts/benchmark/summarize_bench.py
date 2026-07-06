@@ -61,8 +61,6 @@ def _summarize(rows: list[dict[str, Any]], group_by: list[str]) -> list[dict[str
     summary: list[dict[str, Any]] = []
     for key, group in sorted(groups.items()):
         ok = [r for r in group if r.get("success")]
-        if not ok:
-            continue
         a = [r["acquire_ms"] for r in ok]
         ru = [r.get("run_ms", 0) for r in ok]
         rel = [r.get("release_ms", 0) for r in ok]
@@ -80,14 +78,14 @@ def _summarize(rows: list[dict[str, Any]], group_by: list[str]) -> list[dict[str
         entry["acquire_p50"] = round(_p(a, 50), 1)
         entry["acquire_p95"] = round(_p(a, 95), 1)
         entry["acquire_p99"] = round(_p(a, 99), 1)
-        entry["acquire_mean"] = round(sum(a) / len(a), 1)
+        entry["acquire_mean"] = round(sum(a) / len(a), 1) if a else 0.0
         entry["run_p50"] = round(_p(ru, 50), 1)
         entry["run_p95"] = round(_p(ru, 95), 1)
         entry["release_p50"] = round(_p(rel, 50), 1)
         entry["total_p50"] = round(_p(t, 50), 1)
         entry["total_p95"] = round(_p(t, 95), 1)
         entry["total_p99"] = round(_p(t, 99), 1)
-        entry["total_mean"] = round(sum(t) / len(t), 1)
+        entry["total_mean"] = round(sum(t) / len(t), 1) if t else 0.0
 
         summary.append(entry)
 
