@@ -45,9 +45,7 @@ def _group_key(row: dict[str, Any], group_by: list[str]) -> tuple:
     return tuple(row.get(k, "?") for k in group_by)
 
 
-def _summarize(
-    rows: list[dict[str, Any]], group_by: list[str]
-) -> list[dict[str, Any]]:
+def _summarize(rows: list[dict[str, Any]], group_by: list[str]) -> list[dict[str, Any]]:
     groups: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
     for r in rows:
         groups[_group_key(r, group_by)].append(r)
@@ -143,12 +141,8 @@ def _print_table(rows: list[dict[str, Any]], fmt: str = "plain") -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(
-        description="Aggregate JSONL benchmark results"
-    )
-    p.add_argument(
-        "inputs", nargs="+", help="JSONL file(s) from bench_sandbox_provider.py"
-    )
+    p = argparse.ArgumentParser(description="Aggregate JSONL benchmark results")
+    p.add_argument("inputs", nargs="+", help="JSONL file(s) from bench_sandbox_provider.py")
     p.add_argument(
         "--group",
         default="provider,scenario,workload,concurrency",

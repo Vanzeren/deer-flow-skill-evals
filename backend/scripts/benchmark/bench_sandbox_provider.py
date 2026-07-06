@@ -48,17 +48,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import statistics
 import sys
 import threading
 import time
 import types
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
-
 
 # ── Output schema ───────────────────────────────────────────────────────
 
@@ -170,6 +168,7 @@ def _make_boxlite_provider(config: dict[str, Any]) -> tuple[Any, dict[str, Any]]
         boxes_dir = os.path.expanduser("~/.boxlite/boxes")
 
         replicas, total = self._replica_count()
+
         async def _make():
             box = simplebox_cls(
                 name=box_name,
@@ -198,7 +197,9 @@ def _make_boxlite_provider(config: dict[str, Any]) -> tuple[Any, dict[str, Any]]
 
         box = self._loop.run(_make())
         return BoxliteBox(
-            sandbox_id, box, self._loop.run,
+            sandbox_id,
+            box,
+            self._loop.run,
             default_env=self._config["environment"],
         )
 
@@ -309,10 +310,7 @@ def _run_one_turn(
 
         if expected_state is not None:
             if expected_state.strip() not in output.strip():
-                raise RuntimeError(
-                    f"State reuse failed: expected {expected_state!r} in output, "
-                    f"got {output.strip()!r}"
-                )
+                raise RuntimeError(f"State reuse failed: expected {expected_state!r} in output, got {output.strip()!r}")
 
         t_e = time.perf_counter()
         provider.release(sid)
@@ -539,11 +537,7 @@ def main(argv: list[str] | None = None) -> int:
     provider, config_used = factory(config)
 
     if output_path.exists():
-        header = (
-            f"# provider={args.provider} scenario={args.scenario} "
-            f"workload={args.workload} concurrency={args.concurrency} "
-            f"iterations={args.iterations} no_warmpool={args.no_warmpool}\n"
-        )
+        header = f"# provider={args.provider} scenario={args.scenario} workload={args.workload} concurrency={args.concurrency} iterations={args.iterations} no_warmpool={args.no_warmpool}\n"
         with output_path.open("a", encoding="utf-8") as f:
             f.write(header)
 
@@ -569,21 +563,15 @@ def main(argv: list[str] | None = None) -> int:
 
         # --- Idle-timeout scenario: special handling ---
         if args.scenario == "idle_timeout":
-            return _run_idle_timeout_scenario(
-                provider, args, output_path, config_used
-            )
+            return _run_idle_timeout_scenario(provider, args, output_path, config_used)
 
         # --- Replica pressure scenario: special handling ---
         if args.scenario == "replica_pressure":
-            return _run_replica_pressure_scenario(
-                provider, args, output_path, config_used
-            )
+            return _run_replica_pressure_scenario(provider, args, output_path, config_used)
 
         # --- Standard scenarios ---
         print(
-            f"Running: provider={args.provider} scenario={args.scenario} "
-            f"workload={args.workload} concurrency={args.concurrency} "
-            f"iterations={args.iterations}",
+            f"Running: provider={args.provider} scenario={args.scenario} workload={args.workload} concurrency={args.concurrency} iterations={args.iterations}",
             file=sys.stderr,
         )
 
@@ -621,8 +609,7 @@ def _run_idle_timeout_scenario(
     """
     idle = min(args.idle_timeout, 10)
     print(
-        f"Idle timeout scenario: acquire, release, force-reap after "
-        f"{idle + 1}s sleep (timeout={idle}s)",
+        f"Idle timeout scenario: acquire, release, force-reap after {idle + 1}s sleep (timeout={idle}s)",
         file=sys.stderr,
     )
 
@@ -630,9 +617,16 @@ def _run_idle_timeout_scenario(
     for i in range(min(args.iterations, 20)):
         tid = f"idle-{i}"
         r1 = _run_one_turn(
-            provider, args.provider, "idle_timeout", args.workload,
-            WORKLOADS.get(args.workload, "true"), i * 2, args.concurrency,
-            "bench-user", tid, args.no_warmpool,
+            provider,
+            args.provider,
+            "idle_timeout",
+            args.workload,
+            WORKLOADS.get(args.workload, "true"),
+            i * 2,
+            args.concurrency,
+            "bench-user",
+            tid,
+            args.no_warmpool,
         )
         results.append(r1)
 
@@ -642,14 +636,20 @@ def _run_idle_timeout_scenario(
         provider._reap_expired_warm(idle_timeout=idle)
 
         r2 = _run_one_turn(
-            provider, args.provider, "idle_timeout", args.workload,
-            WORKLOADS.get(args.workload, "true"), i * 2 + 1, args.concurrency,
-            "bench-user", tid, args.no_warmpool,
+            provider,
+            args.provider,
+            "idle_timeout",
+            args.workload,
+            WORKLOADS.get(args.workload, "true"),
+            i * 2 + 1,
+            args.concurrency,
+            "bench-user",
+            tid,
+            args.no_warmpool,
         )
         if r2.warm_hit:
             print(
-                f"  WARNING: turn {i * 2 + 1} was a warm hit — "
-                f"reaping may not have removed the entry",
+                f"  WARNING: turn {i * 2 + 1} was a warm hit — reaping may not have removed the entry",
                 file=sys.stderr,
             )
         results.append(r2)
@@ -678,8 +678,7 @@ def _run_replica_pressure_scenario(
     overcommit = replicas * 2
 
     print(
-        f"Replica pressure: replicas={replicas}, overcommitting to "
-        f"{overcommit} unique threads, {args.iterations} rounds",
+        f"Replica pressure: replicas={replicas}, overcommitting to {overcommit} unique threads, {args.iterations} rounds",
         file=sys.stderr,
     )
 
@@ -687,9 +686,16 @@ def _run_replica_pressure_scenario(
     for i in range(args.iterations):
         tid = f"pressure-{i % overcommit}"
         r = _run_one_turn(
-            provider, args.provider, "replica_pressure", args.workload,
-            WORKLOADS.get(args.workload, "true"), i, args.concurrency,
-            "bench-user", tid, args.no_warmpool,
+            provider,
+            args.provider,
+            "replica_pressure",
+            args.workload,
+            WORKLOADS.get(args.workload, "true"),
+            i,
+            args.concurrency,
+            "bench-user",
+            tid,
+            args.no_warmpool,
         )
 
         # Track warm pool evictions
@@ -697,8 +703,7 @@ def _run_replica_pressure_scenario(
             warm_size = len(provider._warm_pool)
             active_size = len(provider._boxes)
         print(
-            f"  iter {i}: warm_pool={warm_size} active={active_size} "
-            f"warm_hit={r.warm_hit}",
+            f"  iter {i}: warm_pool={warm_size} active={active_size} warm_hit={r.warm_hit}",
             file=sys.stderr,
         )
 
@@ -741,18 +746,15 @@ def _print_summary(results: list[BenchResult], args: argparse.Namespace) -> None
 
     print(file=sys.stderr)
     print(
-        f"Results: {len(ok)} ok, {len(fail)} fail, "
-        f"{len(warm)} warm hits, {len(cold)} cold",
+        f"Results: {len(ok)} ok, {len(fail)} fail, {len(warm)} warm hits, {len(cold)} cold",
         file=sys.stderr,
     )
     print(
-        f"  acquire: p50={_p(a, 50):.1f}ms p95={_p(a, 95):.1f}ms "
-        f"p99={_p(a, 99):.1f}ms",
+        f"  acquire: p50={_p(a, 50):.1f}ms p95={_p(a, 95):.1f}ms p99={_p(a, 99):.1f}ms",
         file=sys.stderr,
     )
     print(
-        f"  total:   p50={_p(t, 50):.1f}ms p95={_p(t, 95):.1f}ms "
-        f"p99={_p(t, 99):.1f}ms",
+        f"  total:   p50={_p(t, 50):.1f}ms p95={_p(t, 95):.1f}ms p99={_p(t, 99):.1f}ms",
         file=sys.stderr,
     )
     print(f"  output → {args.output}", file=sys.stderr)
