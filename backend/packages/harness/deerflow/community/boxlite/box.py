@@ -102,14 +102,14 @@ class BoxliteBox(Sandbox):
         env: dict[str, str] | None = None,
         timeout: float | None = None,
     ):
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("sandbox has been closed")
-            box = self._box
         try:
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("sandbox has been closed")
+                box = self._box
             return self._run(box.exec(*argv, env=env, timeout=timeout), timeout=timeout)
         except Exception as e:
-            if self._on_terminal_failure is not None and self._is_terminal_box_failure(e):
+            if self._on_terminal_failure is not None and ("sandbox has been closed" in str(e) or self._is_terminal_box_failure(e)):
                 try:
                     self._on_terminal_failure(self.id, str(e))
                 except Exception:

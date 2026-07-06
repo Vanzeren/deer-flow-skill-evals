@@ -206,6 +206,7 @@ def _make_boxlite_provider(config: dict[str, Any]) -> tuple[Any, dict[str, Any]]
             box,
             self._loop.run,
             default_env=self._config["environment"],
+            on_terminal_failure=self._invalidate_box,
         )
 
     BoxliteProvider._create_box = _patched_create_box
@@ -377,8 +378,8 @@ def _run_scenario(
     output_path: Path,
     no_warmpool: bool,
     config_used: dict[str, Any],
+    fault_inject_after: int | None = None,
 ) -> list[BenchResult]:
-    """Run all iterations for a (scenario, workload) pair."""
 
     command = WORKLOADS.get(workload_name, WORKLOADS["noop"])
 
@@ -417,10 +418,46 @@ def _run_scenario(
             expected_state=expect_state,
         )
 
+    def _tid(i: int) -> str:
+        if scenario == "cold_unique_thread":
+            return f"cold-{i}"
+        elif scenario == "warm_same_thread":
+            return "warm-hit"
+        elif scenario == "warm_miss_many_threads":
+            return f"thread-{i % max(concurrency, 4)}"
+        elif scenario in ("idle_timeout", "replica_pressure"):
+            return f"warm-hit-{i % concurrency}"
+        else:
+            return f"default-{i}"
+
+    def _inject_fault(i: int) -> None:
+        if fault_inject_after is None or i != fault_inject_after:
+            return
+        tid = _tid(i)
+        sandbox_id = _compute_sandbox_id(provider, tid, "bench-user")
+        with provider._lock:
+            warm_entry = provider._warm_pool.get(sandbox_id)
+        if warm_entry is not None:
+            box, _ = warm_entry
+            try:
+                box.close()
+            except Exception:
+                pass
+            print(
+                f"  [fault] killed warm-pool box {sandbox_id} after iteration {i}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"  [fault] no warm-pool box {sandbox_id} to kill after iteration {i}",
+                file=sys.stderr,
+            )
+
     if concurrency == 1:
         for i in range(iterations):
             r = _run_one(i)
             results.append(r)
+            _inject_fault(i)
     else:
         sem = threading.BoundedSemaphore(concurrency)
 
@@ -431,10 +468,9 @@ def _run_scenario(
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = {pool.submit(_guarded, i): i for i in range(iterations)}
             for future in as_completed(futures):
+                i = futures[future]
                 results.append(future.result())
-
-    # Sort by iteration to preserve order
-    results.sort(key=lambda r: r.iteration)
+                _inject_fault(i)
 
     # Annotate with config
     for r in results:
@@ -528,6 +564,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=1,
         help="Warm-up turns before timed iterations (default: 1)",
     )
+    p.add_argument(
+        "--fault-inject",
+        type=int,
+        default=None,
+        metavar="N",
+        help="After iteration N, close the warm-pool box to simulate a VM crash",
+    )
     return p.parse_args(argv)
 
 
@@ -600,6 +643,7 @@ def main(argv: list[str] | None = None) -> int:
             output_path=output_path,
             no_warmpool=args.no_warmpool,
             config_used=config_used,
+            fault_inject_after=args.fault_inject,
         )
 
         _print_summary(results, args)
