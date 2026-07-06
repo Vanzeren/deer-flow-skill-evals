@@ -414,6 +414,72 @@ def test_recently_released_warm_pool_box_skips_health_check(monkeypatch):
     provider.shutdown()
 
 
+def test_health_check_skip_zero_forces_recent_reclaim_validation(monkeypatch):
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config({"health_check_skip_seconds": 0}),
+    )
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider._import_simplebox",
+        lambda: _FakeBox,
+    )
+
+    provider = BoxliteProvider()
+    provider._loop.run = _fake_run
+
+    sid = provider.acquire("thread-1", user_id="u1")
+    provider.release(sid)
+    box, _ = provider._warm_pool[sid]
+    calls = 0
+    original_execute = box.execute_command
+
+    def _record_health_check(command: str, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_execute(command, *args, **kwargs)
+
+    monkeypatch.setattr(box, "execute_command", _record_health_check)
+
+    reclaimed = provider._reclaim_warm_pool(sid)
+    assert reclaimed == sid
+    assert calls == 1
+    assert sid in provider._boxes
+    assert sid not in provider._warm_pool
+
+    provider.shutdown()
+
+
+def test_dead_active_box_invalidation_closes_adapter(monkeypatch):
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config({"health_check_skip_seconds": 5}),
+    )
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider._import_simplebox",
+        lambda: _FakeBox,
+    )
+
+    provider = BoxliteProvider()
+    provider._loop.run = _fake_run
+
+    sid = provider.acquire("thread-1", user_id="u1")
+    box = provider.get(sid)
+    assert box is not None
+
+    def _dead_run(coro, *, timeout=None):
+        coro.close()
+        raise RuntimeError("vsock disconnected")
+
+    box._run = _dead_run
+
+    output = box.execute_command("echo hi")
+    assert output == "Error: vsock disconnected"
+    assert box._closed is True
+    assert provider.get(sid) is None
+
+    provider.shutdown()
+
+
 def test_adopted_warm_pool_box_still_health_checks(monkeypatch):
     """Startup-adopted boxes must still pass a health check before reclaim."""
     monkeypatch.setattr(
