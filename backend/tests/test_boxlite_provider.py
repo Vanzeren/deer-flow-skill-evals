@@ -158,6 +158,46 @@ def test_execute_command_forwards_timeout_to_sdk_and_loop_runner() -> None:
     assert run_timeouts == [5]
 
 
+def test_execute_command_invalidates_box_on_terminal_transport_error() -> None:
+    invalidated: list[tuple[str, str]] = []
+
+    def _failing_run(coro, *, timeout=None):
+        coro.close()
+        raise RuntimeError("vsock disconnected")
+
+    box = BoxliteBox(
+        "box-id",
+        box=_FakeBox(name="box-id"),
+        run=_failing_run,
+        on_terminal_failure=lambda sandbox_id, reason: invalidated.append((sandbox_id, reason)),
+    )
+
+    output = box.execute_command("echo hi")
+
+    assert output == "Error: vsock disconnected"
+    assert invalidated == [("box-id", "vsock disconnected")]
+
+
+def test_execute_command_does_not_invalidate_on_regular_command_error() -> None:
+    invalidated: list[tuple[str, str]] = []
+
+    def _failing_run(coro, *, timeout=None):
+        coro.close()
+        raise RuntimeError("user command failed")
+
+    box = BoxliteBox(
+        "box-id",
+        box=_FakeBox(name="box-id"),
+        run=_failing_run,
+        on_terminal_failure=lambda sandbox_id, reason: invalidated.append((sandbox_id, reason)),
+    )
+
+    output = box.execute_command("echo hi")
+
+    assert output == "Error: user command failed"
+    assert invalidated == []
+
+
 def test_sandbox_id_deterministic(monkeypatch):
     """_sandbox_id produces the same id for the same inputs."""
     monkeypatch.setattr(
@@ -404,6 +444,40 @@ def test_adopted_warm_pool_box_still_health_checks(monkeypatch):
     assert calls == 1
     assert "adopted" in provider._boxes
     assert "adopted" not in provider._warm_pool
+
+    provider.shutdown()
+
+
+def test_dead_active_box_is_invalidated_after_command_failure(monkeypatch):
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config({"health_check_skip_seconds": 5}),
+    )
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider._import_simplebox",
+        lambda: _FakeBox,
+    )
+
+    provider = BoxliteProvider()
+    provider._loop.run = _fake_run
+
+    sid = provider.acquire("thread-1", user_id="u1")
+    box = provider.get(sid)
+    assert box is not None
+
+    def _dead_run(coro, *, timeout=None):
+        coro.close()
+        raise RuntimeError("vsock disconnected")
+
+    box._run = _dead_run
+
+    output = box.execute_command("echo hi")
+    assert output == "Error: vsock disconnected"
+    assert provider.get(sid) is None
+
+    sid2 = provider.acquire("thread-1", user_id="u1")
+    assert sid2 == sid
+    assert provider.get(sid2) is not None
 
     provider.shutdown()
 

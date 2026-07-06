@@ -262,6 +262,24 @@ class BoxliteProvider(WarmPoolLifecycleMixin[BoxliteBox], SandboxProvider):
             else:
                 logger.warning("Error closing BoxLite box %s (reason=%s): %s", sandbox_id, reason, e)
 
+    def _invalidate_box(self, sandbox_id: str, reason: str) -> None:
+        """Destroy and deregister a box after a terminal command-path failure."""
+        box_to_close: BoxliteBox | None = None
+        with self._lock:
+            active_box = self._boxes.pop(sandbox_id, None)
+            warm_entry = self._warm_pool.pop(sandbox_id, None)
+            self._skip_health_check_warm_ids.discard(sandbox_id)
+            for key in [k for k, sid in self._thread_boxes.items() if sid == sandbox_id]:
+                self._thread_boxes.pop(key, None)
+            box_to_close = active_box or (warm_entry[0] if warm_entry is not None else None)
+
+        if box_to_close is None:
+            logger.warning("BoxLite box %s failed terminally but was not tracked: %s", sandbox_id, reason)
+            return
+
+        logger.warning("Invalidating BoxLite box %s after terminal failure: %s", sandbox_id, reason)
+        box_to_close.close()
+
     def _reconcile_orphans(self) -> None:
         """Adopt DeerFlow-owned BoxLite boxes left by a previous provider/process.
 
@@ -311,7 +329,7 @@ class BoxliteProvider(WarmPoolLifecycleMixin[BoxliteBox], SandboxProvider):
                 box_runtime.stop()
                 continue
 
-            wrapped = BoxliteBox(sandbox_id, _SyncBoxAdapter(box_runtime, box), _run_sync_adapter, default_env=self._config["environment"])
+            wrapped = BoxliteBox(sandbox_id, _SyncBoxAdapter(box_runtime, box), _run_sync_adapter, default_env=self._config["environment"], on_terminal_failure=self._invalidate_box)
             with self._lock:
                 if sandbox_id in self._boxes or sandbox_id in self._warm_pool:
                     box_runtime.stop()
@@ -376,7 +394,7 @@ class BoxliteProvider(WarmPoolLifecycleMixin[BoxliteBox], SandboxProvider):
 
         box = self._loop.run(_make())
         logger.info("Created BoxLite box %s (name=%s, image=%s)", sandbox_id, self._box_name(sandbox_id), self._config["image"])
-        return BoxliteBox(sandbox_id, box, self._loop.run, default_env=self._config["environment"])
+        return BoxliteBox(sandbox_id, box, self._loop.run, default_env=self._config["environment"], on_terminal_failure=self._invalidate_box)
 
     def get(self, sandbox_id: str) -> Sandbox | None:
         with self._lock:

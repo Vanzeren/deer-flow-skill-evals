@@ -64,25 +64,65 @@ class BoxliteBox(Sandbox):
         run: Callable[..., T],
         *,
         default_env: dict[str, str] | None = None,
+        on_terminal_failure: Callable[[str, str], None] | None = None,
     ) -> None:
         super().__init__(id)
         self._box = box
         self._run = run
         self._default_env = dict(default_env or {})
+        self._on_terminal_failure = on_terminal_failure
         self._lock = threading.Lock()
         self._closed = False
 
+    @staticmethod
+    def _is_terminal_box_failure(error: Exception) -> bool:
+        if isinstance(error, (BrokenPipeError, ConnectionError, EOFError)):
+            return True
+        if not isinstance(error, RuntimeError | OSError):
+            return False
+        msg = str(error).lower()
+        markers = (
+            "vsock",
+            "transport",
+            "disconnected",
+            "broken pipe",
+            "connection reset",
+            "connection refused",
+            "no such box",
+            "box has been stopped",
+            "engine reported an error",
+        )
+        return any(marker in msg for marker in markers)
+
     # ── bridge helpers ──────────────────────────────────────────────────
 
-    def _exec(self, *argv: str, env: dict[str, str] | None = None):
+    def _exec(
+        self,
+        *argv: str,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ):
         with self._lock:
             if self._closed:
                 raise RuntimeError("sandbox has been closed")
             box = self._box
-        return self._run(box.exec(*argv, env=env))
+        try:
+            return self._run(box.exec(*argv, env=env, timeout=timeout), timeout=timeout)
+        except Exception as e:
+            if self._on_terminal_failure is not None and self._is_terminal_box_failure(e):
+                try:
+                    self._on_terminal_failure(self.id, str(e))
+                except Exception:
+                    logger.exception("Terminal BoxLite failure callback errored for %s", self.id)
+            raise
 
-    def _sh(self, script: str, env: dict[str, str] | None = None):
-        return self._exec("sh", "-lc", script, env=env)
+    def _sh(
+        self,
+        script: str,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ):
+        return self._exec("sh", "-lc", script, env=env, timeout=timeout)
 
     def close(self) -> None:
         with self._lock:
@@ -132,12 +172,8 @@ class BoxliteBox(Sandbox):
         """
         _validate_extra_env(env)  # POSIX env-var key rule; raises ValueError on a bad key
         merged_env = {**self._default_env, **(env or {})} or None
-        with self._lock:
-            if self._closed:
-                return "Error: sandbox has been closed"
-            box = self._box
         try:
-            result = self._run(box.exec("sh", "-lc", command, env=merged_env, timeout=timeout), timeout=timeout)
+            result = self._exec("sh", "-lc", command, env=merged_env, timeout=timeout)
         except Exception as e:
             logger.error("Failed to execute command in BoxLite box %s: %s", self.id, e)
             return f"Error: {e}"
