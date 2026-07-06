@@ -3,7 +3,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import os
-from codecs import BOM_UTF16_BE, BOM_UTF16_LE
+from codecs import BOM_UTF16_BE, BOM_UTF16_LE, getincrementaldecoder
 from pathlib import Path
 
 from .types import (
@@ -258,5 +258,22 @@ def _decode_text_bytes(data: bytes) -> str | None:
     return None
 
 
+def _sample_decodes_as_text(sample: bytes, encoding: str) -> bool:
+    try:
+        decoder = getincrementaldecoder(encoding)()
+        decoder.decode(sample, final=False)
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
 def _looks_binary(sample: bytes) -> bool:
-    return _decode_text_bytes(sample) is None
+    if sample.startswith(_UTF16_BOMS) and _sample_decodes_as_text(sample, "utf-16"):
+        return False
+    if b"\x00" in sample:
+        return True
+    if _sample_decodes_as_text(sample, "utf-8"):
+        return False
+    if sample.startswith(b"\xef\xbb\xbf") and _sample_decodes_as_text(sample, "utf-8-sig"):
+        return False
+    return True
