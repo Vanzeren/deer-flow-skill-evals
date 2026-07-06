@@ -126,6 +126,25 @@ def test_compare_snapshots_treats_utf8_markdown_crossing_sample_boundary_as_text
     assert "+rest" in change.diff
 
 
+def test_compare_snapshots_strips_utf8_bom(tmp_path):
+    roots = _roots(tmp_path)
+    workspace = roots[0].host_path
+
+    before = scan_workspace_roots(roots)
+    content = "# 标题\n\nhello\n".encode()
+    (workspace / "guide.md").write_bytes(b"\xef\xbb\xbf" + content)
+    after = scan_workspace_roots(roots)
+
+    result = compare_snapshots(before, after)
+
+    change = result.files[0]
+    assert change.path == "/mnt/user-data/workspace/guide.md"
+    assert change.binary is False
+    assert change.diff_unavailable_reason is None
+    assert "\ufeff" not in change.diff
+    assert "+# 标题" in change.diff
+
+
 def test_compare_snapshots_keeps_nul_bytes_classified_as_binary(tmp_path):
     roots = _roots(tmp_path)
     workspace = roots[0].host_path

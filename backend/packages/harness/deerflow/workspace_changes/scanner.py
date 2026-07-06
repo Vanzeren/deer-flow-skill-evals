@@ -243,7 +243,7 @@ def _sha256_file(path: Path) -> str:
 
 
 def _decode_text_bytes(data: bytes) -> str | None:
-    for encoding in ("utf-8", "utf-8-sig"):
+    for encoding in ("utf-8-sig", "utf-8"):
         try:
             return data.decode(encoding)
         except UnicodeDecodeError:
@@ -273,7 +273,5 @@ def _looks_binary(sample: bytes) -> bool:
     if b"\x00" in sample:
         return True
     if _sample_decodes_as_text(sample, "utf-8"):
-        return False
-    if sample.startswith(b"\xef\xbb\xbf") and _sample_decodes_as_text(sample, "utf-8-sig"):
         return False
     return True
