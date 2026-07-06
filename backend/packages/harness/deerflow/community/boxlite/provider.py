@@ -203,6 +203,7 @@ class BoxliteProvider(WarmPoolLifecycleMixin[BoxliteBox], SandboxProvider):
             "environment": dict(_opt("environment") or {}),
             "replicas": replicas if replicas is not None else self.DEFAULT_REPLICAS,
             "idle_timeout": idle_timeout if idle_timeout is not None else self.DEFAULT_IDLE_TIMEOUT,
+            "health_check_skip_seconds": float(_opt("health_check_skip_seconds") or 5.0),
         }
 
     @staticmethod
@@ -406,11 +407,31 @@ class BoxliteProvider(WarmPoolLifecycleMixin[BoxliteBox], SandboxProvider):
         """Try to reclaim a warm-pool box by sandbox_id.
 
         Returns sandbox_id on success, None if not found or dead.
+
+        Boxes released within ``health_check_skip_seconds`` skip the health
+        check — a VM that was alive seconds ago is overwhelmingly likely to
+        still be alive, and the round-trip saves ~14 ms of acquire latency.
         """
         with self._lock:
             if sandbox_id not in self._warm_pool:
                 return None
-            box, _ = self._warm_pool[sandbox_id]
+            box, released_at = self._warm_pool[sandbox_id]
+
+        skip_seconds = self._config.get("health_check_skip_seconds", 5.0)
+        if skip_seconds > 0 and (time.time() - released_at) < skip_seconds:
+            # Recently released — promote directly without health check
+            with self._lock:
+                warm_entry = self._warm_pool.pop(sandbox_id, None)
+                if warm_entry is None:
+                    return None  # Raced with another thread
+                box, _ = warm_entry
+                self._boxes[sandbox_id] = box
+            logger.debug(
+                "Reclaimed warm-pool box %s (skipped health check, age=%.1fs)",
+                sandbox_id,
+                time.time() - released_at,
+            )
+            return sandbox_id
 
         # Health check: run a simple command to verify the VM is alive
         try:
