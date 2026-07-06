@@ -176,6 +176,7 @@ class BoxliteProvider(WarmPoolLifecycleMixin[BoxliteBox], SandboxProvider):
         self._boxes: dict[str, BoxliteBox] = {}
         self._thread_boxes: dict[tuple[str, str], str] = {}
         self._warm_pool: dict[str, tuple[BoxliteBox, float]] = {}
+        self._skip_health_check_warm_ids: set[str] = set()
         self._acquire_locks: dict[str, threading.Lock] = {}
         self._idle_checker_stop = threading.Event()
         self._idle_checker_thread: threading.Thread | None = None
@@ -243,6 +244,8 @@ class BoxliteProvider(WarmPoolLifecycleMixin[BoxliteBox], SandboxProvider):
 
     def _destroy_warm_entry(self, sandbox_id: str, entry: BoxliteBox, *, reason: str) -> None:
         """Close a removed warm-pool entry and log with context."""
+        with self._lock:
+            self._skip_health_check_warm_ids.discard(sandbox_id)
         try:
             entry.close()
             if reason == "idle_timeout":
@@ -395,8 +398,10 @@ class BoxliteProvider(WarmPoolLifecycleMixin[BoxliteBox], SandboxProvider):
                 return
             if self._shutdown_called:
                 close_box = box
+                self._skip_health_check_warm_ids.discard(sandbox_id)
             else:
                 self._warm_pool[sandbox_id] = (box, time.time())
+                self._skip_health_check_warm_ids.add(sandbox_id)
 
         if close_box is not None:
             close_box.close()
@@ -409,22 +414,25 @@ class BoxliteProvider(WarmPoolLifecycleMixin[BoxliteBox], SandboxProvider):
 
         Returns sandbox_id on success, None if not found or dead.
 
-        Boxes released within ``health_check_skip_seconds`` skip the health
-        check — a VM that was alive seconds ago is overwhelmingly likely to
-        still be alive, and the round-trip saves ~14 ms of acquire latency.
+        Only boxes that *this provider instance* placed in the warm pool via
+        ``release()`` may skip the health check when reclaimed shortly after
+        release; startup-adopted/orphaned boxes always validate before reuse.
         """
+
         with self._lock:
             if sandbox_id not in self._warm_pool:
                 return None
             box, released_at = self._warm_pool[sandbox_id]
+            skip_eligible = sandbox_id in self._skip_health_check_warm_ids
 
         skip_seconds = self._config.get("health_check_skip_seconds", 5.0)
-        if skip_seconds > 0 and (time.time() - released_at) < skip_seconds:
-            # Recently released — promote directly without health check
+        if skip_eligible and skip_seconds > 0 and (time.time() - released_at) < skip_seconds:
+            # Recently released by this provider — promote directly without health check
             with self._lock:
                 warm_entry = self._warm_pool.pop(sandbox_id, None)
                 if warm_entry is None:
                     return None  # Raced with another thread
+                self._skip_health_check_warm_ids.discard(sandbox_id)
                 box, _ = warm_entry
                 self._boxes[sandbox_id] = box
             logger.debug(
@@ -441,12 +449,14 @@ class BoxliteProvider(WarmPoolLifecycleMixin[BoxliteBox], SandboxProvider):
                 logger.warning("Warm pool box %s health check failed: %s", sandbox_id, result)
                 with self._lock:
                     self._warm_pool.pop(sandbox_id, None)
+                    self._skip_health_check_warm_ids.discard(sandbox_id)
                 box.close()
                 return None
         except Exception as e:
             logger.warning("Warm pool box %s health check error: %s", sandbox_id, e)
             with self._lock:
                 self._warm_pool.pop(sandbox_id, None)
+                self._skip_health_check_warm_ids.discard(sandbox_id)
             box.close()
             return None
 
@@ -455,6 +465,7 @@ class BoxliteProvider(WarmPoolLifecycleMixin[BoxliteBox], SandboxProvider):
             warm_entry = self._warm_pool.pop(sandbox_id, None)
             if warm_entry is None:
                 return None  # Raced with another thread
+            self._skip_health_check_warm_ids.discard(sandbox_id)
             box, _ = warm_entry
             self._boxes[sandbox_id] = box
 
@@ -474,6 +485,7 @@ class BoxliteProvider(WarmPoolLifecycleMixin[BoxliteBox], SandboxProvider):
             now = time.time()
             for sandbox_id, box in self._boxes.items():
                 self._warm_pool.setdefault(sandbox_id, (box, now))
+                self._skip_health_check_warm_ids.discard(sandbox_id)
             self._boxes.clear()
             self._thread_boxes.clear()
             self._acquire_locks.clear()
@@ -493,6 +505,7 @@ class BoxliteProvider(WarmPoolLifecycleMixin[BoxliteBox], SandboxProvider):
             self._warm_pool.clear()
             self._thread_boxes.clear()
             self._acquire_locks.clear()
+            self._skip_health_check_warm_ids.clear()
 
         for box in active + warm:
             try:

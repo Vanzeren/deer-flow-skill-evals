@@ -343,6 +343,71 @@ def test_acquire_reclaims_from_warm_pool(monkeypatch):
     assert sid2 not in provider._warm_pool
 
 
+def test_recently_released_warm_pool_box_skips_health_check(monkeypatch):
+    """A box released by this provider can be reclaimed without a fresh ping."""
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config({"health_check_skip_seconds": 5}),
+    )
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider._import_simplebox",
+        lambda: _FakeBox,
+    )
+
+    provider = BoxliteProvider()
+    provider._loop.run = _fake_run
+
+    sid = provider.acquire("thread-1", user_id="u1")
+    provider.release(sid)
+    box, _ = provider._warm_pool[sid]
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("health check should be skipped for recently released boxes")
+
+    monkeypatch.setattr(box, "execute_command", _fail_if_called)
+
+    reclaimed = provider._reclaim_warm_pool(sid)
+    assert reclaimed == sid
+    assert sid in provider._boxes
+    assert sid not in provider._warm_pool
+
+    provider.shutdown()
+
+
+def test_adopted_warm_pool_box_still_health_checks(monkeypatch):
+    """Startup-adopted boxes must still pass a health check before reclaim."""
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config({"health_check_skip_seconds": 5}),
+    )
+
+    provider = BoxliteProvider()
+    adopted = BoxliteBox(
+        "adopted",
+        _FakeBox(name="deer-flow-boxlite-adopted"),
+        _fake_run,
+        default_env={},
+    )
+    provider._warm_pool["adopted"] = (adopted, time.time())
+    calls = 0
+    original_execute = adopted.execute_command
+
+    def _record_health_check(command: str, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_execute(command, *args, **kwargs)
+
+    monkeypatch.setattr(adopted, "execute_command", _record_health_check)
+
+    reclaimed = provider._reclaim_warm_pool("adopted")
+    assert reclaimed == "adopted"
+    assert calls == 1
+    assert "adopted" in provider._boxes
+    assert "adopted" not in provider._warm_pool
+
+    provider.shutdown()
+
+
 def test_acquire_different_threads_dont_reclaim_each_other(monkeypatch):
     """Thread A's box can't be reclaimed by thread B."""
     monkeypatch.setattr(
