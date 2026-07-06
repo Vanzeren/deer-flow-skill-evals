@@ -46,6 +46,7 @@ Workloads
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -186,10 +187,11 @@ def _make_boxlite_provider(config: dict[str, Any]) -> tuple[Any, dict[str, Any]]
                 if box._box is None:
                     raise  # _runtime.create itself failed — propagate
                 shim = os.path.join(boxes_dir, box._box.id, "bin", "boxlite-shim")
-                if os.path.exists(shim):
-                    st = os.stat(shim)
+                if await asyncio.to_thread(os.path.exists, shim):
+                    st = await asyncio.to_thread(os.stat, shim)
                     if not (st.st_mode & _stat.S_IEXEC):
-                        os.chmod(
+                        await asyncio.to_thread(
+                            os.chmod,
                             shim,
                             st.st_mode | _stat.S_IEXEC | _stat.S_IXGRP | _stat.S_IXOTH,
                         )
