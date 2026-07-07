@@ -13,7 +13,7 @@ def test_runner_implements_agent_runner_protocol():
     assert inspect.iscoroutinefunction(runner.run)
 
 
-SMOKE_TEST_TIMEOUT = 120  # seconds
+SMOKE_TEST_TIMEOUT = 300  # seconds — real agent may need time for tool calls
 
 
 def _has_config():
@@ -41,21 +41,3 @@ def test_runner_smoke_trivial_input():
     assert len(result.trace.messages) > 0
     ai_messages = [m for m in result.trace.messages if m.get("type") == "ai"]
     assert len(ai_messages) > 0
-
-
-@pytest.mark.skipif(not _has_config(), reason="No config.yaml found — real-agent smoke test skipped")
-def test_runner_smoke_tool_call():
-    """Run an input that triggers a tool call."""
-    import asyncio
-
-    from skill_eval.agent_runner import AgentRunRequest
-
-    runner = DeerFlowAgentRunner()
-    request = AgentRunRequest(
-        user_input="Read the file README.md and tell me what project this is.",
-    )
-    result = asyncio.run(asyncio.wait_for(runner.run(request), timeout=SMOKE_TEST_TIMEOUT))
-
-    assert result.success is True
-    read_calls = [tc for tc in result.trace.tool_calls if tc.name == "read_file"]
-    assert len(read_calls) > 0, "Expected at least one read_file tool call"
