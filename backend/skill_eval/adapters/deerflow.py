@@ -1,6 +1,7 @@
 import time
 from typing import Any
 
+from deerflow.client import StreamEvent
 from skill_eval.agent_runner import AgentRunRequest
 from skill_eval.trace_schema import AgentToolCall, AgentTrace, SkillInvocation
 
@@ -21,7 +22,10 @@ class DeerFlowTraceAdapter:
         self._raw_events: list[dict[str, Any]] = []
         self._request = request
 
-    def feed(self, event) -> None:
+    def start(self) -> None:
+        self._start_time = time.monotonic()
+
+    def feed(self, event: StreamEvent) -> None:
         """Ingest one StreamEvent."""
         self._raw_events.append({"type": event.type, "data": event.data})
 
