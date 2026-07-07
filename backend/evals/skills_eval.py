@@ -31,4 +31,4 @@ def skills_eval(case_file: str = "cases/gcp_skills.jsonl", mode: str = "with_ski
 
         agent_runner = DeerFlowAgentRunner()
 
-    return Task(dataset=samples, solver=skill_agent_solver(agent_runner=agent_runner, skills=selected_skills, sandbox="docker"), scorer=scorers, sandbox="docker")
+    return Task(dataset=samples, solver=skill_agent_solver(agent_runner=agent_runner, skills=selected_skills), scorer=scorers)

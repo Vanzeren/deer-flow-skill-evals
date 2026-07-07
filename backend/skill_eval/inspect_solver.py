@@ -5,7 +5,7 @@ from skill_eval.case_schema import SkillEvalCase
 
 
 @solver
-def skill_agent_solver(agent_runner: AgentRunner | None = None, skills: list[str] | None = None, sandbox: str | None = "docker"):
+def skill_agent_solver(agent_runner: AgentRunner | None = None, skills: list[str] | None = None, sandbox: str | None = None):
     async def solve(state: TaskState, generate: Generate) -> TaskState:
         case = SkillEvalCase.model_validate(state.metadata.get("case", {}))
         request = AgentRunRequest(
