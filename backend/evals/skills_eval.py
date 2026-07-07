@@ -9,7 +9,7 @@ from skill_eval.inspect_solver import skill_agent_solver
 
 
 @task
-def skills_eval(case_file: str = "cases/gcp_skills.jsonl", mode: str = "with_skill", skills_folder: str = "skills", use_model_graded_qa: bool = False):
+def skills_eval(case_file: str = "cases/gcp_skills.jsonl", mode: str = "with_skill", skills_folder: str = "skills", use_model_graded_qa: bool = False, use_deerflow: bool = False):
     samples = load_skill_cases(case_file)
 
     if mode == "baseline":
@@ -25,5 +25,10 @@ def skills_eval(case_file: str = "cases/gcp_skills.jsonl", mode: str = "with_ski
     scorers = [trace_integrity_scorer(), skill_assertion_scorer()]
     if use_model_graded_qa:
         scorers.append(model_graded_qa())
+    agent_runner = None
+    if use_deerflow:
+        from skill_eval.adapters.deerflow import DeerFlowAgentRunner
 
-    return Task(dataset=samples, solver=skill_agent_solver(skills=selected_skills, sandbox="docker"), scorer=scorers, sandbox="docker")
+        agent_runner = DeerFlowAgentRunner()
+
+    return Task(dataset=samples, solver=skill_agent_solver(agent_runner=agent_runner, skills=selected_skills, sandbox="docker"), scorer=scorers, sandbox="docker")
