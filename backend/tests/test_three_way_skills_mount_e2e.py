@@ -120,6 +120,15 @@ class TestThreeWayMountEndToEnd:
             idx = _local_mounts(provider, "thread-1", user_id="user-1")
         assert "/mnt/skills/legacy" not in idx
 
+    def test_local_legacy_still_mounted_when_user_has_only_non_skill_subdir(self, skills_fs):
+        (skills_fs["users_dir"] / "ghost" / "skills" / "custom" / "dangling-dir").mkdir(parents=True, exist_ok=True)
+        cfg = _build_config(skills_fs["root"])
+        paths = Paths(base_dir=skills_fs["users_dir"].parent)
+        with patch("deerflow.config.get_app_config", return_value=cfg), patch("deerflow.config.paths.get_paths", return_value=paths):
+            provider = LocalSandboxProvider()
+            idx = _local_mounts(provider, "thread-1", user_id="ghost")
+        assert "/mnt/skills/legacy" in idx
+
     # ── LocalSandboxProvider: read_file on container paths ─────────────
 
     def test_local_read_file_resolves_public_and_custom(self, skills_fs):
@@ -208,7 +217,7 @@ class TestThreeWayMountEndToEnd:
         cfg = _build_config(skills_fs["root"])
         paths = Paths(base_dir=skills_fs["users_dir"].parent)
         monkeypatch.setattr(aio_mod, "get_paths", lambda: paths)
-        with patch(_AIO_GET_CONFIG, return_value=cfg):
+        with patch(_AIO_GET_CONFIG, return_value=cfg), patch("deerflow.config.paths.get_paths", return_value=paths):
             mounts = aio_mod.AioSandboxProvider._get_skills_mounts(user_id="user-1")
         idx = {m[1]: m for m in mounts}
         assert "/mnt/skills/custom" in idx
@@ -219,7 +228,7 @@ class TestThreeWayMountEndToEnd:
         cfg = _build_config(skills_fs["root"])
         paths = Paths(base_dir=skills_fs["users_dir"].parent)
         monkeypatch.setattr(aio_mod, "get_paths", lambda: paths)
-        with patch(_AIO_GET_CONFIG, return_value=cfg):
+        with patch(_AIO_GET_CONFIG, return_value=cfg), patch("deerflow.config.paths.get_paths", return_value=paths):
             mounts = aio_mod.AioSandboxProvider._get_skills_mounts(user_id="noob")
         idx = {m[1]: m for m in mounts}
         assert "/mnt/skills/legacy" in idx
@@ -228,10 +237,20 @@ class TestThreeWayMountEndToEnd:
         cfg = _build_config(skills_fs["root"])
         paths = Paths(base_dir=skills_fs["users_dir"].parent)
         monkeypatch.setattr(aio_mod, "get_paths", lambda: paths)
-        with patch(_AIO_GET_CONFIG, return_value=cfg):
+        with patch(_AIO_GET_CONFIG, return_value=cfg), patch("deerflow.config.paths.get_paths", return_value=paths):
             mounts = aio_mod.AioSandboxProvider._get_skills_mounts(user_id="user-1")
         idx = {m[1]: m for m in mounts}
         assert "/mnt/skills/legacy" not in idx
+
+    def test_aio_legacy_still_mounted_when_user_has_only_non_skill_subdir(self, skills_fs, aio_mod, monkeypatch):
+        (skills_fs["users_dir"] / "ghost" / "skills" / "custom" / "dangling-dir").mkdir(parents=True, exist_ok=True)
+        cfg = _build_config(skills_fs["root"])
+        paths = Paths(base_dir=skills_fs["users_dir"].parent)
+        monkeypatch.setattr(aio_mod, "get_paths", lambda: paths)
+        with patch(_AIO_GET_CONFIG, return_value=cfg), patch("deerflow.config.paths.get_paths", return_value=paths):
+            mounts = aio_mod.AioSandboxProvider._get_skills_mounts(user_id="ghost")
+        idx = {m[1]: m for m in mounts}
+        assert "/mnt/skills/legacy" in idx
 
     # ── AIO → Docker --mount translation ───────────────────────────────
 
@@ -243,7 +262,7 @@ class TestThreeWayMountEndToEnd:
         paths = Paths(base_dir=skills_fs["users_dir"].parent)
         monkeypatch.setattr(aio_mod, "get_paths", lambda: paths)
 
-        with patch(_AIO_GET_CONFIG, return_value=cfg):
+        with patch(_AIO_GET_CONFIG, return_value=cfg), patch("deerflow.config.paths.get_paths", return_value=paths):
             extra = aio_mod.AioSandboxProvider._get_extra_mounts(
                 aio_mod.AioSandboxProvider.__new__(aio_mod.AioSandboxProvider),
                 "thread-1",

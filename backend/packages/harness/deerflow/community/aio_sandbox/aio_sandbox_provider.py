@@ -40,6 +40,7 @@ from deerflow.config.paths import VIRTUAL_PATH_PREFIX, get_paths, join_host_path
 from deerflow.runtime.user_context import get_effective_user_id
 from deerflow.sandbox.sandbox import Sandbox
 from deerflow.sandbox.sandbox_provider import SandboxProvider
+from deerflow.skills.storage import user_should_see_legacy_skills
 
 from .aio_sandbox import AioSandbox
 from .backend import SandboxBackend, wait_for_sandbox_ready, wait_for_sandbox_ready_async
@@ -395,8 +396,7 @@ class AioSandboxProvider(WarmPoolLifecycleMixin[SandboxInfo], SandboxProvider):
             #    users who have no per-user custom skills yet, mirroring
             #    ``UserScopedSkillStorage._iter_skill_files`` visibility rule.
             legacy_skills_path = skills_path / "custom"
-            user_has_no_custom_skills = not any(p.is_dir() and not p.name.startswith(".") for p in user_custom_path.iterdir()) if user_custom_path.exists() else True
-            if user_has_no_custom_skills and legacy_skills_path.exists() and any((legacy_skills_path / d / "SKILL.md").exists() for d in legacy_skills_path.iterdir() if d.is_dir() and not d.name.startswith(".")):
+            if user_should_see_legacy_skills(effective_user_id, host_path=str(skills_path)) and legacy_skills_path.exists():
                 mounts.append(
                     (
                         join_host_path(host_skills_root, "custom"),

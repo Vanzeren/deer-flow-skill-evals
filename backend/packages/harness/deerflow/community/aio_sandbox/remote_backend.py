@@ -22,19 +22,12 @@ import logging
 import requests
 
 from deerflow.runtime.user_context import get_effective_user_id
-from deerflow.skills.storage import get_or_new_user_skill_storage
-from deerflow.skills.types import SkillCategory
+from deerflow.skills.storage import user_should_see_legacy_skills
 
 from .backend import SandboxBackend
 from .sandbox_info import SandboxInfo
 
 logger = logging.getLogger(__name__)
-
-
-def _should_mount_legacy_skills(user_id: str) -> bool:
-    """Return whether this user should see legacy global-custom skills."""
-    storage = get_or_new_user_skill_storage(user_id)
-    return any((skill.category.value if hasattr(skill.category, "value") else skill.category) == SkillCategory.LEGACY.value for skill in storage.load_skills(enabled_only=False))
 
 
 class RemoteSandboxBackend(SandboxBackend):
@@ -153,7 +146,7 @@ class RemoteSandboxBackend(SandboxBackend):
         """POST /api/sandboxes → create Pod + Service."""
         del extra_mounts
         effective_user_id = user_id or get_effective_user_id()
-        include_legacy_skills = _should_mount_legacy_skills(effective_user_id)
+        include_legacy_skills = user_should_see_legacy_skills(effective_user_id)
         try:
             resp = requests.post(
                 f"{self._provisioner_url}/api/sandboxes",
