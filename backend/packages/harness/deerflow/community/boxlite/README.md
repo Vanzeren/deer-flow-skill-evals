@@ -18,8 +18,9 @@ sandbox:
   cpus: 2                         # per-box vCPUs (optional)
   replicas: 3                     # active + warm VM cap per gateway process (default: 3)
   idle_timeout: 600               # warm VM idle seconds before stop; 0 disables
-  health_check_skip_seconds: 5.0  # skip health check on reclaim if box was
-                                  #   released within this many seconds (default: 5.0)
+  health_check_skip_seconds: 0.0  # optional low-latency mode: skip reclaim
+                                  #   health checks for recent releases; 0 keeps
+                                  #   reliability-first validation (default: 0.0)
   environment:                    # injected into every command
     PYTHONUNBUFFERED: "1"
 ```

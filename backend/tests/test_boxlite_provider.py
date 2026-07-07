@@ -383,8 +383,8 @@ def test_acquire_reclaims_from_warm_pool(monkeypatch):
     assert sid2 not in provider._warm_pool
 
 
-def test_recently_released_warm_pool_box_skips_health_check(monkeypatch):
-    """A box released by this provider can be reclaimed without a fresh ping."""
+def test_explicit_recent_reclaim_skip_avoids_health_check(monkeypatch):
+    """A configured skip window can reclaim recently released boxes without a ping."""
     monkeypatch.setattr(
         "deerflow.community.boxlite.provider.get_app_config",
         lambda: _stub_config({"health_check_skip_seconds": 5}),
@@ -414,10 +414,10 @@ def test_recently_released_warm_pool_box_skips_health_check(monkeypatch):
     provider.shutdown()
 
 
-def test_health_check_skip_zero_forces_recent_reclaim_validation(monkeypatch):
+def test_recent_reclaim_validates_by_default(monkeypatch):
     monkeypatch.setattr(
         "deerflow.community.boxlite.provider.get_app_config",
-        lambda: _stub_config({"health_check_skip_seconds": 0}),
+        lambda: _stub_config(),
     )
     monkeypatch.setattr(
         "deerflow.community.boxlite.provider._import_simplebox",
@@ -445,6 +445,39 @@ def test_health_check_skip_zero_forces_recent_reclaim_validation(monkeypatch):
     assert calls == 1
     assert sid in provider._boxes
     assert sid not in provider._warm_pool
+
+    provider.shutdown()
+
+
+def test_default_recent_reclaim_drops_dead_warm_box(monkeypatch):
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider.get_app_config",
+        lambda: _stub_config(),
+    )
+    monkeypatch.setattr(
+        "deerflow.community.boxlite.provider._import_simplebox",
+        lambda: _FakeBox,
+    )
+
+    provider = BoxliteProvider()
+    provider._loop.run = _fake_run
+
+    sid = provider.acquire("thread-1", user_id="u1")
+    provider.release(sid)
+    box, _ = provider._warm_pool[sid]
+
+    def _dead_health_check(command: str, *args, **kwargs):
+        assert command == "echo ok"
+        return "Error: vsock disconnected"
+
+    monkeypatch.setattr(box, "execute_command", _dead_health_check)
+
+    reclaimed = provider._reclaim_warm_pool(sid)
+    assert reclaimed is None
+    assert sid not in provider._boxes
+    assert sid not in provider._warm_pool
+    assert sid not in provider._skip_health_check_warm_ids
+    assert box.is_closed is True
 
     provider.shutdown()
 

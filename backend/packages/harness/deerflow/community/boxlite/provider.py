@@ -205,7 +205,7 @@ class BoxliteProvider(WarmPoolLifecycleMixin[BoxliteBox], SandboxProvider):
             "environment": dict(_opt("environment") or {}),
             "replicas": replicas if replicas is not None else self.DEFAULT_REPLICAS,
             "idle_timeout": idle_timeout if idle_timeout is not None else self.DEFAULT_IDLE_TIMEOUT,
-            "health_check_skip_seconds": float(health_check_skip_seconds if health_check_skip_seconds is not None else 5.0),
+            "health_check_skip_seconds": float(health_check_skip_seconds if health_check_skip_seconds is not None else 0.0),
         }
 
     @staticmethod
@@ -443,7 +443,7 @@ class BoxliteProvider(WarmPoolLifecycleMixin[BoxliteBox], SandboxProvider):
             box, released_at = self._warm_pool[sandbox_id]
             skip_eligible = sandbox_id in self._skip_health_check_warm_ids
 
-        skip_seconds = self._config.get("health_check_skip_seconds", 5.0)
+        skip_seconds = self._config.get("health_check_skip_seconds", 0.0)
         if skip_eligible and skip_seconds > 0 and (time.time() - released_at) < skip_seconds:
             # Recently released by this provider — promote directly without a
             # health-check round trip, but never return an adapter that this
