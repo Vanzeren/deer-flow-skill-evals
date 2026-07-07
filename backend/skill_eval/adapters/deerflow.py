@@ -26,6 +26,9 @@ class DeerFlowTraceAdapter:
     def start(self) -> None:
         self._start_time = time.monotonic()
 
+    def add_error(self, error: str) -> None:
+        self._errors.append(error)
+
     def feed(self, event: StreamEvent) -> None:
         """Ingest one StreamEvent."""
         self._raw_events.append({"type": event.type, "data": event.data})
@@ -159,14 +162,10 @@ class DeerFlowAgentRunner:
         self,
         config_path: str | None = None,
         model_name: str | None = None,
-        sandbox: str | None = None,
-        skills_dir: str = "skills",
         trace_dir: str | None = None,
     ):
         self._config_path = config_path
         self._model_name = model_name
-        self._sandbox = sandbox or "local"
-        self._skills_dir = skills_dir
         self._trace_dir = trace_dir
 
     async def run(self, request: AgentRunRequest) -> AgentRunResult:
@@ -209,7 +208,7 @@ class DeerFlowAgentRunner:
         timeout = request.metadata.get("timeout_seconds", 300)
 
         adapter = DeerFlowTraceAdapter(request)
-        adapter._start_time = time.monotonic()
+        adapter.start()
 
         # Run stream in thread to avoid blocking event loop
         def _stream_and_feed():
@@ -217,7 +216,7 @@ class DeerFlowAgentRunner:
                 for event in client.stream(request.user_input, thread_id=thread_id):
                     adapter.feed(event)
             except Exception as exc:
-                adapter._errors.append(f"Stream error: {exc}")
+                adapter.add_error(f"Stream error: {exc}")
 
         try:
             await asyncio.wait_for(
@@ -225,9 +224,9 @@ class DeerFlowAgentRunner:
                 timeout=timeout,
             )
         except TimeoutError:
-            adapter._errors.append(f"Stream timed out after {timeout}s")
+            adapter.add_error(f"Stream timed out after {timeout}s")
         except Exception as exc:
-            adapter._errors.append(f"Runner error: {exc}")
+            adapter.add_error(f"Runner error: {exc}")
 
         # Save raw trace
         trace_path = None
