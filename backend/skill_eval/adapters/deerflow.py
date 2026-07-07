@@ -1,8 +1,9 @@
+import asyncio
 import time
 from typing import Any
 
 from deerflow.client import StreamEvent
-from skill_eval.agent_runner import AgentRunRequest
+from skill_eval.agent_runner import AgentRunRequest, AgentRunResult
 from skill_eval.trace_schema import AgentToolCall, AgentTrace, SkillInvocation
 
 
@@ -149,3 +150,94 @@ class DeerFlowTraceAdapter:
             )
 
         return invocations
+
+
+class DeerFlowAgentRunner:
+    """AgentRunner backed by DeerFlowClient (in-process, no Gateway)."""
+
+    def __init__(
+        self,
+        config_path: str | None = None,
+        model_name: str | None = None,
+        sandbox: str | None = None,
+        skills_dir: str = "skills",
+        trace_dir: str | None = None,
+    ):
+        self._config_path = config_path
+        self._model_name = model_name
+        self._sandbox = sandbox or "local"
+        self._skills_dir = skills_dir
+        self._trace_dir = trace_dir
+
+    async def run(self, request: AgentRunRequest) -> AgentRunResult:
+        import uuid
+        from pathlib import Path
+
+        from deerflow.client import DeerFlowClient
+
+        # Determine available skills
+        mode = request.metadata.get("mode", "with_skill")
+        if mode == "baseline":
+            available_skills: set[str] | None = set()
+        elif request.forced_skills is not None:
+            available_skills = set(request.forced_skills)
+        else:
+            candidate = set(request.required_skills) | set(request.candidate_skills)
+            available_skills = candidate if candidate else None
+
+        # Create client
+        try:
+            client = DeerFlowClient(
+                config_path=self._config_path,
+                model_name=request.metadata.get("model_name") or self._model_name,
+                available_skills=available_skills,
+            )
+        except Exception as exc:
+            return AgentRunResult(
+                final_answer="",
+                success=False,
+                trace=AgentTrace(
+                    input=request.user_input,
+                    final_answer="",
+                    success=False,
+                    errors=[f"Failed to create DeerFlowClient: {exc}"],
+                    runtime="deerflow",
+                ),
+            )
+
+        thread_id = str(uuid.uuid4())
+        timeout = request.metadata.get("timeout_seconds", 300)
+
+        adapter = DeerFlowTraceAdapter(request)
+        adapter._start_time = time.monotonic()
+
+        # Run stream in thread to avoid blocking event loop
+        def _stream_and_feed():
+            try:
+                for event in client.stream(request.user_input, thread_id=thread_id):
+                    adapter.feed(event)
+            except Exception as exc:
+                adapter._errors.append(f"Stream error: {exc}")
+
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(_stream_and_feed),
+                timeout=timeout,
+            )
+        except TimeoutError:
+            adapter._errors.append(f"Stream timed out after {timeout}s")
+        except Exception as exc:
+            adapter._errors.append(f"Runner error: {exc}")
+
+        # Save raw trace
+        trace_path = None
+        if self._trace_dir:
+            trace_path = str(Path(self._trace_dir) / f"{thread_id}.jsonl")
+
+        trace = adapter.build(raw_trace_path=trace_path)
+
+        return AgentRunResult(
+            final_answer=trace.final_answer,
+            success=trace.success,
+            trace=trace,
+        )
