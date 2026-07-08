@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
 import json
 import os
 import sys
@@ -55,6 +56,7 @@ import time
 import types
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -81,6 +83,7 @@ class BenchResult:
     # Provider config snapshot (written once per batch)
     replicas: int | None = None
     idle_timeout: float | None = None
+    health_check_skip_seconds: float | None = None
     image: str | None = None
     no_warmpool: bool = False
 
@@ -125,6 +128,17 @@ def _stub_config(sandbox_attrs: dict[str, Any] | None = None) -> types.SimpleNam
     return types.SimpleNamespace(sandbox=types.SimpleNamespace(**attrs))
 
 
+@contextmanager
+def _patched_module_attr(module_name: str, attr_name: str, value: Any):
+    module = importlib.import_module(module_name)
+    original = getattr(module, attr_name)
+    setattr(module, attr_name, value)
+    try:
+        yield module
+    finally:
+        setattr(module, attr_name, original)
+
+
 def _make_boxlite_provider(config: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
     """Create a BoxliteProvider with stub config; returns (provider, config_used).
 
@@ -139,6 +153,7 @@ def _make_boxlite_provider(config: dict[str, Any]) -> tuple[Any, dict[str, Any]]
         "image": config.get("image") or "python:3.12-slim",
         "replicas": config.get("replicas", 3),
         "idle_timeout": config.get("idle_timeout", 600),
+        "health_check_skip_seconds": config.get("health_check_skip_seconds", 0.0),
     }
     if "memory_mib" in config:
         sandbox_attrs["memory_mib"] = config["memory_mib"]
@@ -146,12 +161,6 @@ def _make_boxlite_provider(config: dict[str, Any]) -> tuple[Any, dict[str, Any]]
         sandbox_attrs["cpus"] = config["cpus"]
     if "environment" in config:
         sandbox_attrs["environment"] = config["environment"]
-
-    monkeypatch = __import__("pytest").MonkeyPatch()
-    monkeypatch.setattr(
-        "deerflow.community.boxlite.provider.get_app_config",
-        lambda: _stub_config(sandbox_attrs),
-    )
 
     # -- BoxLite 0.9.7 shim permission workaround --
 
@@ -209,9 +218,13 @@ def _make_boxlite_provider(config: dict[str, Any]) -> tuple[Any, dict[str, Any]]
             on_terminal_failure=self._invalidate_box,
         )
 
-    BoxliteProvider._create_box = _patched_create_box
-
-    provider = BoxliteProvider()
+    with _patched_module_attr(
+        "deerflow.community.boxlite.provider",
+        "get_app_config",
+        lambda: _stub_config(sandbox_attrs),
+    ):
+        provider = BoxliteProvider()
+    provider._create_box = types.MethodType(_patched_create_box, provider)
     return provider, sandbox_attrs
 
 
@@ -230,13 +243,12 @@ def _make_aio_provider(config: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
         "provisioner_url": config.get("provisioner_url", ""),
     }
 
-    monkeypatch = __import__("pytest").MonkeyPatch()
-    monkeypatch.setattr(
-        "deerflow.community.aio_sandbox.aio_sandbox_provider.get_app_config",
+    with _patched_module_attr(
+        "deerflow.community.aio_sandbox.aio_sandbox_provider",
+        "get_app_config",
         lambda: _stub_config(sandbox_attrs),
-    )
-
-    provider = AioSandboxProvider()
+    ):
+        provider = AioSandboxProvider()
     return provider, sandbox_attrs
 
 
@@ -540,6 +552,7 @@ def _run_scenario(
     for r in results:
         r.replicas = config_used.get("replicas")
         r.idle_timeout = config_used.get("idle_timeout")
+        r.health_check_skip_seconds = config_used.get("health_check_skip_seconds")
         r.image = config_used.get("image")
 
     # Write JSONL
@@ -618,6 +631,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="sandbox.idle_timeout in seconds (default: 600)",
     )
     p.add_argument(
+        "--health-check-skip-seconds",
+        type=float,
+        default=0.0,
+        help="sandbox.health_check_skip_seconds in seconds (default: 0.0)",
+    )
+    p.add_argument(
         "--image",
         default=None,
         help="OCI image override (default: provider-specific)",
@@ -651,6 +670,7 @@ def main(argv: list[str] | None = None) -> int:
     config: dict[str, Any] = {
         "replicas": args.replicas,
         "idle_timeout": args.idle_timeout,
+        "health_check_skip_seconds": args.health_check_skip_seconds,
         "image": args.image,
     }
 

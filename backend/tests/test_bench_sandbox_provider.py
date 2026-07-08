@@ -217,3 +217,60 @@ def test_summary_preserves_all_failure_group() -> None:
             "total_mean": 0.0,
         }
     ]
+
+
+def test_health_check_skip_seconds_is_forwarded_and_serialized(monkeypatch, tmp_path):
+    captured_config: dict[str, Any] = {}
+
+    def _factory(config: dict[str, Any]):
+        captured_config.update(config)
+        return _FakeProvider(), {
+            "replicas": config["replicas"],
+            "idle_timeout": config["idle_timeout"],
+            "image": config.get("image"),
+            "health_check_skip_seconds": config.get("health_check_skip_seconds"),
+        }
+
+    monkeypatch.setitem(bench.PROVIDER_FACTORIES, "boxlite", _factory)
+    output_path = tmp_path / "out.jsonl"
+
+    rc = bench.main(
+        [
+            "--provider",
+            "boxlite",
+            "--iterations",
+            "1",
+            "--warmup-iterations",
+            "0",
+            "--health-check-skip-seconds",
+            "7.5",
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    assert rc == 0
+    assert captured_config["health_check_skip_seconds"] == 7.5
+    row = __import__("json").loads(output_path.read_text(encoding="utf-8").splitlines()[0])
+    assert row["health_check_skip_seconds"] == 7.5
+
+
+def test_boxlite_factory_restores_module_state(monkeypatch):
+    import deerflow.community.boxlite.provider as provider_mod
+
+    original_get_app_config = provider_mod.get_app_config
+
+    class _FactoryProvider:
+        _create_box = object()
+
+        def __init__(self) -> None:
+            self.created = True
+
+    original_create_box = _FactoryProvider._create_box
+    monkeypatch.setattr(provider_mod, "BoxliteProvider", _FactoryProvider)
+
+    provider, _ = bench._make_boxlite_provider({})
+
+    assert isinstance(provider, _FactoryProvider)
+    assert provider_mod.get_app_config is original_get_app_config
+    assert _FactoryProvider._create_box is original_create_box
