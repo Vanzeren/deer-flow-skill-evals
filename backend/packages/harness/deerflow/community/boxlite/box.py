@@ -57,6 +57,23 @@ class BoxliteBox(Sandbox):
             per-call ``env`` (request-scoped secrets).
     """
 
+    TERMINAL_ERROR_MARKERS = (
+        "vsock",
+        "disconnected",
+        "broken pipe",
+        "connection reset",
+        "connection refused",
+        "no such box",
+        "box has been stopped",
+        "engine reported an error",
+    )
+    RETRYABLE_ERROR_MARKERS = (
+        "transport not ready",
+        "retry later",
+        "temporarily unavailable",
+        "resource busy",
+    )
+
     def __init__(
         self,
         id: str,
@@ -74,25 +91,16 @@ class BoxliteBox(Sandbox):
         self._lock = threading.Lock()
         self._closed = False
 
-    @staticmethod
-    def _is_terminal_box_failure(error: Exception) -> bool:
+    @classmethod
+    def _is_terminal_box_failure(cls, error: Exception) -> bool:
         if isinstance(error, (BrokenPipeError, ConnectionError, EOFError)):
             return True
         if not isinstance(error, RuntimeError | OSError):
             return False
         msg = str(error).lower()
-        markers = (
-            "vsock",
-            "transport",
-            "disconnected",
-            "broken pipe",
-            "connection reset",
-            "connection refused",
-            "no such box",
-            "box has been stopped",
-            "engine reported an error",
-        )
-        return any(marker in msg for marker in markers)
+        if any(marker in msg for marker in cls.RETRYABLE_ERROR_MARKERS):
+            return False
+        return any(marker in msg for marker in cls.TERMINAL_ERROR_MARKERS)
 
     # ── bridge helpers ──────────────────────────────────────────────────
 
@@ -176,6 +184,8 @@ class BoxliteBox(Sandbox):
         block the caller forever if the SDK future itself never resolves.
         """
         _validate_extra_env(env)  # POSIX env-var key rule; raises ValueError on a bad key
+        if self.is_closed:
+            return "Error: sandbox has been closed"
         merged_env = {**self._default_env, **(env or {})} or None
         try:
             result = self._exec("sh", "-lc", command, env=merged_env, timeout=timeout)

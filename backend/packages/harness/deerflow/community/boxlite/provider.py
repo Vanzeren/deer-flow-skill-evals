@@ -476,16 +476,16 @@ class BoxliteProvider(WarmPoolLifecycleMixin[BoxliteBox], SandboxProvider):
             if "ok" not in result:
                 logger.warning("Warm pool box %s health check failed: %s", sandbox_id, result)
                 with self._lock:
-                    self._warm_pool.pop(sandbox_id, None)
-                    self._skip_health_check_warm_ids.discard(sandbox_id)
-                box.close()
+                    warm_entry = self._warm_pool.pop(sandbox_id, None)
+                if warm_entry is not None:
+                    self._destroy_warm_entry(sandbox_id, warm_entry[0], reason="health_check_failed")
                 return None
         except Exception as e:
             logger.warning("Warm pool box %s health check error: %s", sandbox_id, e)
             with self._lock:
-                self._warm_pool.pop(sandbox_id, None)
-                self._skip_health_check_warm_ids.discard(sandbox_id)
-            box.close()
+                warm_entry = self._warm_pool.pop(sandbox_id, None)
+            if warm_entry is not None:
+                self._destroy_warm_entry(sandbox_id, warm_entry[0], reason="health_check_failed")
             return None
 
         # Promote from warm pool to active

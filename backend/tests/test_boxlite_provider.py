@@ -7,6 +7,7 @@ which need a live box.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 import threading
 import time
@@ -196,6 +197,59 @@ def test_execute_command_does_not_invalidate_on_regular_command_error() -> None:
 
     assert output == "Error: user command failed"
     assert invalidated == []
+
+
+def test_execute_command_does_not_invalidate_on_retryable_transport_message() -> None:
+    invalidated: list[tuple[str, str]] = []
+
+    def _failing_run(coro, *, timeout=None):
+        coro.close()
+        raise RuntimeError("transport not ready, retry later")
+
+    box = BoxliteBox(
+        "box-id",
+        box=_FakeBox(name="box-id"),
+        run=_failing_run,
+        on_terminal_failure=lambda sandbox_id, reason: invalidated.append((sandbox_id, reason)),
+    )
+
+    output = box.execute_command("echo hi")
+
+    assert output == "Error: transport not ready, retry later"
+    assert invalidated == []
+
+
+def test_execute_command_uses_overridable_terminal_markers(monkeypatch: pytest.MonkeyPatch) -> None:
+    invalidated: list[tuple[str, str]] = []
+    monkeypatch.setattr(BoxliteBox, "TERMINAL_ERROR_MARKERS", ("custom terminal marker",))
+    monkeypatch.setattr(BoxliteBox, "RETRYABLE_ERROR_MARKERS", ())
+
+    def _failing_run(coro, *, timeout=None):
+        coro.close()
+        raise RuntimeError("custom terminal marker")
+
+    box = BoxliteBox(
+        "box-id",
+        box=_FakeBox(name="box-id"),
+        run=_failing_run,
+        on_terminal_failure=lambda sandbox_id, reason: invalidated.append((sandbox_id, reason)),
+    )
+
+    output = box.execute_command("echo hi")
+
+    assert output == "Error: custom terminal marker"
+    assert invalidated == [("box-id", "custom terminal marker")]
+
+
+def test_execute_command_closed_box_returns_without_error_log(caplog) -> None:
+    box = BoxliteBox("box-id", box=_FakeBox(name="box-id"), run=_fake_run)
+    box.close()
+
+    with caplog.at_level(logging.ERROR, logger="deerflow.community.boxlite.box"):
+        output = box.execute_command("echo hi")
+
+    assert output == "Error: sandbox has been closed"
+    assert "Failed to execute command in BoxLite box" not in caplog.text
 
 
 def test_sandbox_id_deterministic(monkeypatch):
