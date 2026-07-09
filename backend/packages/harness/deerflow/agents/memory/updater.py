@@ -148,6 +148,49 @@ def delete_memory_fact(fact_id: str, agent_name: str | None = None, *, user_id: 
     return updated_memory
 
 
+def search_memory_facts(
+    query: str,
+    category: str | None = None,
+    limit: int = 10,
+    *,
+    agent_name: str | None = None,
+    user_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Search facts by case-insensitive substring match against content.
+
+    Args:
+        query: Substring to match (case-insensitive). Empty query returns [].
+        category: Optional category filter. If provided, only facts matching
+            this category are considered.
+        limit: Maximum results to return (default 10).
+        agent_name: Per-agent scope, or global memory if None.
+        user_id: Per-user scope within agent.
+
+    Returns:
+        List of matching fact dicts, sorted by confidence descending.
+    """
+    if not query or not query.strip():
+        return []
+
+    query_lower = query.strip().lower()
+    memory_data = get_memory_data(agent_name, user_id=user_id)
+    facts = memory_data.get("facts", [])
+
+    matched = []
+    for fact in facts:
+        content = fact.get("content", "")
+        if not isinstance(content, str):
+            continue
+        if query_lower not in content.lower():
+            continue
+        if category is not None and fact.get("category") != category:
+            continue
+        matched.append(fact)
+
+    matched.sort(key=lambda f: f.get("confidence", 0), reverse=True)
+    return matched[:limit]
+
+
 def update_memory_fact(
     fact_id: str,
     content: str | None = None,

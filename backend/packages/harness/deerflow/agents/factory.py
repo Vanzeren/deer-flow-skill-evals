@@ -242,9 +242,19 @@ def _assemble_from_features(
         if isinstance(feat.memory, AgentMiddleware):
             chain.append(feat.memory)
         else:
-            from deerflow.agents.middlewares.memory_middleware import MemoryMiddleware
+            from deerflow.config.memory_config import get_memory_config
 
-            chain.append(MemoryMiddleware(agent_name=name))
+            memory_cfg = get_memory_config()
+            if memory_cfg.mode == "tool" and memory_cfg.enabled:
+                from deerflow.agents.memory.tools import get_memory_tools
+
+                extra_tools.extend(get_memory_tools())
+                # MemoryMiddleware is intentionally NOT appended in tool mode.
+                # The model drives memory via tools instead of passive middleware.
+            else:
+                from deerflow.agents.middlewares.memory_middleware import MemoryMiddleware
+
+                chain.append(MemoryMiddleware(agent_name=name))
 
     # --- [10] Vision ---
     if feat.vision is not False:

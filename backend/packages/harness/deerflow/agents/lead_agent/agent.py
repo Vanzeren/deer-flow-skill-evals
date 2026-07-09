@@ -293,8 +293,9 @@ def build_middlewares(
     # Add TitleMiddleware
     middlewares.append(TitleMiddleware(app_config=resolved_app_config))
 
-    # Add MemoryMiddleware (after TitleMiddleware)
-    middlewares.append(MemoryMiddleware(agent_name=agent_name, memory_config=resolved_app_config.memory))
+    # Add MemoryMiddleware (after TitleMiddleware) — skipped in tool mode
+    if not (resolved_app_config.memory.mode == "tool" and resolved_app_config.memory.enabled):
+        middlewares.append(MemoryMiddleware(agent_name=agent_name, memory_config=resolved_app_config.memory))
 
     # Add ViewImageMiddleware only if the current model supports vision.
     # Use the resolved runtime model_name from make_lead_agent to avoid stale config values.
@@ -492,6 +493,10 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
         final_tools, setup = assemble_deferred_tools(filtered, enabled=resolved_app_config.tool_search.enabled)
         if skill_setup.describe_skill_tool:
             final_tools.append(skill_setup.describe_skill_tool)
+        if resolved_app_config.memory.mode == "tool" and resolved_app_config.memory.enabled:
+            from deerflow.agents.memory.tools import get_memory_tools
+
+            final_tools.extend(get_memory_tools())
         return create_agent(
             model=create_chat_model(name=model_name, thinking_enabled=thinking_enabled, app_config=resolved_app_config, attach_tracing=False),
             tools=final_tools,
@@ -549,6 +554,10 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
     mcp_routing_hints_section = get_mcp_routing_hints_prompt_section(filtered, deferred_names=setup.deferred_names)
     if skill_setup.describe_skill_tool:
         final_tools.append(skill_setup.describe_skill_tool)
+    if resolved_app_config.memory.mode == "tool" and resolved_app_config.memory.enabled:
+        from deerflow.agents.memory.tools import get_memory_tools
+
+        final_tools.extend(get_memory_tools())
     return create_agent(
         model=create_chat_model(name=model_name, thinking_enabled=thinking_enabled, reasoning_effort=reasoning_effort, app_config=resolved_app_config, attach_tracing=False),
         tools=final_tools,

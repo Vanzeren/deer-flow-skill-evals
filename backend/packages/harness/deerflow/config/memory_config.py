@@ -52,6 +52,12 @@ class MemoryConfig(BaseModel):
         le=1.0,
         description="Minimum confidence threshold for storing facts",
     )
+    mode: Literal["middleware", "tool"] = Field(
+        default="middleware",
+        description=(
+            "Memory operation mode. 'middleware': passive LLM summarization after each turn (current behavior). 'tool': model calls memory tools (memory_search, memory_add, etc.) directly. Mutually exclusive — only one mode runs at a time."
+        ),
+    )
     injection_enabled: bool = Field(
         default=True,
         description="Whether to inject memory into system prompt",
