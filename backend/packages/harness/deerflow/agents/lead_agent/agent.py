@@ -60,6 +60,21 @@ _NON_INTERACTIVE_DISABLED_TOOL_NAMES = frozenset({"ask_clarification"})
 _WEBHOOK_CHANNELS: frozenset[str] = frozenset({"github"})
 
 
+def _dedupe_tools_by_name(tools: list) -> list:
+    """Return tools with duplicate names removed, preserving first occurrence."""
+    seen_names: set[str] = set()
+    unique_tools = []
+    for tool in tools:
+        tool_name = getattr(tool, "name", None)
+        if tool_name in seen_names:
+            logger.warning("Duplicate tool name %r detected and skipped before agent binding.", tool_name)
+            continue
+        if tool_name is not None:
+            seen_names.add(tool_name)
+        unique_tools.append(tool)
+    return unique_tools
+
+
 def _get_runtime_config(config: RunnableConfig) -> dict:
     """Merge legacy configurable options with LangGraph runtime context."""
     cfg = dict(config.get("configurable", {}) or {})
@@ -497,6 +512,7 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
             from deerflow.agents.memory.tools import get_memory_tools
 
             final_tools.extend(get_memory_tools())
+        final_tools = _dedupe_tools_by_name(final_tools)
         return create_agent(
             model=create_chat_model(name=model_name, thinking_enabled=thinking_enabled, app_config=resolved_app_config, attach_tracing=False),
             tools=final_tools,
@@ -558,6 +574,7 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
         from deerflow.agents.memory.tools import get_memory_tools
 
         final_tools.extend(get_memory_tools())
+    final_tools = _dedupe_tools_by_name(final_tools)
     return create_agent(
         model=create_chat_model(name=model_name, thinking_enabled=thinking_enabled, reasoning_effort=reasoning_effort, app_config=resolved_app_config, attach_tracing=False),
         tools=final_tools,

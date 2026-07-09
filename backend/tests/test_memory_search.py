@@ -102,6 +102,14 @@ class TestSearchMemoryFacts:
         results = search_memory_facts("Fact", limit=5)
         assert len(results) == 5
 
+    def test_negative_limit_returns_empty(self, tmp_path, monkeypatch):
+        """Should not let negative limits expand the result set via slicing."""
+        facts = [_make_fact(f"Fact {i}", confidence=0.5) for i in range(3)]
+        _setup_memory(tmp_path, monkeypatch, facts)
+
+        results = search_memory_facts("Fact", limit=-1)
+        assert results == []
+
     def test_no_facts_returns_empty(self, tmp_path, monkeypatch):
         """Should return empty list when memory has no facts."""
         _setup_memory(tmp_path, monkeypatch, [])

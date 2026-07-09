@@ -1,6 +1,7 @@
 """Tests for memory tool functions (tool-driven memory mode)."""
 
 import json
+from types import SimpleNamespace
 
 from deerflow.agents.memory.tools import (
     get_memory_tools,
@@ -9,6 +10,11 @@ from deerflow.agents.memory.tools import (
     memory_search_tool,
     memory_update_tool,
 )
+
+
+class _NamedTool:
+    def __init__(self, name: str):
+        self.name = name
 
 
 class TestGetMemoryTools:
@@ -46,9 +52,9 @@ class TestMemorySearchTool:
             "deerflow.agents.memory.tools.search_memory_facts",
             mock_search,
         )
-        monkeypatch.setattr("deerflow.agents.memory.tools.get_effective_user_id", lambda: "test-user")
+        monkeypatch.setattr("deerflow.agents.memory.tools.resolve_runtime_user_id", lambda runtime: "test-user")
 
-        result_json = memory_search_tool.invoke({"query": "Python"})
+        result_json = memory_search_tool.func(SimpleNamespace(context={}), "Python")
         result = json.loads(result_json)
         assert result["count"] == 1
         assert len(result["results"]) == 1
@@ -60,9 +66,9 @@ class TestMemorySearchTool:
             "deerflow.agents.memory.tools.search_memory_facts",
             lambda *a, **kw: [],
         )
-        monkeypatch.setattr("deerflow.agents.memory.tools.get_effective_user_id", lambda: "test-user")
+        monkeypatch.setattr("deerflow.agents.memory.tools.resolve_runtime_user_id", lambda runtime: "test-user")
 
-        result_json = memory_search_tool.invoke({"query": "nothing"})
+        result_json = memory_search_tool.func(SimpleNamespace(context={}), "nothing")
         result = json.loads(result_json)
         assert result["count"] == 0
         assert result["results"] == []
@@ -73,9 +79,9 @@ class TestMemorySearchTool:
             "deerflow.agents.memory.tools.search_memory_facts",
             lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")),
         )
-        monkeypatch.setattr("deerflow.agents.memory.tools.get_effective_user_id", lambda: "test-user")
+        monkeypatch.setattr("deerflow.agents.memory.tools.resolve_runtime_user_id", lambda runtime: "test-user")
 
-        result_json = memory_search_tool.invoke({"query": "anything"})
+        result_json = memory_search_tool.func(SimpleNamespace(context={}), "anything")
         result = json.loads(result_json)
         assert "error" in result
         assert result["error"] == "boom"
@@ -92,15 +98,55 @@ class TestMemoryAddTool:
             return mock_memory
 
         monkeypatch.setattr("deerflow.agents.memory.tools.create_memory_fact", mock_create)
-        monkeypatch.setattr("deerflow.agents.memory.tools.get_effective_user_id", lambda: "test-user")
+        monkeypatch.setattr("deerflow.agents.memory.tools.resolve_runtime_user_id", lambda runtime: "test-user")
 
-        result_json = memory_add_tool.invoke({"content": "User prefers dark mode", "category": "preference", "confidence": 0.9})
+        result_json = memory_add_tool.func(SimpleNamespace(context={}), "User prefers dark mode", category="preference", confidence=0.9)
         result = json.loads(result_json)
         assert result["status"] == "added"
         assert "fact_id" in result
 
         # fact_id is derived from the last fact in the returned memory
         assert result["fact_id"] == "fact_new123"
+
+    def test_uses_runtime_user_id_when_directly_called(self, monkeypatch):
+        """Should prefer runtime.context user_id over ContextVar fallback."""
+        captured = {}
+
+        def mock_create(content, category="context", confidence=0.5, agent_name=None, *, user_id=None):
+            captured["agent_name"] = agent_name
+            captured["user_id"] = user_id
+            return {"facts": [{"id": "fact_new123", "content": content}]}
+
+        monkeypatch.setattr("deerflow.agents.memory.tools.create_memory_fact", mock_create)
+
+        runtime = SimpleNamespace(context={"user_id": "runtime-user", "agent_name": "code-agent"})
+        result_json = memory_add_tool.func(runtime, "User prefers dark mode")
+        result = json.loads(result_json)
+
+        assert result["status"] == "added"
+        assert captured == {"agent_name": "code-agent", "user_id": "runtime-user"}
+
+    def test_rejects_existing_duplicate_content(self, monkeypatch):
+        """Should not persist a fact whose normalized content already exists."""
+        create_called = False
+
+        def mock_create(*a, **kw):
+            nonlocal create_called
+            create_called = True
+            return {"facts": [{"id": "fact_new123"}]}
+
+        monkeypatch.setattr(
+            "deerflow.agents.memory.tools.search_memory_facts",
+            lambda *a, **kw: [{"id": "fact_existing", "content": "User prefers dark mode"}],
+        )
+        monkeypatch.setattr("deerflow.agents.memory.tools.create_memory_fact", mock_create)
+        monkeypatch.setattr("deerflow.agents.memory.tools.resolve_runtime_user_id", lambda runtime: "test-user")
+
+        result_json = memory_add_tool.func(SimpleNamespace(context={}), "  User prefers dark mode  ")
+        result = json.loads(result_json)
+
+        assert "error" in result
+        assert create_called is False
 
     def test_duplicate_content_returns_error(self, monkeypatch):
         """Should return error JSON for duplicate content."""
@@ -109,9 +155,9 @@ class TestMemoryAddTool:
             raise ValueError("Duplicate fact")
 
         monkeypatch.setattr("deerflow.agents.memory.tools.create_memory_fact", mock_create)
-        monkeypatch.setattr("deerflow.agents.memory.tools.get_effective_user_id", lambda: "test-user")
+        monkeypatch.setattr("deerflow.agents.memory.tools.resolve_runtime_user_id", lambda runtime: "test-user")
 
-        result_json = memory_add_tool.invoke({"content": "duplicate"})
+        result_json = memory_add_tool.func(SimpleNamespace(context={}), "duplicate")
         result = json.loads(result_json)
         assert "error" in result
 
@@ -122,9 +168,9 @@ class TestMemoryAddTool:
             raise ValueError("content")
 
         monkeypatch.setattr("deerflow.agents.memory.tools.create_memory_fact", mock_create)
-        monkeypatch.setattr("deerflow.agents.memory.tools.get_effective_user_id", lambda: "test-user")
+        monkeypatch.setattr("deerflow.agents.memory.tools.resolve_runtime_user_id", lambda runtime: "test-user")
 
-        result_json = memory_add_tool.invoke({"content": ""})
+        result_json = memory_add_tool.func(SimpleNamespace(context={}), "")
         result = json.loads(result_json)
         assert "error" in result
 
@@ -140,9 +186,9 @@ class TestMemoryUpdateTool:
             return mock_memory
 
         monkeypatch.setattr("deerflow.agents.memory.tools.update_memory_fact", mock_update)
-        monkeypatch.setattr("deerflow.agents.memory.tools.get_effective_user_id", lambda: "test-user")
+        monkeypatch.setattr("deerflow.agents.memory.tools.resolve_runtime_user_id", lambda runtime: "test-user")
 
-        result_json = memory_update_tool.invoke({"fact_id": "fact_abc", "content": "updated content"})
+        result_json = memory_update_tool.func(SimpleNamespace(context={}), "fact_abc", content="updated content")
         result = json.loads(result_json)
         assert result["status"] == "updated"
         assert result["fact_id"] == "fact_abc"
@@ -154,9 +200,9 @@ class TestMemoryUpdateTool:
             raise KeyError("fact_xxx")
 
         monkeypatch.setattr("deerflow.agents.memory.tools.update_memory_fact", mock_update)
-        monkeypatch.setattr("deerflow.agents.memory.tools.get_effective_user_id", lambda: "test-user")
+        monkeypatch.setattr("deerflow.agents.memory.tools.resolve_runtime_user_id", lambda runtime: "test-user")
 
-        result_json = memory_update_tool.invoke({"fact_id": "fact_xxx", "content": "nope"})
+        result_json = memory_update_tool.func(SimpleNamespace(context={}), "fact_xxx", content="nope")
         result = json.loads(result_json)
         assert "error" in result
         assert "fact_xxx" in result["error"]
@@ -173,9 +219,9 @@ class TestMemoryDeleteTool:
             return mock_memory
 
         monkeypatch.setattr("deerflow.agents.memory.tools.delete_memory_fact", mock_delete)
-        monkeypatch.setattr("deerflow.agents.memory.tools.get_effective_user_id", lambda: "test-user")
+        monkeypatch.setattr("deerflow.agents.memory.tools.resolve_runtime_user_id", lambda runtime: "test-user")
 
-        result_json = memory_delete_tool.invoke({"fact_id": "fact_abc"})
+        result_json = memory_delete_tool.func(SimpleNamespace(context={}), "fact_abc")
         result = json.loads(result_json)
         assert result["status"] == "deleted"
         assert result["fact_id"] == "fact_abc"
@@ -187,9 +233,9 @@ class TestMemoryDeleteTool:
             raise KeyError("fact_xxx")
 
         monkeypatch.setattr("deerflow.agents.memory.tools.delete_memory_fact", mock_delete)
-        monkeypatch.setattr("deerflow.agents.memory.tools.get_effective_user_id", lambda: "test-user")
+        monkeypatch.setattr("deerflow.agents.memory.tools.resolve_runtime_user_id", lambda runtime: "test-user")
 
-        result_json = memory_delete_tool.invoke({"fact_id": "fact_xxx"})
+        result_json = memory_delete_tool.func(SimpleNamespace(context={}), "fact_xxx")
         result = json.loads(result_json)
         assert "error" in result
         assert "fact_xxx" in result["error"]
@@ -271,3 +317,36 @@ class TestModeGating:
         # Tools should NOT be registered in middleware mode regardless of enabled
         tool_names = [t.name for t in extra_tools]
         assert "memory_search" not in tool_names
+
+    def test_lead_agent_deduplicates_memory_tools_after_appending(self, monkeypatch):
+        """Configured tools should not duplicate tool-mode memory tools."""
+        from deerflow.agents.lead_agent import agent as lead_agent_module
+        from deerflow.config.memory_config import MemoryConfig
+
+        monkeypatch.setattr(lead_agent_module, "_resolve_model_name", lambda x=None, **kwargs: "default-model")
+        monkeypatch.setattr(lead_agent_module, "create_chat_model", lambda **kwargs: "model")
+        monkeypatch.setattr(lead_agent_module, "build_middlewares", lambda *args, **kwargs: [])
+        monkeypatch.setattr(lead_agent_module, "apply_prompt_template", lambda **kwargs: "mock_prompt")
+        monkeypatch.setattr(lead_agent_module, "create_agent", lambda **kwargs: kwargs)
+        monkeypatch.setattr(lead_agent_module, "build_tracing_callbacks", lambda: [])
+        monkeypatch.setattr(
+            lead_agent_module,
+            "load_agent_config",
+            lambda name: SimpleNamespace(model=None, skills=None, tool_groups=None),
+        )
+        monkeypatch.setattr(lead_agent_module, "_load_enabled_skills_for_tool_policy", lambda available_skills, *, app_config, user_id=None: [])
+        monkeypatch.setattr(lead_agent_module, "filter_tools_by_skill_allowed_tools", lambda tools, skills, always_allowed_tool_names=(): tools)
+        monkeypatch.setattr("deerflow.tools.get_available_tools", lambda **kwargs: [_NamedTool("memory_search"), _NamedTool("bash")])
+
+        app_config = SimpleNamespace(
+            get_model_config=lambda name: SimpleNamespace(supports_thinking=False, supports_vision=False),
+            memory=MemoryConfig(enabled=True, mode="tool"),
+            skills=SimpleNamespace(deferred_discovery=False, container_path="/tmp/skills"),
+            tool_search=SimpleNamespace(enabled=False),
+        )
+
+        agent_kwargs = lead_agent_module._make_lead_agent({"configurable": {"agent_name": "test-agent"}}, app_config=app_config)
+        tool_names = [tool.name for tool in agent_kwargs["tools"]]
+
+        assert tool_names.count("memory_search") == 1
+        assert "memory_add" in tool_names

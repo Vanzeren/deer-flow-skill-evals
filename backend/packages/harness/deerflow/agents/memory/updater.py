@@ -171,6 +171,8 @@ def search_memory_facts(
     """
     if not query or not query.strip():
         return []
+    if limit <= 0:
+        return []
 
     query_lower = query.strip().lower()
     memory_data = get_memory_data(agent_name, user_id=user_id)

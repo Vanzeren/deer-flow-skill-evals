@@ -9,12 +9,10 @@ its own persistent memory: it decides what to remember, when to
 search, and when to update or remove stale facts.
 """
 
-from __future__ import annotations
-
 import json
 import logging
 
-from langchain_core.tools import tool
+from langchain.tools import tool
 
 from deerflow.agents.memory.updater import (
     create_memory_fact,
@@ -22,23 +20,33 @@ from deerflow.agents.memory.updater import (
     search_memory_facts,
     update_memory_fact,
 )
-from deerflow.runtime.user_context import get_effective_user_id
+from deerflow.runtime.user_context import resolve_runtime_user_id
+from deerflow.tools.types import Runtime
 
 logger = logging.getLogger(__name__)
 
 
-def _resolve_scope() -> tuple[str | None, str]:
+def _resolve_scope(runtime: Runtime | None = None) -> tuple[str | None, str]:
     """Resolve agent_name and user_id for tool handler scope.
 
-    agent_name is None (global memory) for v1; per-agent scoping in
-    tool mode is deferred. user_id is always the effective user from
-    the request context.
+    Tool execution receives user and agent metadata through LangGraph runtime
+    context.  Prefer that channel over ContextVar fallback so persistence stays
+    scoped correctly across request/task boundaries.
     """
-    return None, get_effective_user_id()
+    context = getattr(runtime, "context", None)
+    agent_name = None
+    if isinstance(context, dict) and context.get("agent_name"):
+        agent_name = str(context["agent_name"])
+    return agent_name, resolve_runtime_user_id(runtime)
+
+
+def _memory_content_key(content: str) -> str:
+    return content.strip().casefold()
 
 
 @tool("memory_search", parse_docstring=True)
 def memory_search_tool(
+    runtime: Runtime,
     query: str,
     category: str | None = None,
     limit: int = 10,
@@ -59,7 +67,7 @@ def memory_search_tool(
         JSON string with "results" (list of fact objects) and "count".
         Each fact has id, content, category, confidence, createdAt.
     """
-    agent_name, user_id = _resolve_scope()
+    agent_name, user_id = _resolve_scope(runtime)
     try:
         results = search_memory_facts(
             query,
@@ -76,6 +84,7 @@ def memory_search_tool(
 
 @tool("memory_add", parse_docstring=True)
 def memory_add_tool(
+    runtime: Runtime,
     content: str,
     category: str = "context",
     confidence: float = 0.7,
@@ -99,10 +108,21 @@ def memory_add_tool(
         JSON string with "fact_id" and "status": "added".
         On duplicate content, returns "error" with explanation.
     """
-    agent_name, user_id = _resolve_scope()
+    agent_name, user_id = _resolve_scope(runtime)
     try:
+        normalized_content = content.strip()
+        existing_key = _memory_content_key(normalized_content)
+        existing_facts = search_memory_facts(
+            normalized_content,
+            limit=10,
+            agent_name=agent_name,
+            user_id=user_id,
+        )
+        if any(_memory_content_key(str(fact.get("content", ""))) == existing_key for fact in existing_facts):
+            return json.dumps({"error": "Duplicate fact"})
+
         updated_memory = create_memory_fact(
-            content,
+            normalized_content,
             category=category,
             confidence=confidence,
             agent_name=agent_name,
@@ -121,6 +141,7 @@ def memory_add_tool(
 
 @tool("memory_update", parse_docstring=True)
 def memory_update_tool(
+    runtime: Runtime,
     fact_id: str,
     content: str | None = None,
     category: str | None = None,
@@ -142,7 +163,7 @@ def memory_update_tool(
         JSON string with "fact_id" and "status": "updated".
         On invalid fact_id, returns "error" with explanation.
     """
-    agent_name, user_id = _resolve_scope()
+    agent_name, user_id = _resolve_scope(runtime)
     try:
         update_memory_fact(
             fact_id,
@@ -163,7 +184,7 @@ def memory_update_tool(
 
 
 @tool("memory_delete", parse_docstring=True)
-def memory_delete_tool(fact_id: str) -> str:
+def memory_delete_tool(runtime: Runtime, fact_id: str) -> str:
     """Delete a fact by its ID.
 
     Use this when a fact is no longer accurate or relevant. First use
@@ -176,7 +197,7 @@ def memory_delete_tool(fact_id: str) -> str:
         JSON string with "fact_id" and "status": "deleted".
         On invalid fact_id, returns "error" with explanation.
     """
-    agent_name, user_id = _resolve_scope()
+    agent_name, user_id = _resolve_scope(runtime)
     try:
         delete_memory_fact(fact_id, agent_name=agent_name, user_id=user_id)
         return json.dumps({"fact_id": fact_id, "status": "deleted"})

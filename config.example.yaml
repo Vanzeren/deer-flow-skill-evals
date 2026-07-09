@@ -1383,6 +1383,13 @@ summarization:
 # Stores user context and conversation history for personalized responses
 memory:
   enabled: true
+  # Memory operation mode:
+  #   middleware (default) - passive background extraction after each turn.
+  #   tool - experimental opt-in; the model calls memory_search/memory_add/
+  #     memory_update/memory_delete directly. This gives the model agency over
+  #     memory writes, but effectiveness depends on model tool-use behavior.
+  # Only one mode runs at a time.
+  mode: middleware
   storage_path: memory.json # Path relative to backend directory
   debounce_seconds: 30 # Wait time before processing queued updates
   model_name: null # Use default model
