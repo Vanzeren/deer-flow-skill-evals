@@ -6,9 +6,12 @@ Pure data classes and decorators — no I/O, no side effects.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from langchain.agents.middleware import AgentMiddleware
+
+if TYPE_CHECKING:
+    from deerflow.config.memory_config import MemoryConfig
 
 
 @dataclass
@@ -26,6 +29,7 @@ class RuntimeFeatures:
 
     sandbox: bool | AgentMiddleware = True
     memory: bool | AgentMiddleware = False
+    memory_config: MemoryConfig | None = None
     summarization: Literal[False] | AgentMiddleware = False
     subagent: bool | AgentMiddleware = False
     vision: bool | AgentMiddleware = False

@@ -60,19 +60,17 @@ _NON_INTERACTIVE_DISABLED_TOOL_NAMES = frozenset({"ask_clarification"})
 _WEBHOOK_CHANNELS: frozenset[str] = frozenset({"github"})
 
 
-def _dedupe_tools_by_name(tools: list) -> list:
-    """Return tools with duplicate names removed, preserving first occurrence."""
-    seen_names: set[str] = set()
-    unique_tools = []
-    for tool in tools:
-        tool_name = getattr(tool, "name", None)
-        if tool_name in seen_names:
-            logger.warning("Duplicate tool name %r detected and skipped before agent binding.", tool_name)
+def _append_memory_tools_without_name_conflicts(tools: list) -> None:
+    """Append memory tools without dropping unrelated duplicate-named tools."""
+    from deerflow.agents.memory.tools import get_memory_tools
+
+    existing_names = {getattr(tool, "name", None) for tool in tools}
+    for memory_tool in get_memory_tools():
+        if memory_tool.name in existing_names:
+            logger.warning("Memory tool name %r already exists and was skipped.", memory_tool.name)
             continue
-        if tool_name is not None:
-            seen_names.add(tool_name)
-        unique_tools.append(tool)
-    return unique_tools
+        tools.append(memory_tool)
+        existing_names.add(memory_tool.name)
 
 
 def _get_runtime_config(config: RunnableConfig) -> dict:
@@ -525,10 +523,7 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
         if skill_setup.describe_skill_tool:
             final_tools.append(skill_setup.describe_skill_tool)
         if resolved_app_config.memory.mode == "tool" and resolved_app_config.memory.enabled:
-            from deerflow.agents.memory.tools import get_memory_tools
-
-            final_tools.extend(get_memory_tools())
-        final_tools = _dedupe_tools_by_name(final_tools)
+            _append_memory_tools_without_name_conflicts(final_tools)
         return create_agent(
             model=create_chat_model(name=model_name, thinking_enabled=thinking_enabled, app_config=resolved_app_config, attach_tracing=False),
             tools=final_tools,
@@ -593,10 +588,7 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
     if skill_setup.describe_skill_tool:
         final_tools.append(skill_setup.describe_skill_tool)
     if resolved_app_config.memory.mode == "tool" and resolved_app_config.memory.enabled:
-        from deerflow.agents.memory.tools import get_memory_tools
-
-        final_tools.extend(get_memory_tools())
-    final_tools = _dedupe_tools_by_name(final_tools)
+        _append_memory_tools_without_name_conflicts(final_tools)
     return create_agent(
         model=create_chat_model(name=model_name, thinking_enabled=thinking_enabled, reasoning_effort=reasoning_effort, app_config=resolved_app_config, attach_tracing=False),
         tools=final_tools,

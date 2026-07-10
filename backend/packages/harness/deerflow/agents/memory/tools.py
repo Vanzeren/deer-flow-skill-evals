@@ -15,8 +15,9 @@ import logging
 from langchain.tools import tool
 
 from deerflow.agents.memory.updater import (
-    create_memory_fact,
+    create_memory_fact_with_created_fact,
     delete_memory_fact,
+    get_memory_data,
     search_memory_facts,
     update_memory_fact,
 )
@@ -112,31 +113,32 @@ def memory_add_tool(
     try:
         normalized_content = content.strip()
         existing_key = _memory_content_key(normalized_content)
-        existing_facts = search_memory_facts(
-            normalized_content,
-            limit=10,
-            agent_name=agent_name,
-            user_id=user_id,
-        )
+        existing_facts = get_memory_data(agent_name, user_id=user_id).get("facts", [])
         if any(_memory_content_key(str(fact.get("content", ""))) == existing_key for fact in existing_facts):
             return json.dumps({"error": "Duplicate fact"})
 
-        updated_memory = create_memory_fact(
+        updated_memory, created_fact = create_memory_fact_with_created_fact(
             normalized_content,
             category=category,
             confidence=confidence,
             agent_name=agent_name,
             user_id=user_id,
         )
-        # Extract the newly created fact's id (last one in the list)
-        facts = updated_memory.get("facts", [])
-        fact_id = facts[-1]["id"] if facts else "unknown"
+        fact_id = created_fact["id"]
+        if all(fact.get("id") != fact_id for fact in updated_memory.get("facts", [])):
+            return json.dumps({"error": "Fact was not stored because memory.max_facts kept higher-confidence facts"})
         return json.dumps({"fact_id": fact_id, "status": "added"})
     except ValueError as exc:
         return json.dumps({"error": str(exc)})
     except Exception as exc:
         logger.exception("memory_add_tool failed")
         return json.dumps({"error": str(exc)})
+
+
+# Tool mode exposes explicit CRUD, not the passive staleness-review path.
+# The staleness age/category/removal-count guardrails protect automatic
+# middleware cleanup; tool-mode operators opt into model-directed updates
+# and deletes. The docs call out this difference for configuration review.
 
 
 @tool("memory_update", parse_docstring=True)
