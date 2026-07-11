@@ -392,6 +392,33 @@ class TestModeGating:
         tool_names = [t.name for t in extra_tools]
         assert "memory_search" not in tool_names
 
+    def test_should_use_memory_tools_requires_tool_mode_and_enabled(self):
+        """Tool-mode helper should require both mode=tool and enabled=True."""
+        from deerflow.config.memory_config import MemoryConfig, should_use_memory_tools
+
+        assert should_use_memory_tools(MemoryConfig(enabled=True, mode="tool")) is True
+        assert should_use_memory_tools(MemoryConfig(enabled=False, mode="tool")) is False
+        assert should_use_memory_tools(MemoryConfig(enabled=True, mode="middleware")) is False
+
+    def test_tool_mode_disabled_logs_warning_and_uses_middleware(self, monkeypatch, caplog):
+        """mode=tool with enabled=False should be visible and still disable tools."""
+        from deerflow.agents.factory import _assemble_from_features
+        from deerflow.agents.features import RuntimeFeatures
+        from deerflow.agents.middlewares.memory_middleware import MemoryMiddleware
+        from deerflow.config.memory_config import MemoryConfig
+
+        disabled_tool_config = MemoryConfig(enabled=False, mode="tool")
+        monkeypatch.setattr(
+            "deerflow.config.memory_config.get_memory_config",
+            lambda: disabled_tool_config,
+        )
+
+        chain, extra_tools = _assemble_from_features(RuntimeFeatures(memory=True), name="test-agent")
+
+        assert MemoryMiddleware in [type(m) for m in chain]
+        assert "memory_add" not in [t.name for t in extra_tools]
+        assert "memory.mode is 'tool' but memory.enabled is false" in caplog.text
+
     def test_lead_agent_deduplicates_memory_tools_after_appending(self, monkeypatch):
         """Configured tools should not duplicate tool-mode memory tools."""
         from deerflow.agents.lead_agent import agent as lead_agent_module

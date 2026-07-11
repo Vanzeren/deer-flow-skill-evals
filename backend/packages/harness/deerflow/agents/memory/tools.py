@@ -66,7 +66,7 @@ def memory_search_tool(
 
     Returns:
         JSON string with "results" (list of fact objects) and "count".
-        Each fact has id, content, category, confidence, createdAt.
+        Each fact has id, content, category, confidence, createdAt, and source.
     """
     agent_name, user_id = _resolve_scope(runtime)
     try:
@@ -114,6 +114,9 @@ def memory_add_tool(
         normalized_content = content.strip()
         existing_key = _memory_content_key(normalized_content)
         existing_facts = get_memory_data(agent_name, user_id=user_id).get("facts", [])
+        # Tool calls normally run one-at-a-time per user turn. If tool-mode
+        # writing broadens to multiple concurrent calls for the same user,
+        # move duplicate rejection into the storage/update critical section.
         if any(_memory_content_key(str(fact.get("content", ""))) == existing_key for fact in existing_facts):
             return json.dumps({"error": "Duplicate fact"})
 

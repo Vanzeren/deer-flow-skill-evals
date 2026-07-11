@@ -172,6 +172,11 @@ class MemoryConfig(BaseModel):
     )
 
 
+def should_use_memory_tools(config: MemoryConfig) -> bool:
+    """Return True when memory should use model-directed tools."""
+    return config.enabled and config.mode == "tool"
+
+
 # Global configuration instance
 _memory_config: MemoryConfig = MemoryConfig()
 

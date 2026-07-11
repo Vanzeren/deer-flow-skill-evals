@@ -41,6 +41,7 @@ from deerflow.agents.middlewares.view_image_middleware import ViewImageMiddlewar
 from deerflow.agents.thread_state import ThreadState
 from deerflow.config.agents_config import load_agent_config, validate_agent_name
 from deerflow.config.app_config import AppConfig, get_app_config
+from deerflow.config.memory_config import should_use_memory_tools
 from deerflow.models import create_chat_model
 from deerflow.skills.tool_policy import SKILL_LOADING_TOOL_NAMES, filter_tools_by_skill_allowed_tools
 from deerflow.skills.types import Skill
@@ -309,8 +310,12 @@ def build_middlewares(
     # Add TitleMiddleware
     middlewares.append(TitleMiddleware(app_config=resolved_app_config))
 
-    # Add MemoryMiddleware (after TitleMiddleware) — skipped in tool mode
-    if not (resolved_app_config.memory.mode == "tool" and resolved_app_config.memory.enabled):
+    # Add MemoryMiddleware (after TitleMiddleware) — skipped in enabled tool mode
+    if should_use_memory_tools(resolved_app_config.memory):
+        pass
+    else:
+        if resolved_app_config.memory.mode == "tool" and not resolved_app_config.memory.enabled:
+            logger.warning("memory.mode is 'tool' but memory.enabled is false; memory tools will not be registered.")
         middlewares.append(MemoryMiddleware(agent_name=agent_name, memory_config=resolved_app_config.memory))
 
     # Add ViewImageMiddleware only if the current model supports vision.
@@ -522,7 +527,7 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
         )
         if skill_setup.describe_skill_tool:
             final_tools.append(skill_setup.describe_skill_tool)
-        if resolved_app_config.memory.mode == "tool" and resolved_app_config.memory.enabled:
+        if should_use_memory_tools(resolved_app_config.memory):
             _append_memory_tools_without_name_conflicts(final_tools)
         return create_agent(
             model=create_chat_model(name=model_name, thinking_enabled=thinking_enabled, app_config=resolved_app_config, attach_tracing=False),
@@ -587,7 +592,7 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
     mcp_routing_hints_section = get_mcp_routing_hints_prompt_section(filtered, deferred_names=setup.deferred_names)
     if skill_setup.describe_skill_tool:
         final_tools.append(skill_setup.describe_skill_tool)
-    if resolved_app_config.memory.mode == "tool" and resolved_app_config.memory.enabled:
+    if should_use_memory_tools(resolved_app_config.memory):
         _append_memory_tools_without_name_conflicts(final_tools)
     return create_agent(
         model=create_chat_model(name=model_name, thinking_enabled=thinking_enabled, reasoning_effort=reasoning_effort, app_config=resolved_app_config, attach_tracing=False),

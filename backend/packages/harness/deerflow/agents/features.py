@@ -29,6 +29,8 @@ class RuntimeFeatures:
 
     sandbox: bool | AgentMiddleware = True
     memory: bool | AgentMiddleware = False
+    # Explicit memory config for direct create_deerflow_agent(features=...) callers.
+    # The lead-agent AppConfig path passes resolved_app_config.memory directly.
     memory_config: MemoryConfig | None = None
     summarization: Literal[False] | AgentMiddleware = False
     subagent: bool | AgentMiddleware = False
