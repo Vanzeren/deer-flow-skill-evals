@@ -1089,56 +1089,81 @@ async def get_thread_history(thread_id: str, body: ThreadHistoryRequest, request
                 if messages:
                     serialized_msgs = serialize_channel_values_for_api({"messages": messages}).get("messages", [])
                     try:
-                        from app.gateway.deps import get_run_event_store, get_run_manager
-                        from app.gateway.routers.thread_runs import compute_run_durations
+                        # Human messages carry run_id in additional_kwargs; use
+                        # them as turn boundaries for all following AI/tool
+                        # messages. New checkpoints persist turn_duration on AI
+                        # messages directly; legacy metadata maps remain readable.
+                        ckpt_run_durations = metadata.get("run_durations")
+                        if not isinstance(ckpt_run_durations, dict):
+                            ckpt_run_durations = {}
 
-                        run_mgr = get_run_manager(request)
-                        event_store = get_run_event_store(request)
+                        current_turn_run_id = None
+                        for msg in serialized_msgs:
+                            if msg.get("type") == "human":
+                                additional_kwargs = msg.get("additional_kwargs")
+                                if isinstance(additional_kwargs, dict):
+                                    run_id = additional_kwargs.get("run_id")
+                                    if isinstance(run_id, str) and run_id:
+                                        current_turn_run_id = run_id
+                                continue
 
-                        runs = await run_mgr.list_by_thread(thread_id)
+                            if msg.get("type") not in {"ai", "tool"} or not current_turn_run_id:
+                                continue
 
-                        # FIXME: Fetching limit=1000 silently drops durations for messages older than the cap on long threads.
-                        # We do this full fetch because raw LangGraph messages lack a native run_id link.
+                            msg.setdefault("run_id", current_turn_run_id)
+                            if msg.get("type") == "ai" and current_turn_run_id in ckpt_run_durations:
+                                additional_kwargs = msg.get("additional_kwargs")
+                                if not isinstance(additional_kwargs, dict):
+                                    additional_kwargs = {}
+                                    msg["additional_kwargs"] = additional_kwargs
+                                additional_kwargs.setdefault("turn_duration", ckpt_run_durations[current_turn_run_id])
 
-                        events = await event_store.list_messages(thread_id, limit=1000)
+                        # Fallback: for messages still missing turn_duration
+                        # (old threads before _persist_run_duration existed),
+                        # correlate via event_store + run_mgr for exact per-message
+                        # mapping. The 1000-event window is acceptable here because
+                        # this path only runs for legacy data.
+                        if any(msg.get("type") == "ai" and not (isinstance(msg.get("additional_kwargs"), dict) and "turn_duration" in msg["additional_kwargs"]) for msg in serialized_msgs):
+                            from app.gateway.deps import get_run_event_store, get_run_manager
+                            from app.gateway.routers.thread_runs import compute_run_durations
 
-                        if runs and serialized_msgs:
-                            # 1. Map each run_id to its actual duration
-                            run_durations = compute_run_durations(runs)
+                            run_mgr = get_run_manager(request)
+                            event_store = get_run_event_store(request)
 
-                            # 2. Map every message id directly to its parent run_id
-                            msg_to_run = {}
-                            for e in events:
-                                content = e.get("content", {})
-                                if isinstance(content, dict) and content.get("type") == "ai" and "id" in content:
-                                    msg_to_run[content["id"]] = e["run_id"]
+                            runs = await run_mgr.list_by_thread(thread_id)
+                            events = await event_store.list_messages(thread_id, limit=1000)
 
-                            # 3. Attach the owning run_id to replayed messages.
-                            # Raw LangGraph checkpoint messages do not carry a
-                            # native run link. Message events are exact when
-                            # present, but historical/runtime stores can miss
-                            # them; the user-input message already records the
-                            # run id for the whole turn, so use it as the
-                            # fallback for following AI/tool messages.
-                            current_turn_run_id = None
-                            for msg in serialized_msgs:
-                                if msg.get("type") == "human":
-                                    additional_kwargs = msg.get("additional_kwargs")
-                                    if isinstance(additional_kwargs, dict):
-                                        run_id = additional_kwargs.get("run_id")
-                                        if isinstance(run_id, str) and run_id:
-                                            current_turn_run_id = run_id
-                                    continue
+                            if runs:
+                                run_durations = compute_run_durations(runs)
 
-                                if msg.get("type") in {"ai", "tool"}:
-                                    msg_id = msg.get("id")
-                                    run_id = msg_to_run.get(msg_id) or current_turn_run_id
-                                    if run_id:
-                                        msg["run_id"] = run_id
-                                        if msg.get("type") == "ai" and run_id in run_durations:
-                                            if "additional_kwargs" not in msg:
-                                                msg["additional_kwargs"] = {}
-                                            msg["additional_kwargs"]["turn_duration"] = run_durations[run_id]
+                                msg_to_run = {}
+                                for e in events:
+                                    content = e.get("content", {})
+                                    if isinstance(content, dict) and content.get("type") == "ai" and "id" in content:
+                                        msg_to_run[content["id"]] = e["run_id"]
+
+                                current_turn_run_id = None
+                                for msg in serialized_msgs:
+                                    if msg.get("type") == "human":
+                                        additional_kwargs = msg.get("additional_kwargs")
+                                        if isinstance(additional_kwargs, dict):
+                                            run_id = additional_kwargs.get("run_id")
+                                            if isinstance(run_id, str) and run_id:
+                                                current_turn_run_id = run_id
+                                        continue
+
+                                    if msg.get("type") in {"ai", "tool"}:
+                                        msg_id = msg.get("id")
+                                        run_id = msg_to_run.get(msg_id) or current_turn_run_id
+                                        if run_id:
+                                            if "run_id" not in msg:
+                                                msg["run_id"] = run_id
+                                            if msg.get("type") == "ai" and run_id in run_durations:
+                                                ad_kw = msg.get("additional_kwargs", {})
+                                                if isinstance(ad_kw, dict) and "turn_duration" not in ad_kw:
+                                                    if "additional_kwargs" not in msg:
+                                                        msg["additional_kwargs"] = {}
+                                                    msg["additional_kwargs"]["turn_duration"] = run_durations[run_id]
 
                     except Exception:
                         logger.warning("Failed to inject turn_duration for thread %s", thread_id, exc_info=True)
@@ -1152,7 +1177,7 @@ async def get_thread_history(thread_id: str, body: ThreadHistoryRequest, request
             next_tasks = [t.name for t in tasks_raw if hasattr(t, "name")]
 
             # Strip LangGraph internal keys from metadata
-            user_meta = {k: v for k, v in metadata.items() if k not in ("created_at", "updated_at", "step", "source", "writes", "parents")}
+            user_meta = {k: v for k, v in metadata.items() if k not in ("created_at", "updated_at", "step", "source", "writes", "parents", "run_durations")}
             # Keep step for ordering context
             if "step" in metadata:
                 user_meta["step"] = metadata["step"]

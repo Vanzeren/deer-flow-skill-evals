@@ -7,7 +7,7 @@ import pytest
 from _router_auth_helpers import make_authed_test_app
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.store.memory import InMemoryStore
@@ -566,6 +566,31 @@ def test_get_thread_history_returns_iso_for_legacy_checkpoint_metadata() -> None
     assert entries, "expected at least one history entry"
     for entry in entries:
         assert _ISO_TIMESTAMP_RE.match(entry["created_at"]), entry
+
+
+def test_get_thread_history_associates_tool_messages_from_checkpoint_turn() -> None:
+    app, _store, checkpointer = _build_thread_app()
+    thread_id = "history-tool-run"
+    messages = [
+        HumanMessage(id="human-1", content="Use a tool", additional_kwargs={"run_id": "run-1"}),
+        AIMessage(
+            id="ai-1",
+            content="Calling tool",
+            additional_kwargs={"turn_duration": 4},
+            tool_calls=[{"name": "lookup", "args": {}, "id": "call-1"}],
+        ),
+        ToolMessage(id="tool-1", content="result", tool_call_id="call-1"),
+        AIMessage(id="ai-2", content="Done", additional_kwargs={"turn_duration": 4}),
+    ]
+
+    asyncio.run(_write_checkpoint(checkpointer, thread_id, "checkpoint-tool-run", messages, step=1))
+
+    with TestClient(app) as client:
+        response = client.post(f"/api/threads/{thread_id}/history", json={"limit": 10})
+
+    assert response.status_code == 200, response.text
+    history_messages = response.json()[0]["values"]["messages"]
+    assert [message.get("run_id") for message in history_messages[1:]] == ["run-1", "run-1", "run-1"]
 
 
 # ── branch threads from completed assistant turns ─────────────────────────────
