@@ -19,6 +19,7 @@ on:
       - "backend/tests/replay_provider.py"
       - "backend/tests/_replay_fixture.py"
       - "backend/tests/seed_runs_router.py"
+      - "backend/tests/test_evaluation_replay.py"
       - "backend/tests/test_replay_golden.py"
       - "backend/scripts/run_replay_gateway.py"
       - ".github/workflows/replay-e2e.yml"
@@ -32,6 +33,7 @@ on:
       - "backend/tests/replay_provider.py"
       - "backend/tests/_replay_fixture.py"
       - "backend/tests/seed_runs_router.py"
+      - "backend/tests/test_evaluation_replay.py"
       - "backend/tests/test_replay_golden.py"
       - "backend/scripts/run_replay_gateway.py"
       - ".github/workflows/replay-e2e.yml"
@@ -62,7 +64,7 @@ jobs:
         run: uv sync --group dev
       - name: Replay golden (backend SSE contract)
         working-directory: backend
-        run: PYTHONPATH=. uv run pytest tests/test_replay_golden.py -v
+        run: PYTHONPATH=. uv run pytest tests/test_replay_golden.py tests/test_evaluation_replay.py -v
 
   fullstack-replay-render:
     name: Layer 2 — full-stack render (no API key)

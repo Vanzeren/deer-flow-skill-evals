@@ -17,6 +17,8 @@ so contract drift turns the build red instead.
   through the real FastAPI gateway with `ReplayChatModel` and asserts the streamed
   SSE event sequence equals a committed golden. Fast, no browser. Guards protocol
   *shape*.
+
+  Phase 1 also exposes the same replay logic through a small reusable kernel under `backend/packages/harness/deerflow/evals/`; `tests/test_evaluation_replay.py` is the structured replay-eval entrypoint, while `tests/test_replay_golden.py` remains the narrow compatibility regression over the same runner/checks.
 - **Layer 2 — full-stack render** (`frontend/tests/e2e-real-backend/`): real
   Next.js + real gateway (replay model) + Chromium; asserts the replayed
   auto-title and a follow-up suggestion render in the browser. Guards semantic

@@ -50,6 +50,7 @@ deer-flow/
 │   │           ├── config/            # Configuration system (app, model, sandbox, tool, etc.)
 │   │           ├── community/         # Community tools (search/fetch/scrape, image search, AIO sandbox)
 │   │           ├── reflection/        # Dynamic module loading (resolve_variable, resolve_class)
+│   │           ├── evals/             # Replay eval kernel (phase 1: models, checks, runner, report)
 │   │           ├── utils/             # Utilities (network, readability)
 │   │           └── client.py          # Embedded Python client (DeerFlowClient)
 │   ├── app/                   # Application layer (import: app.*)

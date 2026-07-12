@@ -250,6 +250,7 @@ backend/
 │       ├── uploads/            # Uploads manager
 │       ├── tui/                # Terminal UI (`deerflow` console script)
 │       ├── community/          # Community tools & providers
+│       ├── evals/               # Replay eval kernel (phase 1: deterministic replay regression)
 │       ├── reflection/         # Dynamic module loading
 │       └── utils/              # Utilities
 ├── app/                        # FastAPI Gateway + IM channels (import: app.*)
