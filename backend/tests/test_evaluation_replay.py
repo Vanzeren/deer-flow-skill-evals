@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -187,6 +188,47 @@ def test_run_replay_case_builds_structured_result(tmp_path, monkeypatch):
     assert "keys" in result.trajectory.events[0]
     assert "data_keys" not in result.trajectory.events[0]
     assert set(result.trajectory.events[0]) == set(_trajectory().events[0])
+
+
+@pytest.mark.no_auto_user
+def test_run_replay_case_resets_misses_between_calls(tmp_path, monkeypatch):
+    misses: list[str] = []
+    drive_count = 0
+
+    def drive_with_first_call_miss(_app, *, prompt, context):
+        nonlocal drive_count
+        drive_count += 1
+        if drive_count == 1:
+            misses.append("first-call-miss")
+        return [
+            {"event": "metadata", "keys": ["run_id"]},
+            {"event": "end", "keys": ["status"]},
+        ]
+
+    runtime = replace(
+        _replay_runtime(),
+        create_app=object,
+        drive_gateway=drive_with_first_call_miss,
+        reset_replay_misses=misses.clear,
+        replay_misses=lambda: list(misses),
+    )
+    case = ReplayEvalCase(
+        id="write-read-file",
+        scenario="write_read_file",
+        mode="ultra",
+        checks=(NoReplayMissesCheck(),),
+    )
+
+    first_tmp_path = tmp_path / "first"
+    second_tmp_path = tmp_path / "second"
+    first_tmp_path.mkdir()
+    second_tmp_path.mkdir()
+
+    first = run_replay_case(case, tmp_path=first_tmp_path, monkeypatch=monkeypatch, fixture_dir=FIXTURE_DIR, runtime=runtime)
+    second = run_replay_case(case, tmp_path=second_tmp_path, monkeypatch=monkeypatch, fixture_dir=FIXTURE_DIR, runtime=runtime)
+
+    assert first.trajectory.replay_misses == ["first-call-miss"]
+    assert second.trajectory.replay_misses == []
 
 
 @pytest.mark.no_auto_user

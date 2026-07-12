@@ -80,6 +80,7 @@ def run_replay_case(
     cfg = app_config_module.get_app_config()
     cfg.database.sqlite_dir = str(home / "db")
 
+    runtime.reset_replay_misses()
     events = runtime.drive_gateway(runtime.create_app(), prompt=fixture["prompt"], context=fixture["context"])
     trajectory = Trajectory(
         case_id=case.id,
@@ -119,7 +120,6 @@ def run_replay_suite(
 ) -> ReplayEvalSuiteResult:
     case_results = []
     for case in cases:
-        runtime.reset_replay_misses()
         case_tmp = tmp_path_factory.mktemp(f"replay-{case.id}")
         case_results.append(run_replay_case(case, tmp_path=case_tmp, monkeypatch=monkeypatch, fixture_dir=fixture_dir, runtime=runtime))
     passed_count = sum(1 for result in case_results if result.passed)
