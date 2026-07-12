@@ -20,7 +20,12 @@ import copy
 import inspect
 import logging
 import os
+import threading
+import weakref
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from functools import lru_cache
 from typing import Any, Literal, cast
 
@@ -61,6 +66,28 @@ from .naming import resolve_root_run_name
 from .schemas import RunStatus
 
 logger = logging.getLogger(__name__)
+
+_checkpoint_locks_guard = threading.Lock()
+_checkpoint_locks_by_loop: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, asyncio.Lock]] = weakref.WeakKeyDictionary()
+
+
+@asynccontextmanager
+async def _checkpoint_thread_lock(thread_id: str) -> AsyncIterator[None]:
+    """Serialize checkpoint mutations for one thread without blocking goal commands."""
+    loop = asyncio.get_running_loop()
+    with _checkpoint_locks_guard:
+        locks = _checkpoint_locks_by_loop.get(loop)
+        if locks is None:
+            locks = {}
+            _checkpoint_locks_by_loop[loop] = locks
+        lock = locks.get(thread_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[thread_id] = lock
+
+    async with lock:
+        yield
+
 
 # Valid stream_mode values for LangGraph's graph.astream()
 _VALID_LG_MODES = {"values", "updates", "checkpoints", "tasks", "debug", "messages", "custom"}
@@ -448,7 +475,7 @@ async def run_agent(
 
         async def _stream_once(input_payload: Any, stream_config: RunnableConfig) -> None:
             nonlocal llm_error_fallback_message
-            async with goal_thread_lock(thread_id):
+            async with _checkpoint_thread_lock(thread_id):
                 if len(lg_modes) == 1 and not stream_subgraphs:
                     # Single mode, no subgraphs: astream yields raw chunks
                     single_mode = lg_modes[0]
@@ -620,18 +647,18 @@ async def run_agent(
         # don't need to correlate runs and events.
         if checkpointer is not None and record.status == RunStatus.success:
             try:
-                from datetime import datetime
-
                 created = datetime.fromisoformat(record.created_at.replace("Z", "+00:00"))
                 updated = datetime.fromisoformat(record.updated_at.replace("Z", "+00:00"))
-                duration = int((updated - created).total_seconds())
-                if duration > 0:
-                    await _persist_run_duration(
-                        checkpointer=checkpointer,
-                        thread_id=thread_id,
-                        run_id=run_id,
-                        duration_seconds=duration,
-                    )
+                # Match legacy history semantics: turn_duration is the whole
+                # RunRecord lifetime in integer seconds, including admission
+                # delay. Persist zero for sub-second successful turns.
+                duration = max(0, int((updated - created).total_seconds()))
+                await _persist_run_duration(
+                    checkpointer=checkpointer,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    duration_seconds=duration,
+                )
             except Exception:
                 logger.debug("Failed to persist run duration for thread %s run %s (non-fatal)", thread_id, run_id)
 
@@ -1159,18 +1186,18 @@ async def _persist_run_duration(
 ) -> None:
     """Persist *duration_seconds* on the AI messages owned by *run_id*."""
     ckpt_config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
-    async with goal_thread_lock(thread_id):
+    async with _checkpoint_thread_lock(thread_id):
         ckpt_tuple = await _call_checkpointer_method(checkpointer, "aget_tuple", "get_tuple", ckpt_config)
         if ckpt_tuple is None:
             return
 
-        checkpoint = copy.deepcopy(getattr(ckpt_tuple, "checkpoint", {}) or {})
+        checkpoint = dict(getattr(ckpt_tuple, "checkpoint", {}) or {})
         channel_values = dict(checkpoint.get("channel_values", {}) or {})
-        messages = copy.deepcopy(channel_values.get("messages", []) or [])
+        messages = list(channel_values.get("messages", []) or [])
         current_turn_run_id = None
         changed = False
 
-        for message in messages:
+        for index, message in enumerate(messages):
             message_type = _message_type(message)
             if isinstance(message, dict):
                 additional_kwargs = message.get("additional_kwargs")
@@ -1182,16 +1209,20 @@ async def _persist_run_duration(
                 continue
             if message_type != "ai" or current_turn_run_id != run_id:
                 continue
+            if isinstance(additional_kwargs, dict) and additional_kwargs.get("turn_duration") == duration_seconds:
+                continue
 
-            if not isinstance(additional_kwargs, dict):
-                additional_kwargs = {}
-                if isinstance(message, dict):
-                    message["additional_kwargs"] = additional_kwargs
-                else:
-                    message.additional_kwargs = additional_kwargs
-            if additional_kwargs.get("turn_duration") != duration_seconds:
-                additional_kwargs["turn_duration"] = duration_seconds
-                changed = True
+            if isinstance(message, dict):
+                updated_message = dict(message)
+                updated_kwargs = dict(additional_kwargs) if isinstance(additional_kwargs, dict) else {}
+                updated_message["additional_kwargs"] = updated_kwargs
+            else:
+                updated_message = copy.copy(message)
+                updated_kwargs = dict(additional_kwargs) if isinstance(additional_kwargs, dict) else {}
+                updated_message.additional_kwargs = updated_kwargs
+            updated_kwargs["turn_duration"] = duration_seconds
+            messages[index] = updated_message
+            changed = True
 
         if not changed:
             return

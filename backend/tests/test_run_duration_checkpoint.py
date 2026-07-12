@@ -8,6 +8,8 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.base import empty_checkpoint, uuid6
 from langgraph.checkpoint.memory import InMemorySaver
 
+import deerflow.runtime.runs.worker as worker
+from deerflow.runtime.goal import goal_thread_lock
 from deerflow.runtime.runs.manager import RunManager
 from deerflow.runtime.runs.worker import RunContext, _persist_run_duration, run_agent
 
@@ -225,3 +227,80 @@ async def test_agent_stream_serializes_with_duration_checkpoint_write() -> None:
     await duration_task
 
     assert finished_during_stream is False
+
+
+@pytest.mark.anyio
+async def test_agent_stream_allows_graph_goal_state_access() -> None:
+    """A graph node may acquire the goal lock while a run is streaming."""
+    checkpointer = InMemorySaver()
+    run_manager = RunManager()
+    record = await run_manager.create("duration-stream-goal-lock")
+    bridge = SimpleNamespace(
+        publish=AsyncMock(),
+        publish_end=AsyncMock(),
+        cleanup=AsyncMock(),
+    )
+
+    class DummyAgent:
+        async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
+            async with goal_thread_lock(record.thread_id):
+                yield {"messages": []}
+
+    def factory(*, config):
+        return DummyAgent()
+
+    await asyncio.wait_for(
+        run_agent(
+            bridge,
+            run_manager,
+            record,
+            ctx=RunContext(checkpointer=checkpointer),
+            agent_factory=factory,
+            graph_input={},
+            config={},
+        ),
+        timeout=0.05,
+    )
+    assert record.status.value == "success"
+
+
+@pytest.mark.anyio
+async def test_successful_subsecond_run_persists_zero_duration(monkeypatch: pytest.MonkeyPatch) -> None:
+    checkpointer = InMemorySaver()
+    run_manager = RunManager()
+    record = await run_manager.create("duration-zero")
+    record.created_at = "2026-01-01T00:00:00+00:00"
+    record.updated_at = record.created_at
+    bridge = SimpleNamespace(
+        publish=AsyncMock(),
+        publish_end=AsyncMock(),
+        cleanup=AsyncMock(),
+    )
+    persist_duration = AsyncMock()
+
+    async def set_status(run_id, status, **kwargs):
+        record.status = status
+
+    class DummyAgent:
+        async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
+            yield {"messages": []}
+
+    monkeypatch.setattr(run_manager, "set_status", set_status)
+    monkeypatch.setattr(worker, "_persist_run_duration", persist_duration)
+
+    await run_agent(
+        bridge,
+        run_manager,
+        record,
+        ctx=RunContext(checkpointer=checkpointer),
+        agent_factory=lambda *, config: DummyAgent(),
+        graph_input={},
+        config={},
+    )
+
+    persist_duration.assert_awaited_once_with(
+        checkpointer=checkpointer,
+        thread_id=record.thread_id,
+        run_id=record.run_id,
+        duration_seconds=0,
+    )

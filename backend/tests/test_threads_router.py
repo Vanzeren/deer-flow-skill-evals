@@ -592,6 +592,15 @@ def test_get_thread_history_associates_tool_messages_from_checkpoint_turn() -> N
     history_messages = response.json()[0]["values"]["messages"]
     assert [message.get("run_id") for message in history_messages[1:]] == ["run-1", "run-1", "run-1"]
 
+    assert [message["additional_kwargs"]["turn_duration"] for message in history_messages if message["type"] == "ai"] == [4, 4]
+
+
+def test_ai_message_lacks_duration_only_for_unannotated_ai_messages() -> None:
+    assert threads._ai_message_lacks_duration({"type": "ai"})
+    assert threads._ai_message_lacks_duration({"type": "ai", "additional_kwargs": []})
+    assert not threads._ai_message_lacks_duration({"type": "tool"})
+    assert not threads._ai_message_lacks_duration({"type": "ai", "additional_kwargs": {"turn_duration": 0}})
+
 
 # ── branch threads from completed assistant turns ─────────────────────────────
 

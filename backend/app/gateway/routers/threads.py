@@ -1043,6 +1043,11 @@ async def update_thread_state(thread_id: str, body: ThreadStateUpdateRequest, re
     )
 
 
+def _ai_message_lacks_duration(message: dict[str, Any]) -> bool:
+    additional_kwargs = message.get("additional_kwargs")
+    return message.get("type") == "ai" and (not isinstance(additional_kwargs, dict) or "turn_duration" not in additional_kwargs)
+
+
 @router.post("/{thread_id}/history", response_model=list[HistoryEntry])
 @require_permission("threads", "read", owner_check=True)
 async def get_thread_history(thread_id: str, body: ThreadHistoryRequest, request: Request) -> list[HistoryEntry]:
@@ -1091,12 +1096,8 @@ async def get_thread_history(thread_id: str, body: ThreadHistoryRequest, request
                     try:
                         # Human messages carry run_id in additional_kwargs; use
                         # them as turn boundaries for all following AI/tool
-                        # messages. New checkpoints persist turn_duration on AI
-                        # messages directly; legacy metadata maps remain readable.
-                        ckpt_run_durations = metadata.get("run_durations")
-                        if not isinstance(ckpt_run_durations, dict):
-                            ckpt_run_durations = {}
-
+                        # messages. New checkpoints persist turn_duration directly
+                        # on AI messages.
                         current_turn_run_id = None
                         for msg in serialized_msgs:
                             if msg.get("type") == "human":
@@ -1111,19 +1112,13 @@ async def get_thread_history(thread_id: str, body: ThreadHistoryRequest, request
                                 continue
 
                             msg.setdefault("run_id", current_turn_run_id)
-                            if msg.get("type") == "ai" and current_turn_run_id in ckpt_run_durations:
-                                additional_kwargs = msg.get("additional_kwargs")
-                                if not isinstance(additional_kwargs, dict):
-                                    additional_kwargs = {}
-                                    msg["additional_kwargs"] = additional_kwargs
-                                additional_kwargs.setdefault("turn_duration", ckpt_run_durations[current_turn_run_id])
 
                         # Fallback: for messages still missing turn_duration
                         # (old threads before _persist_run_duration existed),
                         # correlate via event_store + run_mgr for exact per-message
                         # mapping. The 1000-event window is acceptable here because
                         # this path only runs for legacy data.
-                        if any(msg.get("type") == "ai" and not (isinstance(msg.get("additional_kwargs"), dict) and "turn_duration" in msg["additional_kwargs"]) for msg in serialized_msgs):
+                        if any(_ai_message_lacks_duration(msg) for msg in serialized_msgs):
                             from app.gateway.deps import get_run_event_store, get_run_manager
                             from app.gateway.routers.thread_runs import compute_run_durations
 
@@ -1177,7 +1172,7 @@ async def get_thread_history(thread_id: str, body: ThreadHistoryRequest, request
             next_tasks = [t.name for t in tasks_raw if hasattr(t, "name")]
 
             # Strip LangGraph internal keys from metadata
-            user_meta = {k: v for k, v in metadata.items() if k not in ("created_at", "updated_at", "step", "source", "writes", "parents", "run_durations")}
+            user_meta = {k: v for k, v in metadata.items() if k not in ("created_at", "updated_at", "step", "source", "writes", "parents")}
             # Keep step for ordering context
             if "step" in metadata:
                 user_meta["step"] = metadata["step"]
