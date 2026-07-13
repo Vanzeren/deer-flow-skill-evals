@@ -73,7 +73,8 @@ RoutingCase JSONL
 Track A: routing benchmark       Track B: quality evaluation
 20 cases x 3 epochs              4 tagged cases x 1 epoch
         |                              |
-DeerFlowRoutingProbe             DeerFlow full runner
+DeerFlowAgentRunner               DeerFlowAgentRunner
+(mode="routing_probe")            (mode="full")
         |                              |
 real DeerFlowClient stream       complete observable trace
         |                              + final answer + artifacts
@@ -93,6 +94,8 @@ deterministic routing scorer     structured QualityJudgment
 ### 5.1 Track A: routing benchmark
 
 Track A runs all 20 cases for three epochs. It exposes only the two candidate skills to the real DeerFlow runtime. It consumes real stream events and stops before long task execution once the current skill-loading tool-call batch has settled.
+
+`routing_probe` is a bounded mode of the real `DeerFlowAgentRunner`, not a mock runner or a standalone classification prompt. Both tracks construct the real `DeerFlowClient`, invoke the configured agent model, use the production skill middleware and tool definitions, and retain real stream evidence. The only difference is termination: probe mode closes the stream after the routing tool-call batch settles, while full mode runs through the final answer and artifacts. A `none` probe has no skill-load event, so it waits for the agent's normal short response to complete.
 
 The track measures:
 
