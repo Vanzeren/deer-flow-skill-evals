@@ -25,6 +25,33 @@ class _YieldingSaver(InMemorySaver):
         return await super().aput(config, checkpoint, metadata, new_versions)
 
 
+class _AdvancingSaver(InMemorySaver):
+    """Inject a title checkpoint between duration read and write."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._reads = 0
+
+    async def aget_tuple(self, config):
+        self._reads += 1
+        checkpoint_tuple = await super().aget_tuple(config)
+        if self._reads != 2 or checkpoint_tuple is None:
+            return checkpoint_tuple
+
+        checkpoint = copy.deepcopy(checkpoint_tuple.checkpoint)
+        checkpoint["id"] = str(uuid6())
+        channel_values = dict(checkpoint["channel_values"])
+        channel_values["title"] = "Concurrent title"
+        checkpoint["channel_values"] = channel_values
+        channel_versions = dict(checkpoint["channel_versions"])
+        channel_versions["title"] = 1
+        checkpoint["channel_versions"] = channel_versions
+        metadata = dict(checkpoint_tuple.metadata)
+        metadata.update({"step": metadata["step"] + 1, "source": "update", "writes": {"title": "Concurrent title"}})
+        await super().aput(checkpoint_tuple.config, checkpoint, metadata, {"title": 1})
+        return await super().aget_tuple(config)
+
+
 async def _put_checkpoint(
     checkpointer: InMemorySaver,
     *,
@@ -33,18 +60,16 @@ async def _put_checkpoint(
     messages: list[object],
     step: int,
     parent_config: dict | None = None,
+    inherited_metadata: dict | None = None,
 ) -> dict:
     checkpoint = empty_checkpoint()
     checkpoint["id"] = checkpoint_id
     checkpoint["channel_values"] = {"messages": messages}
     checkpoint["channel_versions"] = {"messages": step}
     config = parent_config or {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
-    return await checkpointer.aput(
-        config,
-        checkpoint,
-        {"step": step, "source": "loop", "writes": {"test": {"messages": messages}}, "parents": {}},
-        {"messages": step},
-    )
+    metadata = dict(inherited_metadata or {})
+    metadata.update({"step": step, "source": "loop", "writes": {"test": {"messages": messages}}, "parents": {}})
+    return await checkpointer.aput(config, checkpoint, metadata, {"messages": step})
 
 
 @pytest.mark.anyio
@@ -74,7 +99,7 @@ async def test_run_duration_survives_a_later_checkpoint() -> None:
     duration_checkpoint = await checkpointer.aget_tuple(config)
     assert duration_checkpoint is not None
     persisted_messages = copy.deepcopy(duration_checkpoint.checkpoint["channel_values"]["messages"])
-    assert persisted_messages[1].additional_kwargs["turn_duration"] == 7
+    assert duration_checkpoint.metadata["run_durations"] == {"run-1": 7}
 
     await _put_checkpoint(
         checkpointer,
@@ -83,11 +108,70 @@ async def test_run_duration_survives_a_later_checkpoint() -> None:
         messages=persisted_messages,
         step=3,
         parent_config=duration_checkpoint.config,
+        inherited_metadata=duration_checkpoint.metadata,
     )
 
     latest = await checkpointer.aget_tuple(config)
     assert latest is not None
-    assert latest.checkpoint["channel_values"]["messages"][1].additional_kwargs["turn_duration"] == 7
+    assert latest.metadata["run_durations"] == {"run-1": 7}
+
+
+@pytest.mark.anyio
+async def test_run_duration_checkpoint_stores_duration_in_metadata_without_rewriting_messages() -> None:
+    checkpointer = InMemorySaver()
+    thread_id = "duration-metadata"
+    messages = [
+        HumanMessage(id="human-1", content="Question", additional_kwargs={"run_id": "run-1"}),
+        AIMessage(id="ai-1", content="Answer"),
+    ]
+    await _put_checkpoint(
+        checkpointer,
+        thread_id=thread_id,
+        checkpoint_id="00000000-0000-6000-8000-000000000001",
+        messages=messages,
+        step=1,
+    )
+
+    await _persist_run_duration(
+        checkpointer=checkpointer,
+        thread_id=thread_id,
+        run_id="run-1",
+        duration_seconds=7,
+    )
+
+    latest = await checkpointer.aget_tuple({"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}})
+    assert latest is not None
+    assert latest.metadata["run_durations"] == {"run-1": 7}
+    assert latest.checkpoint["channel_versions"]["messages"] == 1
+    assert "turn_duration" not in latest.checkpoint["channel_values"]["messages"][1].additional_kwargs
+
+
+@pytest.mark.anyio
+async def test_run_duration_retries_after_intervening_title_checkpoint() -> None:
+    checkpointer = _AdvancingSaver()
+    thread_id = "duration-title-race"
+    await _put_checkpoint(
+        checkpointer,
+        thread_id=thread_id,
+        checkpoint_id="00000000-0000-6000-8000-000000000001",
+        messages=[
+            HumanMessage(id="human-1", content="Question", additional_kwargs={"run_id": "run-1"}),
+            AIMessage(id="ai-1", content="Answer"),
+        ],
+        step=1,
+    )
+
+    await _persist_run_duration(
+        checkpointer=checkpointer,
+        thread_id=thread_id,
+        run_id="run-1",
+        duration_seconds=7,
+    )
+
+    latest = await checkpointer.aget_tuple({"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}})
+    assert latest is not None
+    assert latest.checkpoint["channel_values"]["title"] == "Concurrent title"
+    assert latest.metadata["run_durations"] == {"run-1": 7}
 
 
 @pytest.mark.anyio
@@ -125,9 +209,7 @@ async def test_concurrent_run_duration_updates_preserve_both_turns() -> None:
 
     latest = await checkpointer.aget_tuple({"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}})
     assert latest is not None
-    persisted_messages = latest.checkpoint["channel_values"]["messages"]
-    assert persisted_messages[1].additional_kwargs["turn_duration"] == 3
-    assert persisted_messages[3].additional_kwargs["turn_duration"] == 5
+    assert latest.metadata["run_durations"] == {"run-1": 3, "run-2": 5}
 
 
 @pytest.mark.anyio

@@ -75,21 +75,24 @@ async def _write_checkpoint(
     messages: list[object],
     *,
     step: int,
+    metadata: dict | None = None,
 ) -> dict:
     checkpoint = empty_checkpoint()
     checkpoint["id"] = checkpoint_id
     checkpoint["channel_values"] = {"messages": messages}
     checkpoint["channel_versions"] = {"messages": step}
+    checkpoint_metadata = {
+        "step": step,
+        "source": "loop",
+        "writes": {"test": {"messages": messages}},
+        "parents": {},
+        "created_at": f"2026-07-05T00:00:0{step}+00:00",
+    }
+    checkpoint_metadata.update(metadata or {})
     return await checkpointer.aput(
         {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}},
         checkpoint,
-        {
-            "step": step,
-            "source": "loop",
-            "writes": {"test": {"messages": messages}},
-            "parents": {},
-            "created_at": f"2026-07-05T00:00:0{step}+00:00",
-        },
+        checkpoint_metadata,
         {"messages": step},
     )
 
@@ -576,14 +579,22 @@ def test_get_thread_history_associates_tool_messages_from_checkpoint_turn() -> N
         AIMessage(
             id="ai-1",
             content="Calling tool",
-            additional_kwargs={"turn_duration": 4},
             tool_calls=[{"name": "lookup", "args": {}, "id": "call-1"}],
         ),
         ToolMessage(id="tool-1", content="result", tool_call_id="call-1"),
-        AIMessage(id="ai-2", content="Done", additional_kwargs={"turn_duration": 4}),
+        AIMessage(id="ai-2", content="Done"),
     ]
 
-    asyncio.run(_write_checkpoint(checkpointer, thread_id, "checkpoint-tool-run", messages, step=1))
+    asyncio.run(
+        _write_checkpoint(
+            checkpointer,
+            thread_id,
+            "checkpoint-tool-run",
+            messages,
+            step=1,
+            metadata={"run_durations": {"run-1": 4}},
+        )
+    )
 
     with TestClient(app) as client:
         response = client.post(f"/api/threads/{thread_id}/history", json={"limit": 10})
@@ -593,6 +604,53 @@ def test_get_thread_history_associates_tool_messages_from_checkpoint_turn() -> N
     assert [message.get("run_id") for message in history_messages[1:]] == ["run-1", "run-1", "run-1"]
 
     assert [message["additional_kwargs"]["turn_duration"] for message in history_messages if message["type"] == "ai"] == [4, 4]
+
+
+def test_get_thread_history_backfills_legacy_durations_with_exact_event_run_id() -> None:
+    app, _store, checkpointer = _build_thread_app()
+    thread_id = "legacy-history-run-id"
+    messages = [
+        HumanMessage(id="human-1", content="Question", additional_kwargs={"run_id": "boundary-run"}),
+        AIMessage(id="ai-1", content="Answer"),
+        ToolMessage(id="tool-1", content="result", tool_call_id="call-1"),
+    ]
+    asyncio.run(_write_checkpoint(checkpointer, thread_id, "00000000-0000-6000-8000-000000000001", messages, step=1))
+
+    async def list_by_thread(_: str) -> list[SimpleNamespace]:
+        return [
+            SimpleNamespace(
+                run_id="boundary-run",
+                created_at="2026-07-05T00:00:00+00:00",
+                updated_at="2026-07-05T00:00:03+00:00",
+            ),
+            SimpleNamespace(
+                run_id="exact-run",
+                created_at="2026-07-05T00:00:00+00:00",
+                updated_at="2026-07-05T00:00:07+00:00",
+            ),
+        ]
+
+    async def list_messages(_: str, *, limit: int) -> list[dict]:
+        assert limit == 1000
+        return [{"content": {"type": "ai", "id": "ai-1"}, "run_id": "exact-run"}]
+
+    app.state.run_manager = SimpleNamespace(list_by_thread=list_by_thread)
+    app.state.run_event_store = SimpleNamespace(list_messages=list_messages)
+
+    with TestClient(app) as client:
+        response = client.post(f"/api/threads/{thread_id}/history", json={"limit": 10})
+
+    assert response.status_code == 200, response.text
+    entry = response.json()[0]
+    history_messages = entry["values"]["messages"]
+    assert history_messages[1]["run_id"] == "exact-run"
+    assert history_messages[1]["additional_kwargs"]["turn_duration"] == 7
+    assert history_messages[2]["run_id"] == "boundary-run"
+    assert "run_durations" not in entry["metadata"]
+
+    latest = asyncio.run(checkpointer.aget_tuple({"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}))
+    assert latest is not None
+    assert latest.metadata["run_durations"] == {"boundary-run": 3, "exact-run": 7}
 
 
 def test_ai_message_lacks_duration_only_for_unannotated_ai_messages() -> None:

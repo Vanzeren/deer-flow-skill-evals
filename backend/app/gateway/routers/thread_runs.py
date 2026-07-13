@@ -31,6 +31,13 @@ from deerflow.workspace_changes import get_workspace_changes_response
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/threads", tags=["runs"])
 REGENERATE_HISTORY_SCAN_LIMIT = 200
+REGENERATE_HISTORY_RAW_SCAN_LIMIT = REGENERATE_HISTORY_SCAN_LIMIT * 2
+
+
+def _is_duration_only_checkpoint(checkpoint_tuple: Any) -> bool:
+    metadata = getattr(checkpoint_tuple, "metadata", None)
+    writes = metadata.get("writes") if isinstance(metadata, dict) else None
+    return isinstance(writes, dict) and "runtime_run_duration" in writes
 
 
 def compute_run_durations(runs) -> dict[str, int]:
@@ -318,7 +325,8 @@ async def _find_base_checkpoint_before_human(thread_id: str, human_message_id: s
     checkpointer = get_checkpointer(request)
     base_config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
     try:
-        checkpoints = [item async for item in checkpointer.alist(base_config, limit=REGENERATE_HISTORY_SCAN_LIMIT)]
+        raw_checkpoints = [item async for item in checkpointer.alist(base_config, limit=REGENERATE_HISTORY_RAW_SCAN_LIMIT)]
+        checkpoints = [item for item in raw_checkpoints if not _is_duration_only_checkpoint(item)]
     except Exception as exc:
         logger.exception("Failed to list checkpoints for regenerate thread %s", thread_id)
         raise HTTPException(status_code=500, detail="Failed to inspect checkpoint history") from exc
