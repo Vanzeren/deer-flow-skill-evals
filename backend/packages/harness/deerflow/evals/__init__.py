@@ -1,6 +1,7 @@
 from deerflow.evals.replay_checks import (
     BoundaryEventsCheck,
     NoReplayMissesCheck,
+    ReplayCheck,
     SseShapeGoldenCheck,
     run_checks,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "BoundaryEventsCheck",
     "CheckResult",
     "NoReplayMissesCheck",
+    "ReplayCheck",
     "ReplayEvalCase",
     "ReplayEvalResult",
     "ReplayEvalSuiteResult",

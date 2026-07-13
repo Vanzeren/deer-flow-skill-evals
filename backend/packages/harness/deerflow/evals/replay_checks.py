@@ -3,10 +3,22 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Protocol
 
 from deerflow.evals.replay_models import CheckResult, Trajectory
 
 
+class ReplayCheck(Protocol):
+    name: str
+
+    def run(self, trajectory: Trajectory) -> CheckResult: ...
+
+
+# Replay misses signal a stale fixture: a LangGraph node that the replay recorder
+# expected (by content hash) no longer exists or has been modified in the current
+# graph. This is the primary signal that a graph change requires fixture regeneration
+# — without it, tests stay green while replay silently falls back to live execution
+# on changed nodes, masking the regression.
 class NoReplayMissesCheck:
     name = "no_replay_misses"
 
@@ -96,5 +108,5 @@ class SseShapeGoldenCheck:
         )
 
 
-def run_checks(trajectory: Trajectory, checks: Iterable[object]) -> list[CheckResult]:
+def run_checks(trajectory: Trajectory, checks: Iterable[ReplayCheck]) -> list[CheckResult]:
     return [check.run(trajectory) for check in checks]

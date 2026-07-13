@@ -149,6 +149,22 @@ def test_sse_shape_golden_check_passes_for_exact_match(tmp_path):
     assert result.message == "SSE event-shape matches golden"
 
 
+def test_sse_shape_golden_check_reports_missing_golden_file():
+    trajectory = _trajectory(golden_path="/tmp/nonexistent_file.json")
+    result = SseShapeGoldenCheck().run(trajectory)
+    assert result.passed is False
+    assert "cannot load golden" in result.message
+
+
+def test_sse_shape_golden_check_reports_corrupted_golden_json(tmp_path):
+    golden = tmp_path / "corrupted.events.json"
+    golden.write_text("not valid json{{{")
+    trajectory = _trajectory(golden_path=str(golden))
+    result = SseShapeGoldenCheck().run(trajectory)
+    assert result.passed is False
+    assert "cannot load golden" in result.message
+
+
 def test_run_checks_preserves_order():
     results = run_checks(_trajectory(), [BoundaryEventsCheck(), NoReplayMissesCheck()])
     assert [result.name for result in results] == ["boundary_events", "no_replay_misses"]
@@ -251,6 +267,60 @@ def test_run_replay_suite_aggregates_counts(tmp_path_factory, monkeypatch):
     assert result.passed_count == 1
     assert result.failed_count == 0
     assert result.overall_passed is True
+
+
+@pytest.mark.no_auto_user
+def test_sse_shape_golden_check_reports_missing_golden_path():
+    trajectory = Trajectory(
+        case_id="write-read-file",
+        scenario="write_read_file",
+        mode="ultra",
+        prompt="test",
+        context={},
+        events=[],
+        replay_misses=[],
+        metadata={"fixture_path": "/tmp/fixture.json", "generated_at": "2026-07-11T00:00:00Z"},
+    )
+    result = SseShapeGoldenCheck().run(trajectory)
+    assert result.passed is False
+    assert "cannot load golden" in result.message
+
+
+@pytest.mark.no_auto_user
+def test_run_replay_suite_reports_failure_counts(tmp_path_factory, monkeypatch):
+    misses: list[str] = []
+    failing_events = [
+        {"event": "messages", "keys": ["chunk"]},
+    ]
+
+    def failing_drive(_app, *, prompt, context):
+        misses.append("stale-hash-abc123")
+        return failing_events
+
+    runtime = replace(
+        _replay_runtime(),
+        create_app=object,
+        drive_gateway=failing_drive,
+        reset_replay_misses=misses.clear,
+        replay_misses=lambda: list(misses),
+    )
+    case = ReplayEvalCase(
+        id="failing-case",
+        scenario="write_read_file",
+        mode="ultra",
+        checks=(BoundaryEventsCheck(), NoReplayMissesCheck()),
+    )
+    result = run_replay_suite(
+        "failing_suite",
+        [case],
+        tmp_path_factory=tmp_path_factory,
+        monkeypatch=monkeypatch,
+        fixture_dir=FIXTURE_DIR,
+        runtime=runtime,
+    )
+    assert result.passed_count == 0
+    assert result.failed_count == 1
+    assert result.overall_passed is False
 
 
 @pytest.mark.no_auto_user

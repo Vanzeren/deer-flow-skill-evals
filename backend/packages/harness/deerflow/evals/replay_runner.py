@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,12 +29,12 @@ class ReplayTmpPathFactory(Protocol):
 @dataclass(frozen=True)
 class ReplayRuntime:
     model_block: str
-    build_config_yaml: Any
-    prepare_hermetic_extras: Any
-    drive_gateway: Any
-    create_app: Any
-    reset_replay_misses: Any
-    replay_misses: Any
+    build_config_yaml: Callable[..., str]
+    prepare_hermetic_extras: Callable[..., str]
+    drive_gateway: Callable[..., list[dict[str, Any]]]
+    create_app: Callable[[], object]
+    reset_replay_misses: Callable[[], None]
+    replay_misses: Callable[[], list[str]]
 
 
 def _reset_process_singletons(monkeypatch: ReplayMonkeyPatch) -> None:
@@ -45,7 +46,7 @@ def _reset_process_singletons(monkeypatch: ReplayMonkeyPatch) -> None:
         (app_config_module, "_app_config"),
         (app_config_module, "_app_config_path"),
         (app_config_module, "_app_config_mtime"),
-        (paths_module, "_paths_singleton"),
+        (paths_module, "_paths"),
         (engine_module, "_engine"),
         (engine_module, "_session_factory"),
     ):
