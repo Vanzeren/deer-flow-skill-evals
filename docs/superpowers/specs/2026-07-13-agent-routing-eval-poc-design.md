@@ -211,6 +211,54 @@ Exactly four cases carry the `quality` tag:
 
 The bounded SLR prompts MUST specify paper count and output format so full runs do not expand to the skill's default scope unexpectedly.
 
+### 7.1 Case authoring contract
+
+Case authors describe user intent and the human route label. They MUST NOT encode the expected implementation as tool-call assertions.
+
+Authoring rules:
+
+1. Write the request as a natural user would. Autonomous-routing cases MUST NOT name a skill, request skill activation, or use a slash command.
+2. Give each case one primary boundary: multi-paper synthesis, one-paper review, or neither candidate.
+3. Explain the discriminating semantic feature in one concise `rationale`. Do not list expected tools, files, steps, or output substrings.
+4. Use stable IDs after a case enters retained results. Material prompt or label changes create a new case ID so historical run hashes remain interpretable.
+5. Use tags for analysis slices, not for hidden scoring behavior.
+6. Reserve `quality` for bounded cases that are safe to execute fully.
+
+Examples:
+
+```json
+{"id":"slr-implicit-rlhf-001","input":"What does the literature say about RLHF?","expected_route":"systematic-literature-review","rationale":"The phrase 'the literature' requests synthesis across multiple papers.","tags":["implicit","multi-paper"]}
+{"id":"paper-review-arxiv-001","input":"Review this paper and assess its methodology: https://arxiv.org/abs/2310.06825","expected_route":"academic-paper-review","rationale":"A single specified paper requires depth-first review rather than a literature survey.","tags":["explicit","sibling-collision"]}
+{"id":"none-concept-001","input":"Explain the difference between precision and recall.","expected_route":"none","rationale":"A direct conceptual explanation requires neither candidate academic skill.","tags":["direct-answer"]}
+```
+
+The initial suite SHOULD contain all of these case shapes:
+
+- obvious target-skill positives;
+- implicit target-skill positives without the words “systematic” or “survey”;
+- sibling-skill collisions that differ mainly by one paper versus multiple papers;
+- near-boundary `none` cases in the academic domain;
+- a small number of unrelated `none` sanity checks.
+
+Quality cases have additional authoring constraints:
+
+- SLR requests specify a bounded count of three to five papers and an output format.
+- Single-paper requests use a stable, publicly reachable paper source.
+- `none` requests remain useful tasks rather than artificial “do nothing” prompts.
+- Case-specific expectations remain prohibited; shared route rubrics own semantic process and output evaluation.
+
+### 7.2 Label review workflow
+
+Before a case is admitted:
+
+1. The author writes `input`, `expected_route`, `rationale`, and tags.
+2. A second reviewer independently labels the `input` without seeing the author's label or rationale.
+3. Agreement admits the case after schema validation.
+4. Disagreement is resolved by reviewing the two candidate skill descriptions and rewriting or removing genuinely ambiguous prompts.
+5. The final rationale records the discriminating boundary, not the review discussion.
+
+The judge's later `recommended_route` disagreement can open a label review, but it never changes the dataset automatically.
+
 ## 8. Route Observation Semantics
 
 ### 8.1 Candidate surface
