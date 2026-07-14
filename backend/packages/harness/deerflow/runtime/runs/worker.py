@@ -560,7 +560,9 @@ async def run_agent(
             error_msg = error_msg or "LLM provider failed after retries"
             await run_manager.set_status(run_id, RunStatus.error, error=error_msg)
         else:
-            await run_manager.set_status(run_id, RunStatus.success)
+            runtime_context = runtime.context if isinstance(runtime.context, dict) else None
+            stop_reason = runtime_context.get("stop_reason") if runtime_context is not None else None
+            await run_manager.set_status(run_id, RunStatus.success, stop_reason=stop_reason)
 
     except asyncio.CancelledError:
         await run_manager.set_finalizing(run_id, True)
