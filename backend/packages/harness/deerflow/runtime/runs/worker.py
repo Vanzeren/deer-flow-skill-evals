@@ -1203,9 +1203,9 @@ async def persist_run_durations(
     """Merge validated run durations into a metadata-only checkpoint.
 
     Durations accumulate so the history fast path can serve every known turn
-    from the latest checkpoint.  For long-lived threads on DB-backed savers
-    this grows O(runs); a pruning strategy should be evaluated before
-    production deploy.
+    from the latest checkpoint.  Per-entry overhead is negligible (~50 bytes
+    per run_id) compared to the messages channel blob written on every graph
+    checkpoint, so no pruning is needed.
     """
     updates = {run_id: max(0, duration_seconds) for run_id, duration_seconds in durations.items() if valid_duration_entry(run_id, duration_seconds)}
     if not updates:
