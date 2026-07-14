@@ -19,7 +19,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from langgraph.checkpoint.base import empty_checkpoint, uuid6
 from pydantic import BaseModel, Field, field_validator
 
@@ -44,6 +44,7 @@ from deerflow.runtime.goal import (
     read_thread_goal,
     write_thread_goal,
 )
+from deerflow.runtime.runs.worker import valid_duration_entry
 from deerflow.runtime.user_context import get_effective_user_id
 from deerflow.utils.file_io import run_file_io
 from deerflow.utils.time import coerce_iso, now_iso
@@ -1052,7 +1053,7 @@ def _checkpoint_run_durations(metadata: Any) -> dict[str, int]:
     raw_durations = metadata.get("run_durations") if isinstance(metadata, dict) else None
     if not isinstance(raw_durations, dict):
         return {}
-    return {run_id: duration_seconds for run_id, duration_seconds in raw_durations.items() if isinstance(run_id, str) and run_id and isinstance(duration_seconds, int) and not isinstance(duration_seconds, bool)}
+    return {run_id: duration_seconds for run_id, duration_seconds in raw_durations.items() if valid_duration_entry(run_id, duration_seconds)}
 
 
 def _set_message_turn_duration(message: dict[str, Any], run_id: str, run_durations: dict[str, int]) -> None:
@@ -1067,7 +1068,12 @@ def _set_message_turn_duration(message: dict[str, Any], run_id: str, run_duratio
 
 @router.post("/{thread_id}/history", response_model=list[HistoryEntry])
 @require_permission("threads", "read", owner_check=True)
-async def get_thread_history(thread_id: str, body: ThreadHistoryRequest, request: Request) -> list[HistoryEntry]:
+async def get_thread_history(
+    thread_id: str,
+    body: ThreadHistoryRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> list[HistoryEntry]:
     """Get checkpoint history for a thread.
 
     Messages are read from the checkpointer's channel values (the
@@ -1137,7 +1143,7 @@ async def get_thread_history(thread_id: str, body: ThreadHistoryRequest, request
                         if any(_ai_message_lacks_duration(msg) for msg in serialized_msgs):
                             from app.gateway.deps import get_run_event_store, get_run_manager
                             from app.gateway.routers.thread_runs import compute_run_durations
-                            from deerflow.runtime.runs.worker import _persist_run_durations
+                            from deerflow.runtime.runs.worker import persist_run_durations
 
                             run_mgr = get_run_manager(request)
                             event_store = get_run_event_store(request)
@@ -1171,7 +1177,12 @@ async def get_thread_history(thread_id: str, body: ThreadHistoryRequest, request
                                         msg["run_id"] = run_id
                                         _set_message_turn_duration(msg, run_id, run_durations)
 
-                                await _persist_run_durations(
+                                # Intentional, best-effort write-on-read migration:
+                                # persist legacy metadata after the response so the
+                                # history request never waits on an active stream's
+                                # same-thread checkpoint lock.
+                                background_tasks.add_task(
+                                    persist_run_durations,
                                     checkpointer=checkpointer,
                                     thread_id=thread_id,
                                     durations=run_durations,

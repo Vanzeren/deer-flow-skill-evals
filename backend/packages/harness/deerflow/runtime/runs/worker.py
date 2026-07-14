@@ -1189,14 +1189,25 @@ def _title_generation_state(channel_values: dict[str, Any], graph_input: Any | N
     return state
 
 
-async def _persist_run_durations(
+def valid_duration_entry(run_id: Any, duration_seconds: Any) -> bool:
+    """Check that (run_id, duration_seconds) is a well-formed duration entry."""
+    return isinstance(run_id, str) and bool(run_id) and isinstance(duration_seconds, int) and not isinstance(duration_seconds, bool)
+
+
+async def persist_run_durations(
     *,
     checkpointer: Any,
     thread_id: str,
     durations: dict[str, int],
 ) -> bool:
-    """Merge validated run durations into a metadata-only checkpoint."""
-    updates = {run_id: max(0, duration_seconds) for run_id, duration_seconds in durations.items() if isinstance(run_id, str) and run_id and isinstance(duration_seconds, int) and not isinstance(duration_seconds, bool)}
+    """Merge validated run durations into a metadata-only checkpoint.
+
+    Durations accumulate so the history fast path can serve every known turn
+    from the latest checkpoint.  For long-lived threads on DB-backed savers
+    this grows O(runs); a pruning strategy should be evaluated before
+    production deploy.
+    """
+    updates = {run_id: max(0, duration_seconds) for run_id, duration_seconds in durations.items() if valid_duration_entry(run_id, duration_seconds)}
     if not updates:
         return False
 
@@ -1210,7 +1221,7 @@ async def _persist_run_durations(
             checkpoint = dict(getattr(ckpt_tuple, "checkpoint", {}) or {})
             metadata = dict(getattr(ckpt_tuple, "metadata", {}) or {})
             raw_run_durations = metadata.get("run_durations")
-            run_durations = {key: value for key, value in raw_run_durations.items() if isinstance(key, str) and key and isinstance(value, int) and not isinstance(value, bool)} if isinstance(raw_run_durations, dict) else {}
+            run_durations = {key: value for key, value in raw_run_durations.items() if valid_duration_entry(key, value)} if isinstance(raw_run_durations, dict) else {}
             changed_durations = {run_id: duration for run_id, duration in updates.items() if run_durations.get(run_id) != duration}
             if not changed_durations:
                 return False
@@ -1258,7 +1269,7 @@ async def _persist_run_duration(
     duration_seconds: int,
 ) -> None:
     """Persist one completed run duration in the thread checkpoint metadata."""
-    await _persist_run_durations(
+    await persist_run_durations(
         checkpointer=checkpointer,
         thread_id=thread_id,
         durations={run_id: duration_seconds},
