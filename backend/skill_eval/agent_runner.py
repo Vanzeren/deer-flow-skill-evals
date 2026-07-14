@@ -1,36 +1,37 @@
-from typing import Any, Protocol
+from typing import Literal, Protocol
+from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
+from skill_eval.case_schema import CANDIDATE_SKILLS
+from skill_eval.routing import RouteObservation
 from skill_eval.trace_schema import AgentTrace
+
+type RunMode = Literal["routing_probe", "full"]
+type SandboxMode = Literal["configured", "local"]
 
 
 class AgentRunRequest(BaseModel):
-    case_id: str | None = None
+    model_config = ConfigDict(extra="forbid")
+
+    case_id: str
     user_input: str
-    target: str | None = None
-    required_skills: list[str] = Field(default_factory=list)
-    candidate_skills: list[str] = Field(default_factory=list)
-    forced_skills: list[str] | None = None
-    sandbox: str | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    mode: RunMode
+    model_name: str
+    thread_id: str = Field(default_factory=lambda: str(uuid4()))
+    candidate_skills: tuple[str, ...] = CANDIDATE_SKILLS
+    timeout_seconds: int = 300
+    trace_dir: str | None = None
+    sandbox: SandboxMode = "configured"
 
 
 class AgentRunResult(BaseModel):
     final_answer: str
     success: bool
     trace: AgentTrace
+    route_observation: RouteObservation
+    thread_id: str
 
 
 class AgentRunner(Protocol):
-    async def run(self, request: AgentRunRequest) -> AgentRunResult:
-        raise NotImplementedError
-
-
-async def run_agent(request: AgentRunRequest, runner: AgentRunner | None = None) -> AgentRunResult:
-    if runner is None:
-        from skill_eval.adapters.mock import MockAgentRunner
-
-        runner = MockAgentRunner()
-
-    return await runner.run(request)
+    async def run(self, request: AgentRunRequest) -> AgentRunResult: ...

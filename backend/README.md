@@ -455,6 +455,30 @@ the only execution path, which keeps operational mistakes off the table. See
 uv run pytest
 ```
 
+#### Skill routing evaluation POC
+
+The routing benchmark runs real DeerFlow agents against 20 reviewed
+systematic-literature-review, academic-paper-review, and negative cases. The
+full command executes three routing epochs per case, then runs the four
+`quality`-tagged cases through the configured Inspect judge:
+
+```bash
+AGENT_MODEL=<configured-deerflow-model> \
+JUDGE_MODEL=<inspect-provider/model> \
+uv run python -m skill_eval.poc
+```
+
+Use `--smoke` for one real case from each route class without the quality
+judge. `DEER_FLOW_CONFIG_PATH` optionally selects a non-default DeerFlow
+configuration. The POC deliberately uses `LocalSandboxProvider` with host
+`bash` enabled so both skill reads and the SLR command workflow run without an
+external sandbox provisioner. Run only the reviewed benchmark cases on a
+trusted development machine; evaluated agents can execute host commands.
+
+Each run writes `summary.json` and `summary.md` under
+`eval-results/<run-id>/`, retains the Inspect logs under `logs/`, and exits
+non-zero when the approved acceptance thresholds fail.
+
 `make detect-blocking-io` statically scans backend business code for blocking
 IO that may run on the backend event loop and is not test-coverage-bound. It
 prints a concise summary for human review and writes complete JSON findings to

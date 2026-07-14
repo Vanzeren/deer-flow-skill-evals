@@ -1,1 +1,1 @@
-"""Trace-level skill evaluation harness for Inspect AI."""
+"""Evidence-grounded DeerFlow skill routing evaluation harness."""

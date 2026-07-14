@@ -1,48 +1,42 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-AssertionName = Literal[
-    "tool_called",
-    "tool_not_called",
-    "tool_args_contains",
-    "tool_args_match",
-    "tool_call_order",
-    "tool_error_absent",
-    "tool_result_contains",
-    "tool_result_match",
-    "tool_count_under",
-    "output_contains",
-    "output_not_contains",
-    "regex_match",
-    "json_valid",
-    "success_is_true",
-    "trace_complete",
-    "skill_loaded",
-    "skill_used",
-    "skill_not_used",
-    "skill_applied",
-    "skill_not_applied",
-    "latency_under",
-    "tokens_under",
-    "max_steps_under",
-    "no_unexpected_clarification",
+type RouteLabel = Literal[
+    "systematic-literature-review",
+    "academic-paper-review",
+    "none",
 ]
 
-
-class SkillAssertionSpec(BaseModel):
-    name: AssertionName
-    target: str | None = None
-    threshold: int | float | None = None
-    message: str | None = None
+CANDIDATE_SKILLS = (
+    "systematic-literature-review",
+    "academic-paper-review",
+)
 
 
-class SkillEvalCase(BaseModel):
+class RoutingCase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     id: str
     input: str
-    target: str | None = None
-    required_skills: list[str] = Field(default_factory=list)
-    candidate_skills: list[str] = Field(default_factory=list)
-    assertions: list[SkillAssertionSpec] = Field(default_factory=list)
+    expected_route: RouteLabel
+    rationale: str
     tags: list[str] = Field(default_factory=list)
-    difficulty: Literal["smoke", "normal", "hard"] = "normal"
+
+    @field_validator("id", "input", "rationale")
+    @classmethod
+    def reject_blank_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value
+
+    @field_validator("tags")
+    @classmethod
+    def normalize_tags(cls, value: list[str]) -> list[str]:
+        normalized = [tag.strip() for tag in value]
+        if any(not tag for tag in normalized):
+            raise ValueError("tags must not contain blank values")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("tags must be unique")
+        return normalized
