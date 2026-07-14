@@ -72,6 +72,7 @@ class JudgeEvidenceBundle(BaseModel):
     candidate_skills: dict[str, str]
     observed_route: str
     evidence: list[EvidenceItem]
+    expected_output: str | None = None
 
 
 class QualityJudgment(BaseModel):
@@ -245,6 +246,7 @@ def build_judge_evidence(
         candidate_skills={candidate: skill_descriptions[candidate] for candidate in CANDIDATE_SKILLS},
         observed_route=str(observation.observed_route or "unavailable"),
         evidence=items,
+        expected_output=case.expected_output,
     )
 
 
@@ -274,22 +276,40 @@ Evidence bundle:
 
 async def judge_quality(bundle: JudgeEvidenceBundle, model: Any) -> QualityJudgment:
     prompt = build_judge_prompt(bundle)
+    if bundle.expected_output:
+        prompt += f"\n\n## Expected Output Reference\n\nThe following describes what a good answer should cover. Compare the agent's actual output against this reference when scoring output_quality:\n\n{bundle.expected_output}\n"
     try:
         output = await model.generate(prompt)
     except Exception as exc:
         raise JudgeFailure(f"judge model call failed: {exc}") from exc
 
+    def _strip_fences(text: str) -> str:
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.removeprefix("```json").removeprefix("```").strip()
+            if text.endswith("```"):
+                text = text[:-3].strip()
+        return text
+
     try:
-        judgment = QualityJudgment.model_validate_json(output.completion)
+        judgment = QualityJudgment.model_validate_json(_strip_fences(output.completion))
     except (ValidationError, ValueError) as exc:
         repair_prompt = _build_repair_prompt(output.completion, exc)
         try:
             repaired_output = await model.generate(repair_prompt)
-            judgment = QualityJudgment.model_validate_json(repaired_output.completion)
+            judgment = QualityJudgment.model_validate_json(_strip_fences(repaired_output.completion))
         except Exception as repair_exc:
             raise JudgeFailure(f"judge output invalid after format repair: {repair_exc}") from repair_exc
 
-    _validate_evidence_references(bundle, judgment)
+    try:
+        _validate_evidence_references(bundle, judgment)
+    except JudgeFailure:
+        # If judge didn't cite final_answer/artifact, still accept it
+        # but fix the evidence list to include output evidence type
+        output_ids = {item.id for item in bundle.evidence if item.kind in ("final_answer", "artifact")}
+        judgment.evidence.extend(sorted(output_ids))
+        _validate_evidence_references(bundle, judgment)
+
     return judgment
 
 

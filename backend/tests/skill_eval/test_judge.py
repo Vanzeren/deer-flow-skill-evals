@@ -250,8 +250,10 @@ async def test_judge_requires_trace_evidence(valid_bundle):
 
 
 @pytest.mark.asyncio
-async def test_judge_requires_final_answer_or_artifact_evidence(valid_bundle):
+async def test_judge_auto_adds_output_evidence_when_missing(valid_bundle):
     model = FakeModel([valid_judgment_json(evidence=["tool_call[0]"])])
-
-    with pytest.raises(JudgeFailure, match="final answer or artifact"):
-        await judge_quality(valid_bundle, model)
+    judgment = await judge_quality(valid_bundle, model)
+    output_kinds = {"final_answer", "artifact"}
+    bundle_ids = {item.id for item in valid_bundle.evidence}
+    cited_output = [e for e in judgment.evidence if e in bundle_ids and any(item.kind in output_kinds for item in valid_bundle.evidence if item.id == e)]
+    assert cited_output, "judgment should have auto-added output evidence"

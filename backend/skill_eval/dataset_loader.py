@@ -55,6 +55,9 @@ def validate_poc_suite(cases: Sequence[RoutingCase]) -> None:
     quality_count = sum("quality" in case.tags for case in cases)
     if quality_count != 4:
         errors.append(f"expected 4 quality cases, found {quality_count}")
+    missing_output = [case.id for case in cases if "quality" in case.tags and not case.expected_output]
+    if missing_output:
+        errors.append(f"quality cases missing expected_output: {', '.join(missing_output)}")
     for case in cases:
         if case.input.lstrip().startswith("/"):
             errors.append(f"{case.id}: slash activation is not an autonomous routing case")
