@@ -481,10 +481,6 @@ async def run_agent(
 
         async def _stream_once(input_payload: Any, stream_config: RunnableConfig) -> None:
             nonlocal llm_error_fallback_message
-            # Clear any stop_reason from a prior turn so a clean continuation
-            # doesn't carry forward a previous cap reason (#4176 review).
-            if isinstance(runtime.context, dict):
-                runtime.context.pop("stop_reason", None)
             async with _checkpoint_thread_lock(thread_id):
                 if len(lg_modes) == 1 and not stream_subgraphs:
                     # Single mode, no subgraphs: astream yields raw chunks
@@ -521,6 +517,12 @@ async def run_agent(
                         await subagent_events.add(chunk)
 
         # 7. Stream the requested turn, then optionally continue hidden goal turns.
+        # Clear any stale stop_reason before the first (user-visible) turn only.
+        # Continuation turns preserve a cap reason from the user turn: a run that
+        # hits a cap during the user turn IS capped even if hidden goal-evaluator
+        # turns complete cleanly afterward (#4176 review).
+        if isinstance(runtime.context, dict):
+            runtime.context.pop("stop_reason", None)
         await _stream_once(graph_input, initial_runnable_config)
         while not record.abort_event.is_set() and not llm_error_fallback_message and (journal is None or not journal.had_llm_error_fallback):
             continuation_input = await _prepare_goal_continuation_input(
@@ -565,6 +567,19 @@ async def run_agent(
             await run_manager.set_status(run_id, RunStatus.error, error=error_msg)
         else:
             runtime_context = runtime.context if isinstance(runtime.context, dict) else None
+            # Guard middlewares that hard-stop a run by stripping tool_calls
+            # stamp stop_reason into runtime.context so the worker can surface
+            # it on the run record:
+            #   loop_detection      -> "loop_capped"
+            #   token_budget        -> "token_capped"
+            #   safety_finish_reason -> "safety_capped"
+            #   subagent_limit       -> "subagent_limit_capped"
+            #
+            # If more guards grow stop_reason semantics, consider a publish/
+            # collect pattern (e.g. each guard middleware publishes its cap
+            # reason to a dedicated runtime.context channel, and the worker
+            # collects the most severe / first / all reasons) instead of each
+            # guard writing directly to the same key.
             stop_reason = runtime_context.get("stop_reason") if runtime_context is not None else None
             await run_manager.set_status(run_id, RunStatus.success, stop_reason=stop_reason)
 
