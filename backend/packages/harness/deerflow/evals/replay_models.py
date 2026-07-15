@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 # NOTE: All dataclasses below are frozen=True, which prevents field reassignment
 # but does NOT make contained dict/list fields deeply immutable (e.g.
@@ -14,7 +14,7 @@ class ReplayEvalCase:
     id: str
     scenario: str
     mode: str
-    checks: tuple[object, ...]
+    checks: tuple[ReplayCheck, ...]
     prompt: str | None = None
 
 
@@ -28,6 +28,12 @@ class Trajectory:
     events: list[dict[str, Any]]
     replay_misses: list[str]
     metadata: dict[str, Any]
+
+
+class ReplayCheck(Protocol):
+    name: str
+
+    def run(self, trajectory: Trajectory) -> CheckResult: ...
 
 
 @dataclass(frozen=True)

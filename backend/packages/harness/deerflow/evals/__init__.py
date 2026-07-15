@@ -1,12 +1,12 @@
 from deerflow.evals.replay_checks import (
     BoundaryEventsCheck,
     NoReplayMissesCheck,
-    ReplayCheck,
     SseShapeGoldenCheck,
     run_checks,
 )
 from deerflow.evals.replay_models import (
     CheckResult,
+    ReplayCheck,
     ReplayEvalCase,
     ReplayEvalResult,
     ReplayEvalSuiteResult,

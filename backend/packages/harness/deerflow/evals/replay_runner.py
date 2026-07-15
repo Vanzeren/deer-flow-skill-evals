@@ -94,7 +94,9 @@ def run_replay_case(
         metadata={
             "fixture_path": str(fixture_path),
             "golden_path": str(events_path),
-            "generated_at": datetime.now(UTC).isoformat(),
+            "provenance": {
+                "generated_at": datetime.now(UTC).isoformat(),
+            },
         },
     )
     check_results = run_checks(trajectory, case.checks)

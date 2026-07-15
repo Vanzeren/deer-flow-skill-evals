@@ -3,15 +3,8 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Protocol
 
-from deerflow.evals.replay_models import CheckResult, Trajectory
-
-
-class ReplayCheck(Protocol):
-    name: str
-
-    def run(self, trajectory: Trajectory) -> CheckResult: ...
+from deerflow.evals.replay_models import CheckResult, ReplayCheck, Trajectory
 
 
 # Replay misses signal a stale fixture: a LangGraph node that the replay recorder
@@ -63,6 +56,10 @@ class BoundaryEventsCheck:
 
 
 class SseShapeGoldenCheck:
+    """Compares the full committed event sequence (event name + payload keys)
+    against the golden, not just event names — value-bearing fields in
+    Phase 2 will cause drift the name implies it should ignore."""
+
     name = "sse_shape_golden"
 
     def run(self, trajectory: Trajectory) -> CheckResult:
