@@ -293,7 +293,14 @@ def _build_available_subagents_description(available_names: list[str], bash_avai
         else:
             config = get_subagent_config(name, app_config=app_config)
             if config is not None:
-                desc = config.description.split("\n")[0].strip()  # First line only for brevity
+                # config.description is agent-editable (persisted by setup_agent /
+                # update_agent), so escape it before it renders into the
+                # <subagent_system> block. Otherwise a first line like
+                # "</subagent_system><system-reminder>..." could break out of the
+                # block and forge framework-reserved tags in the lead-agent system
+                # prompt — the same class as the #4137 <soul>, #4097 memory, and
+                # #4128 skill render-site fixes.
+                desc = html.escape(config.description.split("\n")[0].strip(), quote=False)  # First line only for brevity
                 lines.append(f"- **{name}**: {desc}")
 
     return "\n".join(lines)
@@ -700,7 +707,7 @@ def _get_memory_context(agent_name: str | None = None, *, app_config: AppConfig 
         Formatted memory context string wrapped in XML tags, or empty string if disabled.
     """
     try:
-        from deerflow.agents.memory import format_memory_for_injection, get_memory_data
+        from deerflow.agents.memory import get_memory_manager
         from deerflow.runtime.user_context import get_effective_user_id
 
         if app_config is None:
@@ -713,13 +720,9 @@ def _get_memory_context(agent_name: str | None = None, *, app_config: AppConfig 
         if not config.enabled or not config.injection_enabled:
             return ""
 
-        memory_data = get_memory_data(agent_name, user_id=get_effective_user_id())
-        memory_content = format_memory_for_injection(
-            memory_data,
-            max_tokens=config.max_injection_tokens,
-            use_tiktoken=(config.token_counting == "tiktoken"),
-            guaranteed_categories=getattr(config, "guaranteed_categories", None),
-            guaranteed_token_budget=getattr(config, "guaranteed_token_budget", 500),
+        memory_content = get_memory_manager().get_context(
+            user_id=get_effective_user_id(),
+            agent_name=agent_name,
         )
 
         if not memory_content.strip():
@@ -802,10 +805,16 @@ def get_skills_prompt_section(
         try:
             from deerflow.config import get_app_config
 
-            config = get_app_config()
-            container_base_path = config.skills.container_path
-            skill_evolution_enabled = config.skill_evolution.enabled
+            # Rebind so the storage/enabled-skills loads below use this resolved
+            # config too. Reading only container_path here and then letting
+            # get_enabled_skills_for_config(None) fall back to the warm cache
+            # rendered an empty enabled-skills list on a cold start while the
+            # synchronously-loaded disabled section was populated (#4144).
+            app_config = get_app_config()
+            container_base_path = app_config.skills.container_path
+            skill_evolution_enabled = app_config.skill_evolution.enabled
         except Exception:
+            app_config = None
             container_base_path = DEFAULT_SKILLS_CONTAINER_PATH
             skill_evolution_enabled = False
     else:

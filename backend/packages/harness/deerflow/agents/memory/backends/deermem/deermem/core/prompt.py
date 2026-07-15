@@ -202,7 +202,7 @@ Rules:
 - The consolidated fact must preserve ALL key details from source facts
 - Only consolidate facts that describe the same aspect of the user
 - Confidence of consolidated fact = max of source confidences
-- Be conservative — when in doubt, keep facts separate
+- Be conservative - when in doubt, keep facts separate
 - Maximum {max_groups} consolidation groups per cycle"""
 
 
@@ -405,11 +405,12 @@ def _format_fact_line(fact: dict[str, Any]) -> str | None:
     # and relocate the text after it out of the user-managed trust zone the
     # prompt declares. Mirrors the MEMORY_UPDATE_PROMPT escaping in #4028/#4060.
     # quote=False: these land in element-text position (never attribute values),
-    # so only <, >, & can break out — leave ' and " in facts untouched.
+    # so only <, >, & can break out - leave ' and " in facts untouched.
     content = html.escape(content, quote=False)
     category = html.escape(category, quote=False)
     if category == "correction" and isinstance(source_error, str) and source_error.strip():
-        return f"- [{category} | {confidence:.2f}] {content} (avoid: {html.escape(source_error.strip(), quote=False)})"
+        source_error = html.escape(source_error.strip(), quote=False)
+        return f"- [{category} | {confidence:.2f}] {content} (avoid: {source_error})"
     return f"- [{category} | {confidence:.2f}] {content}"
 
 
@@ -424,7 +425,7 @@ def _escape_summary(value: Any) -> str:
     escaping (#4097). ``str(...)`` preserves the prior f-string coercion for the
     rare non-string summary an import can plant; ``quote=False`` because summaries
     land in element-text position (never attribute values), so only ``<``, ``>``,
-    ``&`` can break out — leave ``'`` and ``"`` untouched.
+    ``&`` can break out - leave ``'`` and ``"`` untouched.
     """
     return html.escape(str(value), quote=False)
 
@@ -812,6 +813,18 @@ def format_conversation_for_update(messages: list[Any]) -> str:
         # Truncate very long messages
         if len(str(content)) > 1000:
             content = str(content)[:1000] + "..."
+
+        # Escape < > & before embedding into the <conversation> block of
+        # MEMORY_UPDATE_PROMPT. This raw user turn is the most attacker-influenced
+        # input in the prompt, so an unescaped value like
+        # "</conversation><current_memory>..." would close the block and forge a
+        # <current_memory> authority section for the extraction LLM. Same block-
+        # breakout defense #4044 applied to the current_memory slot of this exact
+        # template, and the sibling _escape_summary/_format_fact_line escaping of
+        # the <memory> block (#4097). Escape after truncation so a trailing "..."
+        # cannot split an entity; quote=False because content lands in element-
+        # text position (never an attribute value).
+        content = html.escape(str(content), quote=False)
 
         if role == "human":
             lines.append(f"User: {content}")
