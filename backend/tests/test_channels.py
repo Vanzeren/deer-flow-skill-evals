@@ -1039,6 +1039,45 @@ class TestChannelManager:
         )
         assert ChannelManager._inbound_dedupe_key(without_workspace) is None
 
+    def test_github_redelivery_is_deduped_like_other_channels(self, tmp_path):
+        """A redelivered GitHub webhook must dispatch the agent only once.
+
+        PR #3584 added inbound dedupe for the IM channels; the GitHub channel
+        added in PR #3754 never stamped the ``message_id`` / workspace the
+        dedupe keys on, so GitHub's native "Redeliver" button or a
+        retry-on-timeout re-ran the agent with real side effects (e.g. a
+        duplicate PR comment). The dispatcher now stamps the X-GitHub-Delivery
+        GUID (scoped per agent) plus the repo, so the same manager dedupe
+        absorbs the replay — while a second agent bound to the same delivery,
+        and a genuinely new delivery, still fire.
+        """
+        from app.channels.manager import ChannelManager
+
+        manager = ChannelManager(bus=MessageBus(), store=ChannelStore(path=tmp_path / "store.json"))
+
+        def _gh(delivery: str, agent: str = "reviewer") -> InboundMessage:
+            # Shaped exactly as app.gateway.github.dispatcher.fanout_event emits.
+            return InboundMessage(
+                channel_name="github",
+                chat_id="zhfeng/llm-gateway",
+                user_id="alice",
+                text="@bot please review",
+                topic_id=f"7:{agent}",
+                workspace_id="zhfeng/llm-gateway",
+                metadata={"message_id": f"{delivery}:{agent}", "agent_name": agent},
+            )
+
+        # The dedupe key matches the other channels' 4-tuple shape.
+        assert ChannelManager._inbound_dedupe_key(_gh("d1")) == ("github", "zhfeng/llm-gateway", "zhfeng/llm-gateway", "d1:reviewer")
+
+        # First delivery fires; an identical redelivery of the same GUID is dropped.
+        assert manager._is_duplicate_inbound(_gh("d1")) is False
+        assert manager._is_duplicate_inbound(_gh("d1")) is True
+        # A genuinely new delivery still fires.
+        assert manager._is_duplicate_inbound(_gh("d2")) is False
+        # A second agent fanned out from the SAME delivery is not cross-deduped.
+        assert manager._is_duplicate_inbound(_gh("d1", agent="coder")) is False
+
     def test_dispatch_loop_releases_dedupe_key_when_handling_fails(self, tmp_path):
         """A transient handling failure must not black-hole a provider redelivery (ShenAC #1)."""
         from app.channels.manager import ChannelManager
@@ -2412,7 +2451,7 @@ class TestChannelManager:
     def test_handle_command_slash_skill_respects_custom_agent_skill_whitelist(self, monkeypatch, tmp_path):
         from app.channels.manager import ChannelManager
 
-        monkeypatch.setattr("app.channels.manager.load_agent_config", lambda name: SimpleNamespace(skills=["frontend-design"]))
+        monkeypatch.setattr("app.channels.manager.load_agent_config", lambda name, *, user_id=None: SimpleNamespace(skills=["frontend-design"]))
 
         async def go():
             bus = MessageBus()
@@ -2450,6 +2489,47 @@ class TestChannelManager:
             assert outbound_received[0].text == "Skill `/data-analysis` is not available for this agent."
 
         _run(go())
+
+    def test_slash_skill_whitelist_loads_agent_config_for_the_resolved_owner(self, monkeypatch):
+        """The per-user custom agent whitelist must be read from the same owner
+        bucket the run uses. ``_resolve_run_params`` resolves that owner into
+        ``run_context["user_id"]`` (per ``_channel_storage_user_id``, the single
+        source of truth for run identity and storage), but the whitelist
+        pre-check dropped it, so ``load_agent_config`` fell back to the dispatch
+        loop's unset contextvar (``"default"``) — reading, or failing to find,
+        the wrong user's agent config.
+        """
+        from app.channels.manager import ChannelManager
+
+        captured: dict[str, object] = {}
+
+        def spy_load_agent_config(name, *, user_id=None):
+            captured["name"] = name
+            captured["user_id"] = user_id
+            return SimpleNamespace(skills=["data-analysis"])
+
+        monkeypatch.setattr("app.channels.manager.load_agent_config", spy_load_agent_config)
+
+        bus = MessageBus()
+        store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+        manager = ChannelManager(bus=bus, store=store, default_session={"assistant_id": "analyst-agent"})
+
+        # A bound connection: the owner resolves to a real, non-default bucket.
+        msg = InboundMessage(
+            channel_name="test",
+            chat_id="chat1",
+            user_id="platform-user",
+            owner_user_id="owner-alice",
+            text="/data-analysis go",
+            msg_type=InboundMessageType.COMMAND,
+        )
+
+        expected_owner = manager._resolve_run_params(msg, "")[2].get("user_id")
+
+        manager._resolve_available_skill_names(msg)
+
+        assert expected_owner and expected_owner != "default"
+        assert captured["user_id"] == expected_owner
 
     def test_handle_command_slash_skill_reports_disabled_skill(self, tmp_path):
         from app.channels.manager import ChannelManager
