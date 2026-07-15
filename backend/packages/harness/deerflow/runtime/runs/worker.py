@@ -481,6 +481,10 @@ async def run_agent(
 
         async def _stream_once(input_payload: Any, stream_config: RunnableConfig) -> None:
             nonlocal llm_error_fallback_message
+            # Clear any stop_reason from a prior turn so a clean continuation
+            # doesn't carry forward a previous cap reason (#4176 review).
+            if isinstance(runtime.context, dict):
+                runtime.context.pop("stop_reason", None)
             async with _checkpoint_thread_lock(thread_id):
                 if len(lg_modes) == 1 and not stream_subgraphs:
                     # Single mode, no subgraphs: astream yields raw chunks
