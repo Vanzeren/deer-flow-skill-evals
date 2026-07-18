@@ -1650,6 +1650,9 @@ skill_evolution:
 database:
   backend: sqlite
   sqlite_dir: .deer-flow/data
+  # Restart required. Use one value across every process sharing this database.
+  # full: current full-message checkpoints; delta: DeltaChannel for messages.
+  checkpoint_channel_mode: full
 
 # ============================================================================
 # Run Events Configuration

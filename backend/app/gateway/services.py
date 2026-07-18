@@ -34,6 +34,7 @@ from deerflow.config.app_config import get_app_config
 from deerflow.runtime import (
     END_SENTINEL,
     HEARTBEAT_SENTINEL,
+    CheckpointStateAccessor,
     ConflictError,
     DisconnectMode,
     RunManager,
@@ -41,8 +42,10 @@ from deerflow.runtime import (
     RunStatus,
     StreamBridge,
     UnsupportedStrategyError,
+    build_state_mutation_graph,
     run_agent,
 )
+from deerflow.runtime.checkpoint_mode import INTERNAL_CHECKPOINT_MODE_KEY, inject_checkpoint_mode
 from deerflow.runtime.goal import goal_thread_lock
 from deerflow.runtime.runs.naming import resolve_root_run_name
 from deerflow.runtime.secret_context import redact_config_secrets
@@ -494,6 +497,7 @@ def build_run_config(
         else:
             configurable = {"thread_id": thread_id}
             configurable.update(request_config.get("configurable", {}))
+            configurable["thread_id"] = thread_id
             config["configurable"] = configurable
         for k, v in request_config.items():
             if k not in ("configurable", "context"):
@@ -536,9 +540,73 @@ def build_run_config(
         if isinstance(runtime_context, dict):
             runtime_context["agent_name"] = effective_agent_name
         config.setdefault("run_name", resolve_root_run_name(config, normalized))
+    for section in ("configurable", "context"):
+        external_values = config.get(section)
+        if isinstance(external_values, dict):
+            external_values.pop(INTERNAL_CHECKPOINT_MODE_KEY, None)
+
     if metadata:
         config.setdefault("metadata", {}).update(metadata)
     return config
+
+
+def build_checkpoint_state_mutation_accessor(
+    request: Request,
+    *,
+    thread_id: str,
+    as_node: str,
+    checkpoint_id: str | None = None,
+) -> tuple[CheckpointStateAccessor, dict[str, Any]]:
+    """Build a state-only graph whose writer node finishes immediately."""
+    mode = getattr(request.app.state, "checkpoint_channel_mode", "full")
+    config: dict[str, Any] = {
+        "configurable": {
+            "thread_id": thread_id,
+            "checkpoint_ns": "",
+        }
+    }
+    if checkpoint_id is not None:
+        config["configurable"]["checkpoint_id"] = checkpoint_id
+    inject_checkpoint_mode(config, mode)
+
+    graph = build_state_mutation_graph(as_node, mode)
+    accessor = CheckpointStateAccessor.bind(
+        graph,
+        get_checkpointer(request),
+        store=getattr(request.app.state, "store", None),
+        mode=mode,
+    )
+    return accessor, config
+
+
+def build_checkpoint_state_accessor(
+    request: Request,
+    *,
+    thread_id: str,
+    assistant_id: str | None = None,
+    checkpoint_id: str | None = None,
+) -> tuple[CheckpointStateAccessor, dict[str, Any]]:
+    """Build the mode-selected lead graph used for materialized checkpoint state."""
+    ctx = get_run_context(request)
+    config = build_run_config(thread_id, None, None, assistant_id=assistant_id)
+    configurable = config.setdefault("configurable", {})
+    configurable["checkpoint_ns"] = ""
+    if checkpoint_id is not None:
+        configurable["checkpoint_id"] = checkpoint_id
+
+    if ctx.app_config is not None:
+        config.setdefault("context", {})["app_config"] = ctx.app_config
+    inject_checkpoint_mode(config, ctx.checkpoint_channel_mode)
+
+    agent_factory = resolve_agent_factory(assistant_id)
+    graph = agent_factory(config=config)
+    accessor = CheckpointStateAccessor.bind(
+        graph,
+        ctx.checkpointer,
+        store=ctx.store,
+        mode=ctx.checkpoint_channel_mode,
+    )
+    return accessor, config
 
 
 async def apply_checkpoint_to_run_config(
