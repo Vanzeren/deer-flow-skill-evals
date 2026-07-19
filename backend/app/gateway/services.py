@@ -556,8 +556,15 @@ def build_checkpoint_state_mutation_accessor(
     thread_id: str,
     as_node: str,
     checkpoint_id: str | None = None,
+    state_schema: Any | None = None,
 ) -> tuple[CheckpointStateAccessor, dict[str, Any]]:
-    """Build a state-only graph whose writer node finishes immediately."""
+    """Build a state-only graph whose writer node finishes immediately.
+
+    ``state_schema`` should be the thread's effective schema (from
+    :func:`graph_state_schema` on the assistant graph) whenever the write
+    carries materialized state; with the base-schema fallback, channels
+    contributed by custom middleware are silently discarded.
+    """
     mode = getattr(request.app.state, "checkpoint_channel_mode", "full")
     config: dict[str, Any] = {
         "configurable": {
@@ -569,7 +576,7 @@ def build_checkpoint_state_mutation_accessor(
         config["configurable"]["checkpoint_id"] = checkpoint_id
     inject_checkpoint_mode(config, mode)
 
-    graph = build_state_mutation_graph(as_node, mode)
+    graph = build_state_mutation_graph(as_node, mode, state_schema)
     accessor = CheckpointStateAccessor.bind(
         graph,
         get_checkpointer(request),

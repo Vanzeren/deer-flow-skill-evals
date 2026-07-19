@@ -32,23 +32,66 @@ def _finish_state_mutation(_state: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def build_state_mutation_graph(as_node: str, mode: CheckpointChannelMode) -> Any:
+def build_state_mutation_graph(as_node: str, mode: CheckpointChannelMode, state_schema: Any | None = None) -> Any:
     """Compile a state-only graph whose single writer node finishes immediately.
 
     ``update_state(..., as_node=...)`` requires the node to be registered in
     the graph; a dedicated single-node graph applies reducer writes and
     finishes, so the mutation checkpoint schedules no agent nodes and has no
     pending ``next`` nodes.
+
+    ``state_schema`` must be the thread's *effective* schema (the class the
+    assistant graph was compiled with) whenever the write carries materialized
+    state: the base ThreadState fallback does not know channels contributed by
+    custom middleware, and writes to unknown channels are silently discarded.
     """
     if not as_node:
         raise ValueError("as_node is required for checkpoint state mutation")
     from langgraph.graph import StateGraph
 
-    builder = StateGraph(get_thread_state_schema(mode))
+    builder = StateGraph(state_schema if state_schema is not None else get_thread_state_schema(mode))
     builder.add_node(as_node, _finish_state_mutation)
     builder.set_entry_point(as_node)
     builder.set_finish_point(as_node)
     return builder.compile()
+
+
+def graph_state_schema(graph: Any) -> Any | None:
+    """Return the state schema class a compiled graph was built with.
+
+    The schema is the first entry of ``StateGraph.schemas`` (state schema is
+    registered before input/output schemas). Returns ``None`` for stub
+    accessors in tests that do not wrap a real compiled graph.
+    """
+    schemas = getattr(getattr(graph, "builder", None), "schemas", None)
+    if not schemas:
+        return None
+    return next(iter(schemas))
+
+
+def graph_writable_channels(graph: Any) -> frozenset[str] | None:
+    """Return the user-visible state channel names of a compiled graph.
+
+    Excludes Pregel-internal channels (``__*``) and branch fan-in channels
+    (``branch:*``). Returns ``None`` when the graph does not expose channels
+    (stub accessors), so callers can fall back to the base ThreadState set.
+    """
+    channels = getattr(graph, "channels", None)
+    if not channels:
+        return None
+    return frozenset(name for name in channels if not name.startswith("__") and not name.startswith("branch:"))
+
+
+def graph_reducer_channels(graph: Any) -> frozenset[str]:
+    """Return channel names whose writes merge through a reducer.
+
+    Covers classic reducers (``BinaryOperatorAggregate``) and delta channels:
+    both require ``Overwrite`` wrapping for replace-style writes, in any mode.
+    """
+    from langgraph.channels import BinaryOperatorAggregate, DeltaChannel
+
+    channels = getattr(graph, "channels", None) or {}
+    return frozenset(name for name, channel in channels.items() if isinstance(channel, (BinaryOperatorAggregate, DeltaChannel)))
 
 
 @dataclass

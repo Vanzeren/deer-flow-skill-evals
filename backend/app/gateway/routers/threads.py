@@ -33,6 +33,7 @@ from deerflow.agents.thread_state import THREAD_STATE_REDUCER_FIELDS
 from deerflow.config.paths import Paths, get_paths
 from deerflow.config.summarization_config import ContextSize
 from deerflow.runtime import serialize_channel_values_for_api
+from deerflow.runtime.checkpoint_state import graph_reducer_channels, graph_state_schema, graph_writable_channels
 from deerflow.runtime.context_compaction import (
     ContextCompactionDisabled,
     ContextCompactionFailed,
@@ -668,6 +669,10 @@ async def branch_thread(thread_id: str, body: ThreadBranchRequest, request: Requ
         request,
         thread_id=new_thread_id,
         as_node="branch",
+        # The branch write carries the full materialized snapshot; use the
+        # source assistant's effective schema so extension middleware channels
+        # survive instead of being silently discarded as unknown channels.
+        state_schema=graph_state_schema(getattr(source_accessor, "graph", None)),
     )
     new_config.setdefault("metadata", {}).update(
         {
@@ -984,13 +989,37 @@ async def update_thread_state(thread_id: str, body: ThreadStateUpdateRequest, re
             raise HTTPException(status_code=404, detail=f"Checkpoint {body.checkpoint_id} not found")
 
     mutation_node = body.as_node or "manual_state_update"
+    # Resolve the thread's effective state schema through the assistant graph
+    # so extension middleware channels are writable; the base ThreadState
+    # mutation graph would silently discard them.
+    record = await thread_store.get(thread_id) if thread_store is not None else None
+    assistant_id = record.get("assistant_id") if isinstance(record, dict) else None
+    read_accessor, _schema_config = build_checkpoint_state_accessor(
+        request,
+        thread_id=thread_id,
+        assistant_id=assistant_id,
+    )
+    state_schema = graph_state_schema(getattr(read_accessor, "graph", None))
     accessor, read_config = build_checkpoint_state_mutation_accessor(
         request,
         thread_id=thread_id,
         as_node=mutation_node,
         checkpoint_id=body.checkpoint_id,
+        state_schema=state_schema,
     )
-    updates = {key: Overwrite(value) if key in THREAD_STATE_REDUCER_FIELDS else value for key, value in (body.values or {}).items()}
+    values = dict(body.values or {})
+    writable_channels = graph_writable_channels(getattr(accessor, "graph", None))
+    if writable_channels is not None:
+        unknown_fields = sorted(set(values) - writable_channels)
+        if unknown_fields:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unknown thread-state field(s): {', '.join(unknown_fields)}",
+            )
+        reducer_fields = graph_reducer_channels(accessor.graph)
+    else:
+        reducer_fields = THREAD_STATE_REDUCER_FIELDS
+    updates = {key: Overwrite(value) if key in reducer_fields else value for key, value in values.items()}
     try:
         updated_config = await accessor.aupdate(
             read_config,

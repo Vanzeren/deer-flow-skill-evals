@@ -148,7 +148,7 @@ def _patch_checkpoint_state_builder(monkeypatch):
             config["configurable"]["checkpoint_id"] = checkpoint_id
         return _RawStateAccessor(request.app.state.checkpointer), config
 
-    def _mutation_builder(request, *, thread_id, as_node, checkpoint_id=None):
+    def _mutation_builder(request, *, thread_id, as_node, checkpoint_id=None, state_schema=None):
         config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
         if checkpoint_id is not None:
             config["configurable"]["checkpoint_id"] = checkpoint_id
@@ -1181,7 +1181,7 @@ def test_branch_thread_uses_materialized_history_and_overwrites_fresh_seed(monke
             }
         }
 
-    def build_mutation_accessor(_request, *, thread_id, as_node, checkpoint_id=None):
+    def build_mutation_accessor(_request, *, thread_id, as_node, checkpoint_id=None, state_schema=None):
         return branch_accessor, {
             "configurable": {
                 "thread_id": thread_id,
@@ -1290,6 +1290,108 @@ def test_branch_thread_real_mutation_graph_finishes_without_scheduling(monkeypat
     assert branch_snapshot.next == ()
     assert branch_snapshot.metadata["deerflow_branch"] is True
     assert branch_snapshot.metadata["branch_parent_checkpoint_id"] == "ckpt-1"
+
+
+def test_branch_and_state_update_preserve_extension_owned_channels(monkeypatch) -> None:
+    """Custom middleware state_schema channels survive branch and POST /state.
+
+    A mutation graph compiled from the base ThreadState silently discards
+    channels contributed by AgentMiddleware.state_schema; the gateway must
+    compile it from the thread's effective schema and reject unknown fields
+    explicitly instead of returning a false-success 200.
+    """
+    from typing import NotRequired, TypedDict
+
+    from langchain.agents import create_agent
+    from langchain.agents.middleware import AgentMiddleware
+    from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+
+    from deerflow.runtime.checkpoint_state import CheckpointStateAccessor
+
+    class ExtensionState(TypedDict):
+        extension_state: NotRequired[dict[str, str]]
+
+    class ExtensionMiddleware(AgentMiddleware):
+        state_schema = ExtensionState
+
+    app, _store, checkpointer = _build_thread_app()
+    model = FakeMessagesListChatModel(responses=[AIMessage(content="ok")])
+
+    def custom_factory(*, config=None):
+        return create_agent(model, middleware=[ExtensionMiddleware()])
+
+    def custom_read_builder(request, *, thread_id, assistant_id=None, checkpoint_id=None):
+        # The production read builder resolves the assistant graph from config;
+        # the test environment has no config.yaml, so bind the custom graph
+        # directly. The handler's schema extraction stays the real code path.
+        graph = custom_factory()
+        accessor = CheckpointStateAccessor.bind(graph, request.app.state.checkpointer, mode="full")
+        config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+        if checkpoint_id is not None:
+            config["configurable"]["checkpoint_id"] = checkpoint_id
+        return accessor, config
+
+    monkeypatch.setattr(gateway_services, "resolve_agent_factory", lambda _assistant_id: custom_factory)
+    monkeypatch.setattr(threads, "build_checkpoint_state_accessor", custom_read_builder)
+    monkeypatch.setattr(
+        threads,
+        "build_checkpoint_state_mutation_accessor",
+        gateway_services.build_checkpoint_state_mutation_accessor,
+        raising=False,
+    )
+
+    source_thread_id = "extension-source"
+
+    async def seed_source():
+        accessor = CheckpointStateAccessor.bind(custom_factory(), checkpointer, mode="full")
+        await accessor.aupdate(
+            {"configurable": {"thread_id": source_thread_id, "checkpoint_ns": ""}},
+            {
+                "messages": [HumanMessage(id="h1", content="question"), AIMessage(id="a1", content="answer")],
+                "extension_state": {"token": "must-survive"},
+            },
+            as_node="model",
+        )
+
+    asyncio.run(seed_source())
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/threads",
+            json={"thread_id": source_thread_id, "metadata": {}, "assistant_id": "extension-agent"},
+        )
+        assert created.status_code == 200, created.text
+
+        branch_response = client.post(
+            f"/api/threads/{source_thread_id}/branches",
+            json={"message_id": "a1", "message_ids": ["a1"]},
+        )
+        assert branch_response.status_code == 200, branch_response.text
+        branch_thread_id = branch_response.json()["thread_id"]
+
+        state_response = client.post(
+            f"/api/threads/{source_thread_id}/state",
+            json={"values": {"extension_state": {"token": "updated"}}},
+        )
+        assert state_response.status_code == 200, state_response.text
+
+        bogus_response = client.post(
+            f"/api/threads/{source_thread_id}/state",
+            json={"values": {"not_a_state_field": 1}},
+        )
+        assert bogus_response.status_code == 422, bogus_response.text
+
+    async def materialize(thread_id):
+        accessor = CheckpointStateAccessor.bind(custom_factory(), checkpointer, mode="full")
+        snapshot = await accessor.aget({"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}})
+        return snapshot.values
+
+    branch_values = asyncio.run(materialize(branch_thread_id))
+    assert branch_values["extension_state"] == {"token": "must-survive"}
+    assert [message.id for message in branch_values["messages"]] == ["h1", "a1"]
+
+    source_values = asyncio.run(materialize(source_thread_id))
+    assert source_values["extension_state"] == {"token": "updated"}
 
 
 def test_branch_display_name_strips_legacy_branch_prefix_only_for_branch_sources() -> None:
@@ -1526,7 +1628,7 @@ def test_update_thread_state_overwrites_reducer_fields_and_writes_last_values_di
         aget=AsyncMock(return_value=snapshot),
     )
 
-    def build_accessor(_request, *, thread_id, as_node, checkpoint_id=None):
+    def build_accessor(_request, *, thread_id, as_node, checkpoint_id=None, state_schema=None):
         assert thread_id == "state-overwrite"
         return accessor, {
             "configurable": {
@@ -1574,10 +1676,12 @@ def test_update_thread_state_real_mutation_graph_finishes_without_scheduling(mon
     app.state.checkpoint_channel_mode = "delta"
     real_mutation_builder = gateway_services.build_checkpoint_state_mutation_accessor
 
-    def reject_regular_builder(*_args, **_kwargs):
-        raise AssertionError("state updates must use the dedicated mutation graph")
+    def stub_read_builder(_request, *, thread_id, assistant_id=None, checkpoint_id=None):
+        # No real assistant graph in this unit context: the handler must fall
+        # back to the base schema while writes still use the mutation graph.
+        return SimpleNamespace(), {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
 
-    monkeypatch.setattr(threads, "build_checkpoint_state_accessor", reject_regular_builder)
+    monkeypatch.setattr(threads, "build_checkpoint_state_accessor", stub_read_builder)
     monkeypatch.setattr(
         threads,
         "build_checkpoint_state_mutation_accessor",
