@@ -46,6 +46,7 @@ from deerflow.runtime import (
     run_agent,
 )
 from deerflow.runtime.checkpoint_mode import INTERNAL_CHECKPOINT_MODE_KEY, inject_checkpoint_mode
+from deerflow.runtime.checkpoint_state import graph_state_schema
 from deerflow.runtime.goal import goal_thread_lock
 from deerflow.runtime.runs.naming import resolve_root_run_name
 from deerflow.runtime.secret_context import redact_config_secrets
@@ -614,6 +615,72 @@ def build_checkpoint_state_accessor(
         mode=ctx.checkpoint_channel_mode,
     )
     return accessor, config
+
+
+async def resolve_thread_assistant_id(request: Request, thread_id: str) -> str | None:
+    """Return the assistant_id recorded in thread metadata, or ``None``.
+
+    Missing store/record degrades to ``None`` (the default lead agent),
+    matching the pre-boundary behavior of the state endpoints.
+    """
+    from app.gateway.deps import get_thread_store
+
+    try:
+        thread_store = get_thread_store(request)
+        record = await thread_store.get(thread_id)
+    except Exception:
+        logger.warning("Failed to resolve assistant_id for thread %s", thread_id, exc_info=True)
+        return None
+    return record.get("assistant_id") if isinstance(record, dict) else None
+
+
+async def build_thread_checkpoint_state_accessor(
+    request: Request,
+    *,
+    thread_id: str,
+    checkpoint_id: str | None = None,
+) -> tuple[CheckpointStateAccessor, dict[str, Any]]:
+    """Single resolution boundary for state endpoints.
+
+    Thread metadata -> assistant_id -> effective assistant graph. Materializing
+    with the default lead schema would drop channels contributed by a custom
+    ``AgentMiddleware.state_schema`` from the response.
+    """
+    assistant_id = await resolve_thread_assistant_id(request, thread_id)
+    return build_checkpoint_state_accessor(
+        request,
+        thread_id=thread_id,
+        assistant_id=assistant_id,
+        checkpoint_id=checkpoint_id,
+    )
+
+
+async def build_thread_checkpoint_state_mutation_accessor(
+    request: Request,
+    *,
+    thread_id: str,
+    as_node: str,
+    checkpoint_id: str | None = None,
+) -> tuple[CheckpointStateAccessor, dict[str, Any]]:
+    """Mutation accessor compiled with the thread's effective state schema.
+
+    Derives the schema through :func:`build_thread_checkpoint_state_accessor`
+    so writes carrying materialized state do not silently discard
+    extension-owned channels.
+    """
+    read_accessor, _read_config = await build_thread_checkpoint_state_accessor(
+        request,
+        thread_id=thread_id,
+        checkpoint_id=checkpoint_id,
+    )
+    state_schema = graph_state_schema(getattr(read_accessor, "graph", None))
+    return build_checkpoint_state_mutation_accessor(
+        request,
+        thread_id=thread_id,
+        as_node=as_node,
+        checkpoint_id=checkpoint_id,
+        state_schema=state_schema,
+    )
 
 
 async def apply_checkpoint_to_run_config(

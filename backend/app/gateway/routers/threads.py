@@ -27,7 +27,12 @@ from sqlalchemy.exc import IntegrityError
 from app.gateway.authz import require_permission
 from app.gateway.deps import get_checkpointer, get_run_manager
 from app.gateway.internal_auth import get_trusted_internal_owner_user_id
-from app.gateway.services import build_checkpoint_state_accessor, build_checkpoint_state_mutation_accessor
+from app.gateway.services import (
+    build_checkpoint_state_accessor,
+    build_checkpoint_state_mutation_accessor,
+    build_thread_checkpoint_state_accessor,
+    build_thread_checkpoint_state_mutation_accessor,
+)
 from app.gateway.utils import sanitize_log_param
 from deerflow.agents.thread_state import THREAD_STATE_REDUCER_FIELDS
 from deerflow.config.paths import Paths, get_paths
@@ -662,9 +667,9 @@ async def branch_thread(thread_id: str, body: ThreadBranchRequest, request: Requ
     thread_owner_user_id = get_trusted_internal_owner_user_id(request)
     thread_owner_kwargs = {"user_id": thread_owner_user_id} if thread_owner_user_id else {}
 
-    branch_values = dict(snapshot.values)
-    branch_messages = list(branch_values.get("messages", []))
-    branch_values["messages"] = Overwrite(branch_messages)
+    # Copy materialized values with replace semantics: reducer channels must
+    # not re-merge an already-aggregated value, so every copied reducer value
+    # is wrapped in Overwrite (not just messages).
     branch_accessor, new_config = build_checkpoint_state_mutation_accessor(
         request,
         thread_id=new_thread_id,
@@ -674,6 +679,15 @@ async def branch_thread(thread_id: str, body: ThreadBranchRequest, request: Requ
         # survive instead of being silently discarded as unknown channels.
         state_schema=graph_state_schema(getattr(source_accessor, "graph", None)),
     )
+    branch_reducer_fields = graph_reducer_channels(getattr(branch_accessor, "graph", None))
+    if branch_reducer_fields is None:
+        branch_reducer_fields = THREAD_STATE_REDUCER_FIELDS
+    branch_values = {}
+    for key, value in dict(snapshot.values).items():
+        if key in branch_reducer_fields:
+            branch_values[key] = Overwrite(list(value) if key == "messages" and isinstance(value, list) else value)
+        else:
+            branch_values[key] = value
     new_config.setdefault("metadata", {}).update(
         {
             **branch_metadata,
@@ -932,7 +946,9 @@ async def compact_thread(thread_id: str, body: ThreadCompactRequest, request: Re
 @require_permission("threads", "read", owner_check=True)
 async def get_thread_state(thread_id: str, request: Request) -> ThreadStateResponse:
     """Get the latest materialized graph state for a thread."""
-    accessor, config = build_checkpoint_state_accessor(request, thread_id=thread_id)
+    # Resolve through the thread's assistant so custom middleware channels
+    # appear in the response instead of being dropped by the default schema.
+    accessor, config = await build_thread_checkpoint_state_accessor(request, thread_id=thread_id)
     try:
         snapshot = await accessor.aget(config)
     except Exception:
@@ -989,23 +1005,13 @@ async def update_thread_state(thread_id: str, body: ThreadStateUpdateRequest, re
             raise HTTPException(status_code=404, detail=f"Checkpoint {body.checkpoint_id} not found")
 
     mutation_node = body.as_node or "manual_state_update"
-    # Resolve the thread's effective state schema through the assistant graph
-    # so extension middleware channels are writable; the base ThreadState
-    # mutation graph would silently discard them.
-    record = await thread_store.get(thread_id) if thread_store is not None else None
-    assistant_id = record.get("assistant_id") if isinstance(record, dict) else None
-    read_accessor, _schema_config = build_checkpoint_state_accessor(
-        request,
-        thread_id=thread_id,
-        assistant_id=assistant_id,
-    )
-    state_schema = graph_state_schema(getattr(read_accessor, "graph", None))
-    accessor, read_config = build_checkpoint_state_mutation_accessor(
+    # Resolve through the shared boundary (thread metadata -> assistant_id ->
+    # effective schema) so extension middleware channels stay writable.
+    accessor, read_config = await build_thread_checkpoint_state_mutation_accessor(
         request,
         thread_id=thread_id,
         as_node=mutation_node,
         checkpoint_id=body.checkpoint_id,
-        state_schema=state_schema,
     )
     values = dict(body.values or {})
     writable_channels = graph_writable_channels(getattr(accessor, "graph", None))
@@ -1016,8 +1022,8 @@ async def update_thread_state(thread_id: str, body: ThreadStateUpdateRequest, re
                 status_code=422,
                 detail=f"Unknown thread-state field(s): {', '.join(unknown_fields)}",
             )
-        reducer_fields = graph_reducer_channels(accessor.graph)
-    else:
+    reducer_fields = graph_reducer_channels(getattr(accessor, "graph", None))
+    if reducer_fields is None:
         reducer_fields = THREAD_STATE_REDUCER_FIELDS
     updates = {key: Overwrite(value) if key in reducer_fields else value for key, value in values.items()}
     try:

@@ -82,15 +82,19 @@ def graph_writable_channels(graph: Any) -> frozenset[str] | None:
     return frozenset(name for name in channels if not name.startswith("__") and not name.startswith("branch:"))
 
 
-def graph_reducer_channels(graph: Any) -> frozenset[str]:
+def graph_reducer_channels(graph: Any) -> frozenset[str] | None:
     """Return channel names whose writes merge through a reducer.
 
     Covers classic reducers (``BinaryOperatorAggregate``) and delta channels:
     both require ``Overwrite`` wrapping for replace-style writes, in any mode.
+    Returns ``None`` when the graph does not expose channels (stub
+    accessors), so callers can fall back to the base ThreadState set.
     """
     from langgraph.channels import BinaryOperatorAggregate, DeltaChannel
 
-    channels = getattr(graph, "channels", None) or {}
+    channels = getattr(graph, "channels", None)
+    if channels is None:
+        return None
     return frozenset(name for name, channel in channels.items() if isinstance(channel, (BinaryOperatorAggregate, DeltaChannel)))
 
 
