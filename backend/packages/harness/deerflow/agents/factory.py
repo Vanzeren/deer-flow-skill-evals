@@ -103,7 +103,10 @@ def create_deerflow_agent(
         LangGraph state type.  Defaults to ``ThreadState``.
     checkpoint_channel_mode:
         Checkpoint representation for accumulating channels.  Defaults to the
-        full-state compatibility schema.
+        full-state compatibility schema.  ``"delta"`` requires the guarded
+        persistence paths (mode markers + compatibility gate) and is therefore
+        rejected when combined with *checkpointer* in this factory; without a
+        checkpointer the graph is ephemeral and delta is allowed.
     checkpointer:
         Optional persistence backend.
     name:
@@ -116,6 +119,14 @@ def create_deerflow_agent(
     """
     if middleware is not None and features is not None:
         raise ValueError("Cannot specify both 'middleware' and 'features'.  Use one or the other.")
+    if checkpoint_channel_mode == "delta" and checkpointer is not None:
+        raise ValueError(
+            "create_deerflow_agent does not support checkpoint_channel_mode='delta' with a checkpointer: "
+            "persisted graphs built here bypass checkpoint mode marker injection and the fail-closed "
+            "compatibility gate (see deerflow.runtime.checkpoint_mode), so a mixed-mode store would "
+            "silently corrupt thread state.  Use the guarded application paths (make_lead_agent or "
+            "DeerFlowClient) for delta persistence; delta without a checkpointer is ephemeral and allowed."
+        )
     if middleware is not None and extra_middleware:
         raise ValueError("Cannot use 'extra_middleware' with 'middleware' (full takeover).")
     if extra_middleware:

@@ -585,6 +585,7 @@ async def run_agent(
         while not record.abort_event.is_set() and not llm_error_fallback_message and (journal is None or not journal.had_llm_error_fallback):
             continuation_input = await _prepare_goal_continuation_input(
                 bridge=bridge,
+                accessor=accessor,
                 checkpointer=checkpointer,
                 thread_id=thread_id,
                 run_id=run_id,
@@ -795,11 +796,17 @@ def _goal_instance_matches(left: GoalState | None, right: GoalState | None) -> b
     return same_status and same_objective and same_created_at
 
 
-def _read_checkpoint_messages(checkpoint_tuple: Any) -> list[Any]:
-    checkpoint = getattr(checkpoint_tuple, "checkpoint", {}) or {}
-    channel_values = checkpoint.get("channel_values", {}) if isinstance(checkpoint, dict) else {}
-    messages = channel_values.get("messages", []) if isinstance(channel_values, dict) else []
-    return messages if isinstance(messages, list) else []
+async def _materialized_checkpoint_messages(accessor: CheckpointStateAccessor, thread_id: str) -> list[Any]:
+    """Read ``messages`` through the mode-matched accessor.
+
+    Raw ``channel_values`` reads see a sentinel in delta mode; only a
+    materialized read reconstructs the list.  Raw checkpoint tuples remain
+    valid for tuple-level metadata (checkpoint id, ``pending_writes``).
+    """
+    snapshot = await accessor.aget({"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}})
+    values = getattr(snapshot, "values", None) or {}
+    messages = values.get("messages") if isinstance(values, dict) else None
+    return list(messages) if isinstance(messages, list) else []
 
 
 def _read_checkpoint_goal(checkpoint_tuple: Any) -> GoalState | None:
@@ -916,6 +923,7 @@ async def _reread_goal_and_checkpoint(checkpointer: Any, thread_id: str) -> tupl
 async def _prepare_goal_continuation_input(
     *,
     bridge: StreamBridge,
+    accessor: CheckpointStateAccessor,
     checkpointer: Any,
     thread_id: str,
     run_id: str,
@@ -978,7 +986,7 @@ async def _prepare_goal_continuation_input(
         if checkpoint_tuple is None:
             return None
         checkpoint_id_before = _checkpoint_id(checkpoint_tuple)
-        messages = _read_checkpoint_messages(checkpoint_tuple)
+        messages = await _materialized_checkpoint_messages(accessor, thread_id)
         conversation_signature_before = visible_conversation_signature(messages)
         evidence_signature = latest_visible_assistant_signature(messages)
 
@@ -1026,7 +1034,7 @@ async def _prepare_goal_continuation_input(
         return None
 
     checkpoint_changed = _checkpoint_id(current_checkpoint_tuple) != checkpoint_id_before
-    messages_changed = visible_conversation_signature(_read_checkpoint_messages(current_checkpoint_tuple)) != conversation_signature_before
+    messages_changed = visible_conversation_signature(await _materialized_checkpoint_messages(accessor, thread_id)) != conversation_signature_before
     if checkpoint_changed or messages_changed:
         await _persist(current_goal, evaluation, no_progress_count, stand_down_reason="thread_changed_after_evaluation")
         return None
@@ -1078,7 +1086,7 @@ async def _prepare_goal_continuation_input(
         return None
     if not _goal_instance_matches(updated_goal, latest_goal) or latest_checkpoint_tuple is None:
         return None
-    if visible_conversation_signature(_read_checkpoint_messages(latest_checkpoint_tuple)) != conversation_signature_before:
+    if visible_conversation_signature(await _materialized_checkpoint_messages(accessor, thread_id)) != conversation_signature_before:
         # Do not pass continuation_count here: the persist above already
         # committed it (as next_count). Re-passing next_count would make
         # _persist_goal_evaluation's race guard (#4088) see that same write as

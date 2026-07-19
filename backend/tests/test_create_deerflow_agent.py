@@ -8,6 +8,7 @@ from langchain.agents import AgentState
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
 from langgraph.channels import DeltaChannel
+from langgraph.checkpoint.memory import InMemorySaver
 
 from deerflow.agents.factory import create_deerflow_agent
 from deerflow.agents.features import Next, Prev, RuntimeFeatures
@@ -86,6 +87,19 @@ def test_custom_state_schema_is_preserved_in_full_mode_and_adapted_in_delta_mode
     hints = get_type_hints(adapted, include_extras=True)
     assert "custom_value" in hints
     assert any(isinstance(item, DeltaChannel) for item in hints["messages"].__metadata__)
+
+
+def test_delta_checkpointer_combination_is_rejected_before_any_persistence():
+    """Mixed-mode corruption guard: delta + checkpointer must fail loudly at
+    construction, before any state is read or written through the ungated graph."""
+    saver = InMemorySaver()
+    with pytest.raises(ValueError, match="checkpoint_channel_mode='delta'"):
+        create_deerflow_agent(
+            _FakeModel(responses=[AIMessage(content="ok")]),
+            checkpoint_channel_mode="delta",
+            checkpointer=saver,
+        )
+    assert list(saver.list(None)) == []
 
 
 def test_compiled_factory_graph_selects_full_and_delta_message_channels():

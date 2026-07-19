@@ -29,7 +29,6 @@ import pytest
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveMessage
 from langgraph.channels import DeltaChannel
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.serde.types import _DeltaSnapshot
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import StateGraph
@@ -134,7 +133,8 @@ async def _open_sqlite(db_path: Any) -> AsyncIterator[Any]:
 
 @asynccontextmanager
 async def _open_postgres(uri: str) -> AsyncIterator[Any]:
-    async with AsyncPostgresSaver.from_conn_string(uri) as saver:
+    aio = pytest.importorskip("langgraph.checkpoint.postgres.aio", reason="postgres extra not installed")
+    async with aio.AsyncPostgresSaver.from_conn_string(uri) as saver:
         await saver.setup()
         yield saver
 
