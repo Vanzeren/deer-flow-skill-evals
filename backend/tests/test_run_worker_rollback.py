@@ -15,7 +15,7 @@ from langgraph.graph import StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.types import Overwrite
 
-from deerflow.agents.thread_state import merge_message_writes
+from deerflow.agents.thread_state import merge_artifacts, merge_message_writes
 from deerflow.runtime.checkpoint_state import CheckpointStateAccessor
 from deerflow.runtime.context_keys import CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY
 from deerflow.runtime.runs.manager import ConflictError, RunManager
@@ -551,6 +551,57 @@ async def test_rollback_skips_when_rollback_point_has_no_checkpoint_id(monkeypat
     checkpointer.adelete_thread.assert_not_awaited()
     mock_graph.aupdate_state.assert_not_awaited()
     checkpointer.aput_writes.assert_not_awaited()
+
+
+class _ArtifactChannelState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+    artifacts: Annotated[list[str], merge_artifacts]
+
+
+def _build_message_and_artifact_graph(checkpointer: Any):
+    async def _append(state: dict[str, Any]) -> dict[str, Any]:
+        n = len(state.get("messages") or [])
+        return {"messages": [HumanMessage(content=f"turn-{n}")], "artifacts": [f"a{n}"]}
+
+    builder = StateGraph(_ArtifactChannelState)
+    builder.add_node("append", _append)
+    builder.set_entry_point("append")
+    builder.set_finish_point("append")
+    return builder.compile(checkpointer=checkpointer)
+
+
+@pytest.mark.anyio
+async def test_rollback_restores_non_message_channels_via_fork_inheritance():
+    """Rollback overwrites only messages; sibling reducer channels must be
+    restored to their pre-run values by forking the pre-run checkpoint
+    (non-updated channels inherit from the parent). Locks in the load-bearing
+    assumption of the rollback design."""
+    checkpointer = InMemorySaver()
+    graph = _build_message_and_artifact_graph(checkpointer)
+    accessor = CheckpointStateAccessor.bind(graph, checkpointer, mode="full")
+    thread_config = {"configurable": {"thread_id": "thread-1"}}
+
+    await graph.ainvoke({}, thread_config)
+    rollback_point = await _capture_rollback_point(accessor, checkpointer, thread_config)
+    assert rollback_point is not None
+
+    await graph.ainvoke({}, thread_config)
+    cancelled_snapshot = await accessor.aget(thread_config)
+    assert cancelled_snapshot.values["artifacts"] == ["a0", "a1"]
+    assert [message.content for message in cancelled_snapshot.values["messages"]] == ["turn-0", "turn-1"]
+
+    await _rollback_to_pre_run_checkpoint(
+        accessor=accessor,
+        checkpointer=checkpointer,
+        thread_id="thread-1",
+        run_id="run-1",
+        rollback_point=rollback_point,
+        snapshot_capture_failed=False,
+    )
+
+    latest_snapshot = await accessor.aget(thread_config)
+    assert [message.content for message in latest_snapshot.values["messages"]] == ["turn-0"]
+    assert latest_snapshot.values["artifacts"] == ["a0"]
 
 
 @pytest.mark.anyio

@@ -49,6 +49,7 @@ from deerflow.models import create_chat_model
 from deerflow.runtime.checkpoint_mode import (
     INTERNAL_CHECKPOINT_MODE_KEY,
     freeze_checkpoint_channel_mode,
+    frozen_checkpoint_channel_mode,
     inject_checkpoint_mode,
 )
 from deerflow.skills.types import Skill
@@ -448,16 +449,25 @@ def _load_enabled_available_skills(available_skills: set[str] | None, *, app_con
 def make_lead_agent(config: RunnableConfig):
     """LangGraph graph factory; keep the signature compatible with LangGraph Server."""
     runtime_config = _get_runtime_config(config)
-    trusted_config = config.get("configurable", {}) or {}
     runtime_app_config = runtime_config.get("app_config")
-    if isinstance(runtime_app_config, AppConfig):
-        requested_mode = trusted_config.get(
+    if not isinstance(runtime_app_config, AppConfig):
+        runtime_app_config = get_app_config()
+    # Mode selection precedence, pinned by test_checkpoint_mode.py:
+    # - First freeze: the app config owns the process mode; a client-supplied
+    #   configurable key is ignored so a direct LangGraph request cannot
+    #   reconfigure (or crash) a fresh process.
+    # - Once frozen: an internally injected key (run worker / gateway) or the
+    #   app config must match the frozen mode; ``freeze_checkpoint_channel_mode``
+    #   fails closed on any mismatch, so neither a forged key nor a config.yaml
+    #   change can silently reconfigure the process.
+    frozen_mode = frozen_checkpoint_channel_mode()
+    if frozen_mode is None:
+        requested_mode = runtime_app_config.database.checkpoint_channel_mode
+    else:
+        requested_mode = (config.get("configurable", {}) or {}).get(
             INTERNAL_CHECKPOINT_MODE_KEY,
             runtime_app_config.database.checkpoint_channel_mode,
         )
-    else:
-        runtime_app_config = get_app_config()
-        requested_mode = runtime_app_config.database.checkpoint_channel_mode
     mode = freeze_checkpoint_channel_mode(requested_mode)
     inject_checkpoint_mode(config, mode)
     return _make_lead_agent(config, app_config=runtime_app_config)

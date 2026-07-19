@@ -1472,8 +1472,9 @@ class TestThreadQueries:
             self._make_mock_snapshot(cp1),
             self._make_mock_snapshot(cp3_no_ts),
         ]
-        checkpoint_by_id = {checkpoint.config["configurable"]["checkpoint_id"]: checkpoint for checkpoint in (cp1, cp2, cp3_no_ts)}
-        mock_checkpointer.get_tuple.side_effect = lambda config: checkpoint_by_id[config["configurable"]["checkpoint_id"]]
+        # get_thread collects pending_writes via one checkpointer.list walk
+        # instead of a get_tuple round-trip per checkpoint.
+        mock_checkpointer.list.return_value = [cp1, cp2, cp3_no_ts]
         accessor = MagicMock()
         accessor.history.return_value = snapshots
 

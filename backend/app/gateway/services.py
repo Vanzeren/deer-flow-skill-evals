@@ -587,6 +587,28 @@ def build_checkpoint_state_mutation_accessor(
     return accessor, config
 
 
+# Cache of factory-built accessor graphs. Accessor operations (aget_state /
+# aupdate_state) never execute graph nodes or middleware, so per-request
+# variations (user, model, skills) cannot affect materialization semantics;
+# the compiled graph is stable per (assistant_id, mode). The factory identity
+# is re-validated on every call so patched/plugged factories take effect
+# immediately. Bounded: cleared when too many distinct assistants appear.
+_STATE_ACCESSOR_GRAPH_CACHE_MAX = 64
+_state_accessor_graph_cache: dict[tuple[str | None, str], tuple[Any, Any]] = {}
+
+
+def _state_accessor_graph(agent_factory: Any, assistant_id: str | None, mode: str, config: dict[str, Any]) -> Any:
+    key = (assistant_id, mode)
+    cached = _state_accessor_graph_cache.get(key)
+    if cached is not None and cached[0] is agent_factory:
+        return cached[1]
+    if len(_state_accessor_graph_cache) >= _STATE_ACCESSOR_GRAPH_CACHE_MAX:
+        _state_accessor_graph_cache.clear()
+    graph = agent_factory(config=config)
+    _state_accessor_graph_cache[key] = (agent_factory, graph)
+    return graph
+
+
 def build_checkpoint_state_accessor(
     request: Request,
     *,
@@ -607,7 +629,7 @@ def build_checkpoint_state_accessor(
     inject_checkpoint_mode(config, ctx.checkpoint_channel_mode)
 
     agent_factory = resolve_agent_factory(assistant_id)
-    graph = agent_factory(config=config)
+    graph = _state_accessor_graph(agent_factory, assistant_id, ctx.checkpoint_channel_mode, config)
     accessor = CheckpointStateAccessor.bind(
         graph,
         ctx.checkpointer,

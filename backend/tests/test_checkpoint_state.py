@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from copy import deepcopy
 from types import SimpleNamespace
-from typing import Any
+from typing import Annotated, Any, TypedDict
 
 import pytest
+from langchain_core.messages import AnyMessage
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph.message import add_messages
 
 from deerflow.runtime import CheckpointStateAccessor
 from deerflow.runtime.checkpoint_mode import CHECKPOINT_MODE_METADATA_KEY, INTERNAL_CHECKPOINT_MODE_KEY
@@ -36,9 +39,11 @@ class FakeGraph:
         self.calls.append(("get", config))
         return SimpleNamespace(values={"messages": ["sync"]})
 
-    def get_state_history(self, config: dict[str, Any]):
-        self.calls.append(("history", config))
+    def get_state_history(self, config: dict[str, Any], *, limit: int | None = None):
+        self.calls.append(("history", config, limit))
         for index in range(4):
+            if limit is not None and self.sync_history_yields >= limit:
+                return
             self.sync_history_yields += 1
             yield SimpleNamespace(values={"index": index})
 
@@ -50,9 +55,11 @@ class FakeGraph:
         self.calls.append(("aget", config))
         return SimpleNamespace(values={"messages": ["async"]})
 
-    async def aget_state_history(self, config: dict[str, Any]):
-        self.calls.append(("ahistory", config))
+    async def aget_state_history(self, config: dict[str, Any], *, limit: int | None = None):
+        self.calls.append(("ahistory", config, limit))
         for index in range(4):
+            if limit is not None and self.async_history_yields >= limit:
+                return
             self.async_history_yields += 1
             yield SimpleNamespace(values={"index": index})
 
@@ -139,7 +146,8 @@ def test_sync_history_zero_limit_guards_without_consuming_a_snapshot() -> None:
     config = {"configurable": {"thread_id": "thread-sync-zero"}}
 
     assert accessor.history(config, limit=0) == []
-    assert len(saver.sync_configs) == 1
+    # The read-side gate folds onto the returned snapshot: no standalone tuple fetch.
+    assert len(saver.sync_configs) == 0
     assert graph.sync_history_yields == 0
 
 
@@ -151,12 +159,14 @@ async def test_async_history_zero_limit_guards_without_consuming_a_snapshot() ->
     config = {"configurable": {"thread_id": "thread-async-zero"}}
 
     assert await accessor.ahistory(config, limit=0) == []
-    assert len(saver.async_configs) == 1
+    assert len(saver.async_configs) == 0
     assert graph.async_history_yields == 0
 
 
 @pytest.mark.anyio
-async def test_full_accessor_checks_compatibility_before_all_sync_and_async_operations() -> None:
+async def test_full_accessor_gates_writes_and_checks_reads_on_the_returned_snapshot() -> None:
+    """Full mode: only writes pay the pre-write tuple fetch; reads check the
+    marker on the materialized snapshot's metadata instead."""
     graph = FakeGraph()
     saver = FakeCheckpointer()
     accessor = CheckpointStateAccessor.bind(graph, saver)
@@ -169,9 +179,128 @@ async def test_full_accessor_checks_compatibility_before_all_sync_and_async_oper
     await accessor.ahistory(config, limit=1)
     await accessor.aupdate(config, {}, as_node=None)
 
-    assert len(saver.sync_configs) == 3
-    assert len(saver.async_configs) == 3
+    assert len(saver.sync_configs) == 1
+    assert len(saver.async_configs) == 1
     for prepared in [*saver.sync_configs, *saver.async_configs]:
         assert prepared["configurable"][INTERNAL_CHECKPOINT_MODE_KEY] == "full"
         assert CHECKPOINT_MODE_METADATA_KEY not in prepared["metadata"]
     assert config == {"configurable": {"thread_id": "thread-full"}}
+
+
+@pytest.mark.anyio
+async def test_full_accessor_raises_when_the_returned_snapshot_is_delta_marked() -> None:
+    """A full-mode accessor must fail closed on a delta checkpoint, detected
+    via the returned snapshot metadata (no pre-read tuple fetch)."""
+    from deerflow.runtime.checkpoint_mode import CheckpointModeMismatchError
+
+    graph = FakeGraph()
+    saver = FakeCheckpointer()
+    accessor = CheckpointStateAccessor.bind(graph, saver, mode="full")
+    config = {"configurable": {"thread_id": "thread-delta-marked"}}
+    graph.get_state = lambda _config: SimpleNamespace(values={}, metadata={CHECKPOINT_MODE_METADATA_KEY: "delta"})
+
+    with pytest.raises(CheckpointModeMismatchError, match="requires delta mode"):
+        accessor.get(config)
+    assert len(saver.sync_configs) == 0
+
+    async def _delta_history(_config, *, limit=None):
+        yield SimpleNamespace(values={"index": 0}, metadata={})
+        yield SimpleNamespace(values={"index": 1}, metadata={CHECKPOINT_MODE_METADATA_KEY: "delta"})
+
+    graph.aget_state_history = _delta_history
+    with pytest.raises(CheckpointModeMismatchError, match="requires delta mode"):
+        await accessor.ahistory(config)
+    assert len(saver.async_configs) == 0
+
+
+@pytest.mark.anyio
+async def test_full_accessor_writes_still_check_compatibility_before_writing() -> None:
+    """Writes cannot be un-applied, so the pre-write tuple fetch stays."""
+    from deerflow.runtime.checkpoint_mode import CheckpointModeMismatchError
+
+    graph = FakeGraph()
+
+    class DeltaMarkedSaver(FakeCheckpointer):
+        async def aget_tuple(self, config):
+            self.async_configs.append(config)
+            return SimpleNamespace(metadata={CHECKPOINT_MODE_METADATA_KEY: "delta"})
+
+    saver = DeltaMarkedSaver()
+    accessor = CheckpointStateAccessor.bind(graph, saver, mode="full")
+    config = {"configurable": {"thread_id": "thread-delta-write"}}
+
+    with pytest.raises(CheckpointModeMismatchError, match="requires delta mode"):
+        await accessor.aupdate(config, {"messages": []}, as_node=None)
+    assert len(saver.async_configs) == 1
+    assert graph.calls == []
+
+
+class _CountingSaver(InMemorySaver):
+    """InMemorySaver that counts checkpoint round-trips."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.aget_tuple_calls = 0
+        self.alist_limits: list[int | None] = []
+
+    async def aget_tuple(self, config):
+        self.aget_tuple_calls += 1
+        return await super().aget_tuple(config)
+
+    async def alist(self, config, *, filter=None, before=None, limit=None):
+        self.alist_limits.append(limit)
+        async for item in super().alist(config, filter=filter, before=before, limit=limit):
+            yield item
+
+
+def _build_counting_graph(saver):
+    from langchain_core.messages import HumanMessage
+    from langgraph.graph import StateGraph
+
+    class _State(TypedDict):
+        messages: Annotated[list[AnyMessage], add_messages]
+
+    async def _append(state):
+        return {"messages": [HumanMessage(content=f"turn-{len(state.get('messages') or [])}")]}
+
+    builder = StateGraph(_State)
+    builder.add_node("append", _append)
+    builder.set_entry_point("append")
+    builder.set_finish_point("append")
+    return builder.compile(checkpointer=saver)
+
+
+@pytest.mark.anyio
+async def test_ahistory_pushes_limit_into_alist_and_reads_each_snapshot_once() -> None:
+    """The history limit must reach ``checkpointer.alist`` (SQL LIMIT), and the
+    read-side compat gate must not add a standalone tuple fetch per call."""
+    saver = _CountingSaver()
+    graph = _build_counting_graph(saver)
+    accessor = CheckpointStateAccessor.bind(graph, saver, mode="full")
+    config = {"configurable": {"thread_id": "thread-counted"}}
+    for _ in range(4):
+        await graph.ainvoke({}, config)
+
+    saver.aget_tuple_calls = 0
+    history = await accessor.ahistory(config, limit=2)
+
+    assert len(history) == 2
+    assert saver.alist_limits[-1] == 2
+    # get_state_history walks via alist only; no aget_tuple in the read path.
+    assert saver.aget_tuple_calls == 0
+
+
+@pytest.mark.anyio
+async def test_aget_fetches_the_checkpoint_exactly_once_in_full_mode() -> None:
+    """Full-mode reads: one fetch inside aget_state; the folded gate adds none."""
+    saver = _CountingSaver()
+    graph = _build_counting_graph(saver)
+    accessor = CheckpointStateAccessor.bind(graph, saver, mode="full")
+    config = {"configurable": {"thread_id": "thread-counted-get"}}
+    await graph.ainvoke({}, config)
+
+    saver.aget_tuple_calls = 0
+    snapshot = await accessor.aget(config)
+
+    assert [message.content for message in snapshot.values["messages"]] == ["turn-0"]
+    assert saver.aget_tuple_calls == 1

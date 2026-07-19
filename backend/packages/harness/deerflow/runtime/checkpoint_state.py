@@ -25,6 +25,7 @@ from deerflow.runtime.checkpoint_mode import (
     aensure_checkpoint_mode_compatible,
     ensure_checkpoint_mode_compatible,
     inject_checkpoint_mode,
+    raise_if_snapshot_incompatible,
 )
 
 
@@ -129,21 +130,23 @@ class CheckpointStateAccessor:
 
     def get(self, config: dict[str, Any]) -> Any:
         prepared = self._prepare_config(config)
-        ensure_checkpoint_mode_compatible(self.checkpointer, prepared, self.mode)
-        return self.graph.get_state(prepared)
+        snapshot = self.graph.get_state(prepared)
+        raise_if_snapshot_incompatible(snapshot, self.mode)
+        return snapshot
 
     async def aget(self, config: dict[str, Any]) -> Any:
         prepared = self._prepare_config(config)
-        await aensure_checkpoint_mode_compatible(self.checkpointer, prepared, self.mode)
-        return await self.graph.aget_state(prepared)
+        snapshot = await self.graph.aget_state(prepared)
+        raise_if_snapshot_incompatible(snapshot, self.mode)
+        return snapshot
 
     def history(self, config: dict[str, Any], *, limit: int | None = None) -> list[Any]:
         prepared = self._prepare_config(config)
-        ensure_checkpoint_mode_compatible(self.checkpointer, prepared, self.mode)
         if limit is not None and limit <= 0:
             return []
         result = []
-        for snapshot in self.graph.get_state_history(prepared):
+        for snapshot in self.graph.get_state_history(prepared, limit=limit):
+            raise_if_snapshot_incompatible(snapshot, self.mode)
             result.append(snapshot)
             if limit is not None and len(result) >= limit:
                 break
@@ -151,11 +154,11 @@ class CheckpointStateAccessor:
 
     async def ahistory(self, config: dict[str, Any], *, limit: int | None = None) -> list[Any]:
         prepared = self._prepare_config(config)
-        await aensure_checkpoint_mode_compatible(self.checkpointer, prepared, self.mode)
         if limit is not None and limit <= 0:
             return []
         result = []
-        async for snapshot in self.graph.aget_state_history(prepared):
+        async for snapshot in self.graph.aget_state_history(prepared, limit=limit):
+            raise_if_snapshot_incompatible(snapshot, self.mode)
             result.append(snapshot)
             if limit is not None and len(result) >= limit:
                 break

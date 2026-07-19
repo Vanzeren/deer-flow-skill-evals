@@ -578,6 +578,14 @@ class DeerFlowClient:
             checkpointer,
             mode=self._checkpoint_channel_mode,
         )
+        # One streaming walk collects pending_writes per checkpoint id; a
+        # per-snapshot get_tuple would cost one round-trip per checkpoint.
+        pending_writes_by_checkpoint: dict[str, list] = {}
+        for raw_tuple in checkpointer.list(config):
+            raw_checkpoint_id = raw_tuple.config.get("configurable", {}).get("checkpoint_id")
+            if raw_checkpoint_id:
+                pending_writes_by_checkpoint[raw_checkpoint_id] = list(getattr(raw_tuple, "pending_writes", ()) or ())
+
         checkpoints = []
         for snapshot in accessor.history(config):
             values = dict(snapshot.values or {})
@@ -588,8 +596,7 @@ class DeerFlowClient:
             configurable = snapshot_config.get("configurable", {})
             parent_config = snapshot.parent_config or {}
             parent_configurable = parent_config.get("configurable", {})
-            raw_tuple = checkpointer.get_tuple(snapshot_config)
-            pending_writes = getattr(raw_tuple, "pending_writes", ()) or () if raw_tuple is not None else ()
+            pending_writes = pending_writes_by_checkpoint.get(configurable.get("checkpoint_id"), [])
 
             checkpoints.append(
                 {

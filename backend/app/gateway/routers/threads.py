@@ -422,16 +422,36 @@ def _delete_thread_data(thread_id: str, paths: Paths | None = None, *, user_id: 
     return ThreadDeleteResponse(success=True, message=f"Deleted local thread data for {thread_id}")
 
 
-def _derive_thread_status(snapshot: Any, *, pending_writes: list[Any] | tuple[Any, ...] = ()) -> str:
-    """Derive thread status from materialized tasks and raw pending errors."""
+async def _fetch_raw_pending_writes(checkpointer: Any, config: dict[str, Any]) -> list[Any]:
+    """Fetch pending writes attached to a specific checkpoint.
+
+    Snapshot ``tasks`` only reflect writes that were pending while a task was
+    still scheduled; writes attached to the latest checkpoint afterwards
+    (rollback reattachment, worker error fallback) never surface there, so the
+    status derivation needs one raw tuple fetch on the resolved checkpoint.
+    """
+    raw_tuple = await checkpointer.aget_tuple(config)
+    if raw_tuple is None:
+        return []
+    return list(getattr(raw_tuple, "pending_writes", ()) or ())
+
+
+def _derive_thread_status(snapshot: Any, pending_writes: list[Any]) -> str:
+    """Derive thread status from the materialized snapshot plus the raw
+    pending writes attached to the resolved checkpoint."""
     if snapshot is None:
         return "idle"
 
-    for pending_write in pending_writes:
-        if len(pending_write) >= 2 and pending_write[1] == "__error__":
+    for write in pending_writes:
+        if isinstance(write, (list, tuple)) and len(write) >= 2 and write[1] == "__error__":
             return "error"
 
-    if getattr(snapshot, "tasks", None):
+    tasks = getattr(snapshot, "tasks", None) or ()
+    for task in tasks:
+        if getattr(task, "error", None) is not None:
+            return "error"
+
+    if tasks:
         return "interrupted"
 
     return "idle"
@@ -808,14 +828,13 @@ async def get_thread(thread_id: str, request: Request) -> ThreadResponse:
 
     try:
         snapshot = await accessor.aget(config)
-        snapshot_config = snapshot.config or {}
-        checkpoint_id = snapshot_config.get("configurable", {}).get("checkpoint_id")
-        checkpoint_tuple = await checkpointer.aget_tuple(snapshot_config) if checkpoint_id else None
+        checkpoint_id = (snapshot.config or {}).get("configurable", {}).get("checkpoint_id")
+        pending_writes = await _fetch_raw_pending_writes(checkpointer, snapshot.config) if checkpoint_id else []
     except Exception:
         logger.exception("Failed to get checkpoint for thread %s", sanitize_log_param(thread_id))
         raise HTTPException(status_code=500, detail="Failed to get thread")
 
-    if record is None and checkpoint_tuple is None:
+    if record is None and not checkpoint_id:
         raise HTTPException(status_code=404, detail=f"Thread {thread_id} not found")
 
     metadata = snapshot.metadata or {}
@@ -827,8 +846,7 @@ async def get_thread(thread_id: str, request: Request) -> ThreadResponse:
             "updated_at": coerce_iso(metadata.get("updated_at", snapshot.created_at or metadata.get("created_at", ""))),
             "metadata": {key: value for key, value in metadata.items() if key not in ("created_at", "updated_at", "step", "source", "writes", "parents")},
         }
-    pending_writes = getattr(checkpoint_tuple, "pending_writes", ()) or () if checkpoint_tuple is not None else ()
-    status = _derive_thread_status(snapshot, pending_writes=pending_writes) if checkpoint_id else record.get("status", "idle")
+    status = _derive_thread_status(snapshot, pending_writes) if checkpoint_id else record.get("status", "idle")
 
     return ThreadResponse(
         thread_id=thread_id,
