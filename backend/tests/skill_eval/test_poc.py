@@ -333,6 +333,7 @@ def test_quality_mode_quick_skips_full_quality(
     assert summary.quality_results == []
     assert len(summary.quick_results) == 4
     assert exit_code == 0
+    assert all("dimension thresholds" not in check.name for check in summary.acceptance)
 
 
 def test_quick_turn_missing_invalidates_evaluation(

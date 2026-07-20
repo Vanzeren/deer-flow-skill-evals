@@ -318,7 +318,7 @@ def run_poc(config: PocConfig) -> tuple[PocSummary, int]:
     acceptance = _acceptance_checks(
         routing_metrics,
         quality_passed_cases=quality_passed_cases,
-        include_quality=not config.smoke,
+        include_quality=not config.smoke and config.quality_mode in {"full", "both"},
         quick_passed_cases=quick_passed_cases,
         include_quick=not config.smoke and config.quality_mode in {"quick", "both"},
     )
