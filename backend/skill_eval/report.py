@@ -190,6 +190,46 @@ class QuickCaseResult(BaseModel):
     evidence_log: str
 
 
+_QUICK_FAILURE_CATEGORIES: tuple[str, ...] = (
+    "infrastructure_error",
+    "judge_failure",
+    "quick_turn_missing",
+    "route_mismatch",
+    "not_applicable_none_case",
+)
+
+
+class QuickMetrics(BaseModel):
+    planned_runs: int
+    judged_cases: int
+    passed_cases: int
+    pass_rate: float
+    mean_turn_quality: float | None
+    turn_quality_distribution: dict[str, int]
+    failure_buckets: dict[str, int]
+
+
+def summarize_quick(results: Sequence[QuickCaseResult]) -> QuickMetrics:
+    judged = [result for result in results if result.judgment is not None]
+    passed = sum(result.quality_passed for result in judged)
+    distribution = {str(score): 0 for score in range(5)}
+    for result in judged:
+        distribution[str(result.turn_quality)] += 1
+    buckets = {category: 0 for category in _QUICK_FAILURE_CATEGORIES}
+    for result in results:
+        if result.category is not None:
+            buckets[result.category] += 1
+    return QuickMetrics(
+        planned_runs=len(results),
+        judged_cases=len(judged),
+        passed_cases=passed,
+        pass_rate=passed / len(judged) if judged else 0.0,
+        mean_turn_quality=(sum(result.turn_quality or 0 for result in judged) / len(judged)) if judged else None,
+        turn_quality_distribution=distribution,
+        failure_buckets=buckets,
+    )
+
+
 class AcceptanceCheck(BaseModel):
     name: str
     actual: float | int
@@ -215,6 +255,7 @@ class PocSummary(BaseModel):
     quick_turn_missing: int = 0
     quick_judge_failures: int = 0
     quick_infrastructure_failures: int = 0
+    quick_metrics: QuickMetrics | None = None
 
 
 def extract_quality_results(log: EvalLog) -> list[QualityCaseResult]:
@@ -384,12 +425,22 @@ def render_poc_markdown(summary: PocSummary) -> str:
 
     lines.extend(["", "## Quick quality (first turn after skill load)", ""])
     if summary.quick_results:
-        judged = [result for result in summary.quick_results if result.judgment is not None]
-        lines.append(f"- Passed: {summary.quick_passed_cases}/{len(summary.quick_results)}")
-        lines.append(f"- quick_turn_missing: {summary.quick_turn_missing}; infrastructure: {summary.quick_infrastructure_failures}; judge failures: {summary.quick_judge_failures}")
-        if judged:
-            mean_quality = sum(result.turn_quality or 0 for result in judged) / len(judged)
-            lines.append(f"- Mean turn quality: {mean_quality:.2f}")
+        if summary.quick_metrics is not None:
+            metrics = summary.quick_metrics
+            lines.append(f"- Passed: {metrics.passed_cases}/{metrics.judged_cases} judged ({metrics.pass_rate:.1%}) across {metrics.planned_runs} planned runs")
+            mean_quality = f"{metrics.mean_turn_quality:.2f}" if metrics.mean_turn_quality is not None else "n/a"
+            lines.append(f"- Mean turn quality: {mean_quality}")
+            distribution = ", ".join(f"{score}: {metrics.turn_quality_distribution.get(score, 0)}" for score in ("0", "1", "2", "3", "4"))
+            lines.append(f"- Turn quality distribution (0-4): {distribution}")
+            buckets = "; ".join(f"{category}: {metrics.failure_buckets.get(category, 0)}" for category in _QUICK_FAILURE_CATEGORIES)
+            lines.append(f"- Failure buckets: {buckets}")
+        else:
+            judged = [result for result in summary.quick_results if result.judgment is not None]
+            lines.append(f"- Passed: {summary.quick_passed_cases}/{len(summary.quick_results)}")
+            lines.append(f"- quick_turn_missing: {summary.quick_turn_missing}; infrastructure: {summary.quick_infrastructure_failures}; judge failures: {summary.quick_judge_failures}")
+            if judged:
+                mean_quality = sum(result.turn_quality or 0 for result in judged) / len(judged)
+                lines.append(f"- Mean turn quality: {mean_quality:.2f}")
         for result in summary.quick_results:
             if result.judgment is not None:
                 lines.append(f"- `{result.case_id}`: turn_quality={result.turn_quality}, passed={result.quality_passed}, rationale: {result.judgment.rationale}")

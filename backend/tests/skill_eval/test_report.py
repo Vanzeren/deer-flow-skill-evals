@@ -20,6 +20,7 @@ from skill_eval.report import (
     extract_routing_results,
     render_poc_markdown,
     routing_acceptance,
+    summarize_quick,
     summarize_routing,
 )
 from skill_eval.routing import RouteEvidence
@@ -432,6 +433,94 @@ def make_poc_summary() -> PocSummary:
         infrastructure_failures=0,
         acceptance=[],
     )
+
+
+def quick_result(case_id, *, turn_quality=None, passed=False, category=None):
+    judgment = None
+    if category is None:
+        judgment = QuickJudgment(
+            turn_quality=turn_quality,
+            fatal_error=False,
+            rationale=f"rationale for {case_id}",
+            evidence_references=["tool_chain[0]"],
+        )
+    return QuickCaseResult(
+        case_id=case_id,
+        observed_route="systematic-literature-review",
+        judgment=judgment,
+        category=category,
+        detail=category,
+        turn_quality=turn_quality,
+        quality_passed=passed,
+        evidence_log="logs/quick.eval",
+    )
+
+
+def test_summarize_quick_counts_judged_pass_rate_distribution_and_buckets():
+    results = [
+        quick_result("a", turn_quality=3, passed=True),
+        quick_result("b", turn_quality=4, passed=True),
+        quick_result("c", turn_quality=2, passed=False),
+        quick_result("d", category="quick_turn_missing"),
+        quick_result("e", category="route_mismatch"),
+        quick_result("f", category="not_applicable_none_case"),
+    ]
+
+    metrics = summarize_quick(results)
+
+    assert metrics.planned_runs == 6
+    assert metrics.judged_cases == 3
+    assert metrics.passed_cases == 2
+    assert metrics.pass_rate == pytest.approx(2 / 3)
+    assert metrics.mean_turn_quality == pytest.approx(3.0)
+    assert metrics.turn_quality_distribution == {"0": 0, "1": 0, "2": 1, "3": 1, "4": 1}
+    assert metrics.failure_buckets == {
+        "infrastructure_error": 0,
+        "judge_failure": 0,
+        "quick_turn_missing": 1,
+        "route_mismatch": 1,
+        "not_applicable_none_case": 1,
+    }
+
+
+def test_summarize_quick_handles_zero_judged_cases():
+    metrics = summarize_quick([quick_result("a", category="route_mismatch")])
+
+    assert metrics.planned_runs == 1
+    assert metrics.judged_cases == 0
+    assert metrics.passed_cases == 0
+    assert metrics.pass_rate == 0.0
+    assert metrics.mean_turn_quality is None
+    assert metrics.turn_quality_distribution == {"0": 0, "1": 0, "2": 0, "3": 0, "4": 0}
+    assert metrics.failure_buckets["route_mismatch"] == 1
+
+
+def test_markdown_renders_quick_metrics_when_present():
+    summary = make_poc_summary()
+    quick_results = [
+        quick_result("a", turn_quality=3, passed=True),
+        quick_result("b", category="quick_turn_missing"),
+    ]
+    summary = summary.model_copy(
+        update={
+            "quality_mode": "both",
+            "quick_results": quick_results,
+            "quick_passed_cases": 1,
+            "quick_turn_missing": 1,
+            "quick_metrics": summarize_quick(quick_results),
+        }
+    )
+
+    markdown = render_poc_markdown(summary)
+
+    assert "## Quick quality (first turn after skill load)" in markdown
+    assert "1/1 judged" in markdown
+    assert "100.0%" in markdown
+    assert "Mean turn quality: 3.00" in markdown
+    assert "3: 1" in markdown
+    assert "quick_turn_missing: 1" in markdown
+    assert "not_applicable_none_case: 0" in markdown
+    assert "turn_quality=3" in markdown
 
 
 def test_markdown_includes_quick_section():

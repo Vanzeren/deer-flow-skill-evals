@@ -29,6 +29,7 @@ from skill_eval.report import (
     extract_routing_results,
     render_poc_markdown,
     routing_acceptance,
+    summarize_quick,
     summarize_routing,
 )
 
@@ -312,6 +313,8 @@ def run_poc(config: PocConfig) -> tuple[PocSummary, int]:
     judge_failures = sum(result.judge_failure is not None for result in quality_results)
     infrastructure_failures = sum(result.infrastructure_error is not None for result in quality_results)
     quick_passed_cases = sum(result.quality_passed for result in quick_results)
+    quick_judgeable = sum(result.judgment is not None for result in quick_results)
+    quick_metrics = summarize_quick(quick_results) if quick_log is not None else None
     quick_turn_missing = sum(result.category == "quick_turn_missing" for result in quick_results)
     quick_judge_failures = sum(result.category == "judge_failure" for result in quick_results)
     quick_infrastructure_failures = sum(result.category == "infrastructure_error" for result in quick_results)
@@ -320,6 +323,7 @@ def run_poc(config: PocConfig) -> tuple[PocSummary, int]:
         quality_passed_cases=quality_passed_cases,
         include_quality=not config.smoke and config.quality_mode in {"full", "both"},
         quick_passed_cases=quick_passed_cases,
+        quick_judgeable_cases=quick_judgeable,
         include_quick=not config.smoke and config.quality_mode in {"quick", "both"},
     )
     summary = PocSummary(
@@ -337,6 +341,7 @@ def run_poc(config: PocConfig) -> tuple[PocSummary, int]:
         quick_turn_missing=quick_turn_missing,
         quick_judge_failures=quick_judge_failures,
         quick_infrastructure_failures=quick_infrastructure_failures,
+        quick_metrics=quick_metrics,
         acceptance=acceptance,
         errors=errors,
     )
@@ -357,6 +362,7 @@ def _acceptance_checks(
     quality_passed_cases: int,
     include_quality: bool,
     quick_passed_cases: int = 0,
+    quick_judgeable_cases: int = 0,
     include_quick: bool = False,
 ) -> list[AcceptanceCheck]:
     checks = [
@@ -389,12 +395,13 @@ def _acceptance_checks(
             )
         )
     if include_quick:
+        pass_rate = quick_passed_cases / quick_judgeable_cases if quick_judgeable_cases else 0.0
         checks.append(
             AcceptanceCheck(
-                name="quick quality cases passing turn threshold",
-                actual=quick_passed_cases,
-                threshold=">= 3 of 4",
-                passed=quick_passed_cases >= 3,
+                name="quick quality pass rate of judgeable cases",
+                actual=round(pass_rate, 3),
+                threshold=">= 75% of judgeable",
+                passed=quick_judgeable_cases == 0 or pass_rate >= 0.75,
             )
         )
     return checks
@@ -418,7 +425,8 @@ def exit_code_for(summary: PocSummary) -> int:
     if evaluation_invalid:
         return 2
     full_quality_passed = full_quality_expected == 0 or summary.quality_passed_cases >= 3
-    quick_passed = quick_expected == 0 or summary.mode == "smoke" or summary.quick_passed_cases >= 3
+    quick_judgeable = sum(result.judgment is not None for result in summary.quick_results)
+    quick_passed = quick_expected == 0 or summary.mode == "smoke" or quick_judgeable == 0 or summary.quick_passed_cases / quick_judgeable >= 0.75
     return 0 if routing_acceptance(summary.routing) and full_quality_passed and quick_passed else 1
 
 

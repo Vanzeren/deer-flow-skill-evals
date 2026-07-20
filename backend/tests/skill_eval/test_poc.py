@@ -226,6 +226,12 @@ def test_run_poc_calls_routing_three_epochs_and_quality_one(
     assert len(calls) == 3
     assert summary.quick_passed_cases == 3
     assert len(summary.quick_results) == 4
+    quick_check = next(check for check in summary.acceptance if "quick" in check.name)
+    assert quick_check.threshold == ">= 75% of judgeable"
+    assert quick_check.passed is True
+    assert summary.quick_metrics is not None
+    assert summary.quick_metrics.judged_cases == 3
+    assert summary.quick_metrics.passed_cases == 3
     assert summary.routing.planned_runs == 60
     assert (valid_config.output_dir / summary.run_id / "summary.json").exists()
     assert (valid_config.output_dir / summary.run_id / "summary.md").exists()
@@ -360,6 +366,35 @@ def test_quick_turn_missing_invalidates_evaluation(
 
     assert exit_code_for(summary) == 2
     assert summary.quick_turn_missing == 1
+
+
+def test_quick_gate_fails_below_75_percent_of_judgeable(
+    monkeypatch,
+    valid_config,
+    preflight_record,
+):
+    cases = read_routing_cases(valid_config.case_file)
+    quality_cases = [case for case in cases if "quality" in case.tags]
+    quick = quick_log(quality_cases)
+    judged_sample = next(sample for sample in quick.samples if "quick_judgment" in (sample.scores["quick_turn_scorer"].metadata or {}))
+    judged_sample.scores["quick_turn_scorer"].metadata["quality_passed"] = False
+    logs = [routing_log(cases), quick, quality_log(quality_cases)]
+    monkeypatch.setattr(
+        "skill_eval.poc.inspect_eval",
+        lambda *args, **kwargs: [logs.pop(0)],
+    )
+    monkeypatch.setattr("skill_eval.poc.preflight", lambda config: preflight_record)
+
+    summary, _ = run_poc(valid_config)
+
+    assert summary.quick_metrics is not None
+    assert summary.quick_metrics.judged_cases == 3
+    assert summary.quick_metrics.passed_cases == 2
+    assert summary.quick_metrics.pass_rate == pytest.approx(2 / 3)
+    quick_check = next(check for check in summary.acceptance if "quick" in check.name)
+    assert quick_check.threshold == ">= 75% of judgeable"
+    assert quick_check.passed is False
+    assert exit_code_for(summary) == 1
 
 
 def test_parser_defaults_and_accepts_quality_mode():
