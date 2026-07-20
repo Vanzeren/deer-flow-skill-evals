@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
-from inspect_ai.scorer import CORRECT, Score
+from inspect_ai.scorer import CORRECT, NOANSWER, Score
 
 from skill_eval.case_schema import CANDIDATE_SKILLS
 from skill_eval.dataset_loader import read_routing_cases
@@ -9,6 +9,7 @@ from skill_eval.poc import (
     PocConfig,
     PocConfigurationError,
     PreflightRecord,
+    _build_parser,
     exit_code_for,
     preflight,
     run_poc,
@@ -122,6 +123,43 @@ def quality_log(cases):
     return SimpleNamespace(samples=samples, location="logs/quality.eval")
 
 
+def quick_log(cases):
+    samples = []
+    for case in cases:
+        if case.expected_route == "none":
+            quick_score = Score(
+                value=NOANSWER,
+                explanation="quick turn not applicable to none-expected case",
+                metadata={"not_applicable_none_case": True, "case_id": case.id},
+            )
+        else:
+            quick_score = Score(
+                value=CORRECT,
+                metadata={
+                    "case_id": case.id,
+                    "quick_judgment": {
+                        "turn_quality": 3,
+                        "fatal_error": False,
+                        "rationale": "Turn follows the loaded skill.",
+                        "evidence_references": ["tool_chain[0]", "quick_turn"],
+                    },
+                    "quality_passed": True,
+                },
+            )
+        samples.append(
+            SimpleNamespace(
+                id=case.id,
+                epoch=1,
+                metadata={"case": case.model_dump()},
+                scores={
+                    "routing_scorer": routing_score(case),
+                    "quick_turn_scorer": quick_score,
+                },
+            )
+        )
+    return SimpleNamespace(samples=samples, location="logs/quick.eval")
+
+
 def test_preflight_requires_both_model_inputs(monkeypatch):
     monkeypatch.delenv("AGENT_MODEL", raising=False)
     monkeypatch.delenv("JUDGE_MODEL", raising=False)
@@ -168,7 +206,8 @@ def test_run_poc_calls_routing_three_epochs_and_quality_one(
     preflight_record,
 ):
     cases = read_routing_cases(valid_config.case_file)
-    logs = [routing_log(cases), quality_log([case for case in cases if "quality" in case.tags])]
+    quality_cases = [case for case in cases if "quality" in case.tags]
+    logs = [routing_log(cases), quick_log(quality_cases), quality_log(quality_cases)]
     calls = []
 
     def fake_eval(*args, **kwargs):
@@ -184,6 +223,9 @@ def test_run_poc_calls_routing_three_epochs_and_quality_one(
     assert calls[1][1]["epochs"] == 1
     assert all(call[1]["max_samples"] == 1 for call in calls)
     assert exit_code == 0
+    assert len(calls) == 3
+    assert summary.quick_passed_cases == 3
+    assert len(summary.quick_results) == 4
     assert summary.routing.planned_runs == 60
     assert (valid_config.output_dir / summary.run_id / "summary.json").exists()
     assert (valid_config.output_dir / summary.run_id / "summary.md").exists()
@@ -201,21 +243,24 @@ def test_smoke_selects_fixed_three_cases_and_skips_quality(
     }
     cases = [case for case in read_routing_cases(valid_config.case_file) if case.id in smoke_ids]
     calls = []
+    logs = [routing_log(cases, epochs=1), quick_log(cases)]
 
     def fake_eval(task, **kwargs):
         calls.append((task, kwargs))
-        return [routing_log(cases, epochs=1)]
+        return [logs.pop(0)]
 
     monkeypatch.setattr("skill_eval.poc.inspect_eval", fake_eval)
     monkeypatch.setattr("skill_eval.poc.preflight", lambda config: preflight_record)
 
     summary, exit_code = run_poc(valid_config.model_copy(update={"smoke": True}))
 
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert calls[0][1]["epochs"] == 1
     assert {sample.id for sample in calls[0][0].dataset} == smoke_ids
     assert summary.mode == "smoke"
     assert summary.quality_results == []
+    assert len(summary.quick_results) == 3
+    assert summary.quick_passed_cases == 2
     assert exit_code == 0
 
 
@@ -227,7 +272,8 @@ def test_incomplete_eval_log_returns_invalid_exit(
     cases = read_routing_cases(valid_config.case_file)
     incomplete = routing_log(cases)
     incomplete.samples.pop()
-    logs = [incomplete, quality_log([case for case in cases if "quality" in case.tags])]
+    quality_cases = [case for case in cases if "quality" in case.tags]
+    logs = [incomplete, quick_log(quality_cases), quality_log(quality_cases)]
     monkeypatch.setattr(
         "skill_eval.poc.inspect_eval",
         lambda *args, **kwargs: [logs.pop(0)],
@@ -249,7 +295,8 @@ def test_exit_codes_separate_quality_failure_and_invalid_evaluation(
     quality = quality_log([case for case in cases if "quality" in case.tags])
     quality.samples[0].scores["quality_judge_scorer"].metadata["quality_passed"] = False
     quality.samples[1].scores["quality_judge_scorer"].metadata["quality_passed"] = False
-    logs = [routing_log(cases), quality]
+    quality_cases = [case for case in cases if "quality" in case.tags]
+    logs = [routing_log(cases), quick_log(quality_cases), quality]
     monkeypatch.setattr(
         "skill_eval.poc.inspect_eval",
         lambda *args, **kwargs: [logs.pop(0)],
@@ -261,3 +308,60 @@ def test_exit_codes_separate_quality_failure_and_invalid_evaluation(
     assert exit_code_for(summary) == 1
     invalid = summary.model_copy(update={"errors": ["missing log"]})
     assert exit_code_for(invalid) == 2
+
+
+def test_quality_mode_quick_skips_full_quality(
+    monkeypatch,
+    valid_config,
+    preflight_record,
+):
+    cases = read_routing_cases(valid_config.case_file)
+    quality_cases = [case for case in cases if "quality" in case.tags]
+    logs = [routing_log(cases), quick_log(quality_cases)]
+    calls = []
+
+    def fake_eval(*args, **kwargs):
+        calls.append((args, kwargs))
+        return [logs.pop(0)]
+
+    monkeypatch.setattr("skill_eval.poc.inspect_eval", fake_eval)
+    monkeypatch.setattr("skill_eval.poc.preflight", lambda config: preflight_record)
+
+    summary, exit_code = run_poc(valid_config.model_copy(update={"quality_mode": "quick"}))
+
+    assert len(calls) == 2
+    assert summary.quality_results == []
+    assert len(summary.quick_results) == 4
+    assert exit_code == 0
+
+
+def test_quick_turn_missing_invalidates_evaluation(
+    monkeypatch,
+    valid_config,
+    preflight_record,
+):
+    cases = read_routing_cases(valid_config.case_file)
+    quality_cases = [case for case in cases if "quality" in case.tags]
+    quick = quick_log(quality_cases)
+    quick.samples[0].scores["quick_turn_scorer"] = Score(
+        value=NOANSWER,
+        explanation="quick turn not captured before the stream ended",
+        metadata={"quick_turn_missing": True, "case_id": quality_cases[0].id},
+    )
+    logs = [routing_log(cases), quick, quality_log(quality_cases)]
+    monkeypatch.setattr(
+        "skill_eval.poc.inspect_eval",
+        lambda *args, **kwargs: [logs.pop(0)],
+    )
+    monkeypatch.setattr("skill_eval.poc.preflight", lambda config: preflight_record)
+
+    summary, _ = run_poc(valid_config)
+
+    assert exit_code_for(summary) == 2
+    assert summary.quick_turn_missing == 1
+
+
+def test_parser_defaults_and_accepts_quality_mode():
+    parser = _build_parser()
+    assert parser.parse_args([]).quality_mode == "both"
+    assert parser.parse_args(["--quality-mode", "quick"]).quality_mode == "quick"

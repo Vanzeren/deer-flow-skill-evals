@@ -5,7 +5,7 @@ import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from inspect_ai import eval as inspect_eval
@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from deerflow.client import DeerFlowClient
 from deerflow.config.app_config import AppConfig
 from evals.skills_quality_eval import skills_quality_eval
+from evals.skills_quick_eval import skills_quick_eval
 from evals.skills_routing_eval import skills_routing_eval
 from skill_eval.case_schema import CANDIDATE_SKILLS
 from skill_eval.dataset_loader import read_routing_cases, validate_poc_suite
@@ -24,6 +25,7 @@ from skill_eval.report import (
     PocSummary,
     RunIdentity,
     extract_quality_results,
+    extract_quick_results,
     extract_routing_results,
     render_poc_markdown,
     routing_acceptance,
@@ -54,6 +56,7 @@ class PocConfig(BaseModel):
     skills_root: Path = Path("../skills/public")
     config_path: str | None = None
     smoke: bool = False
+    quality_mode: Literal["quick", "full", "both"] = "both"
 
     @classmethod
     def from_env(
@@ -62,6 +65,7 @@ class PocConfig(BaseModel):
         case_file: str | Path | None = None,
         output_dir: str | Path | None = None,
         smoke: bool = False,
+        quality_mode: str = "both",
     ) -> "PocConfig":
         agent_model = os.getenv("AGENT_MODEL", "").strip()
         judge_model = os.getenv("JUDGE_MODEL", "").strip()
@@ -79,6 +83,7 @@ class PocConfig(BaseModel):
             "agent_model": agent_model,
             "judge_model": judge_model,
             "smoke": smoke,
+            "quality_mode": quality_mode,
             "config_path": os.getenv("DEER_FLOW_CONFIG_PATH") or None,
         }
         if case_file is not None:
@@ -202,8 +207,34 @@ def run_poc(config: PocConfig) -> tuple[PocSummary, int]:
     except Exception as exc:
         raise PocInvalidEvaluationError(f"Routing evaluation failed: {exc}") from exc
 
+    quick_log = None
+    if config.quality_mode in {"quick", "both"}:
+        quick_task = skills_quick_eval(
+            case_file=str(config.case_file),
+            agent_model=config.agent_model,
+            judge_model=config.judge_model,
+            skills_root=config.skills_root,
+            sample_ids=_SMOKE_CASE_IDS if config.smoke else None,
+            trace_dir=trace_dir,
+            config_path=config.config_path,
+            sandbox="local",
+        )
+        try:
+            quick_logs = inspect_eval(
+                quick_task,
+                model=None,
+                epochs=1,
+                max_samples=1,
+                log_dir=str(config.log_dir),
+                fail_on_error=False,
+                score_on_error=True,
+            )
+            quick_log = _single_log(quick_logs, "quick quality")
+        except Exception as exc:
+            raise PocInvalidEvaluationError(f"Quick quality evaluation failed: {exc}") from exc
+
     quality_log = None
-    if not config.smoke:
+    if not config.smoke and config.quality_mode in {"full", "both"}:
         quality_task = skills_quality_eval(
             case_file=str(config.case_file),
             agent_model=config.agent_model,
@@ -250,9 +281,21 @@ def run_poc(config: PocConfig) -> tuple[PocSummary, int]:
         if len(quality_results) != 4:
             errors.append(f"Expected 4 quality results, found {len(quality_results)}")
 
+    quick_results = []
+    if quick_log is not None:
+        try:
+            quick_results = extract_quick_results(quick_log)
+        except Exception as exc:
+            errors.append(f"Cannot extract quick quality results: {exc}")
+        expected_quick = 3 if config.smoke else 4
+        if len(quick_results) != expected_quick:
+            errors.append(f"Expected {expected_quick} quick quality results, found {len(quick_results)}")
+
     inspect_logs = [str(getattr(routing_log, "location", ""))]
     if quality_log is not None:
         inspect_logs.append(str(getattr(quality_log, "location", "")))
+    if quick_log is not None:
+        inspect_logs.append(str(getattr(quick_log, "location", "")))
     identity = RunIdentity(
         agent_model=config.agent_model,
         judge_model=config.judge_model,
@@ -268,10 +311,16 @@ def run_poc(config: PocConfig) -> tuple[PocSummary, int]:
     quality_passed_cases = sum(result.quality_passed for result in quality_results)
     judge_failures = sum(result.judge_failure is not None for result in quality_results)
     infrastructure_failures = sum(result.infrastructure_error is not None for result in quality_results)
+    quick_passed_cases = sum(result.quality_passed for result in quick_results)
+    quick_turn_missing = sum(result.category == "quick_turn_missing" for result in quick_results)
+    quick_judge_failures = sum(result.category == "judge_failure" for result in quick_results)
+    quick_infrastructure_failures = sum(result.category == "infrastructure_error" for result in quick_results)
     acceptance = _acceptance_checks(
         routing_metrics,
         quality_passed_cases=quality_passed_cases,
         include_quality=not config.smoke,
+        quick_passed_cases=quick_passed_cases,
+        include_quick=not config.smoke and config.quality_mode in {"quick", "both"},
     )
     summary = PocSummary(
         run_id=run_id,
@@ -282,6 +331,12 @@ def run_poc(config: PocConfig) -> tuple[PocSummary, int]:
         quality_passed_cases=quality_passed_cases,
         judge_failures=judge_failures,
         infrastructure_failures=infrastructure_failures,
+        quality_mode=config.quality_mode,
+        quick_results=quick_results,
+        quick_passed_cases=quick_passed_cases,
+        quick_turn_missing=quick_turn_missing,
+        quick_judge_failures=quick_judge_failures,
+        quick_infrastructure_failures=quick_infrastructure_failures,
         acceptance=acceptance,
         errors=errors,
     )
@@ -301,6 +356,8 @@ def _acceptance_checks(
     *,
     quality_passed_cases: int,
     include_quality: bool,
+    quick_passed_cases: int = 0,
+    include_quick: bool = False,
 ) -> list[AcceptanceCheck]:
     checks = [
         AcceptanceCheck(
@@ -331,16 +388,38 @@ def _acceptance_checks(
                 passed=quality_passed_cases >= 3,
             )
         )
+    if include_quick:
+        checks.append(
+            AcceptanceCheck(
+                name="quick quality cases passing turn threshold",
+                actual=quick_passed_cases,
+                threshold=">= 3 of 4",
+                passed=quick_passed_cases >= 3,
+            )
+        )
     return checks
 
 
 def exit_code_for(summary: PocSummary) -> int:
     expected_routing_runs = 3 if summary.mode == "smoke" else 60
-    evaluation_invalid = bool(summary.errors) or len(summary.routing.results) != expected_routing_runs or summary.judge_failures > 0 or summary.infrastructure_failures > 0 or (summary.mode == "full" and len(summary.quality_results) != 4)
+    full_quality_expected = 4 if (summary.mode == "full" and summary.quality_mode in {"full", "both"}) else 0
+    quick_expected = (3 if summary.mode == "smoke" else 4) if summary.quality_mode in {"quick", "both"} else 0
+    evaluation_invalid = (
+        bool(summary.errors)
+        or len(summary.routing.results) != expected_routing_runs
+        or summary.judge_failures > 0
+        or summary.infrastructure_failures > 0
+        or len(summary.quality_results) != full_quality_expected
+        or len(summary.quick_results) != quick_expected
+        or summary.quick_judge_failures > 0
+        or summary.quick_infrastructure_failures > 0
+        or summary.quick_turn_missing > 0
+    )
     if evaluation_invalid:
         return 2
-    quality_passed = summary.mode == "smoke" or summary.quality_passed_cases >= 3
-    return 0 if routing_acceptance(summary.routing) and quality_passed else 1
+    full_quality_passed = full_quality_expected == 0 or summary.quality_passed_cases >= 3
+    quick_passed = quick_expected == 0 or summary.mode == "smoke" or summary.quick_passed_cases >= 3
+    return 0 if routing_acceptance(summary.routing) and full_quality_passed and quick_passed else 1
 
 
 def _write_summary(run_dir: Path, summary: PocSummary) -> None:
@@ -361,6 +440,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--case-file")
     parser.add_argument("--output-dir")
+    parser.add_argument("--quality-mode", choices=["quick", "full", "both"], default="both")
     return parser
 
 
@@ -371,6 +451,7 @@ def main(argv: list[str] | None = None) -> int:
             case_file=args.case_file,
             output_dir=args.output_dir,
             smoke=args.smoke,
+            quality_mode=args.quality_mode,
         )
         summary, exit_code = run_poc(config)
     except (PocConfigurationError, PocInvalidEvaluationError) as exc:
