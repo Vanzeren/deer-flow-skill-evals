@@ -107,6 +107,17 @@ async def test_quick_scorer_fails_below_threshold_or_fatal(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_quick_scorer_fails_on_fatal_error(monkeypatch):
+    model = FakeModel(quick_judgment_json(turn_quality=4, fatal_error=True))
+    monkeypatch.setattr("skill_eval.inspect_scorer.get_model", lambda _: model)
+
+    score = await quick_turn_scorer("fake/judge", descriptions())(quick_state(), Target("academic-paper-review"))
+
+    assert score.value == INCORRECT
+    assert score.metadata["quality_passed"] is False
+
+
+@pytest.mark.asyncio
 async def test_quick_scorer_rejects_failed_agent_run(monkeypatch):
     model = FakeModel(quick_judgment_json())
     monkeypatch.setattr("skill_eval.inspect_scorer.get_model", lambda _: model)
