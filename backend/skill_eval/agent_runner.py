@@ -7,7 +7,7 @@ from skill_eval.case_schema import CANDIDATE_SKILLS
 from skill_eval.routing import RouteObservation
 from skill_eval.trace_schema import AgentTrace
 
-type RunMode = Literal["routing_probe", "full"]
+type RunMode = Literal["routing_probe", "quick", "full"]
 type SandboxMode = Literal["configured", "local"]
 
 

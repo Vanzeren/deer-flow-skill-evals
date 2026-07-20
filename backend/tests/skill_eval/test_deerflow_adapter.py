@@ -446,3 +446,139 @@ def test_adapter_builds_tool_call_chain_grouped_by_ai_message():
     chained = [call_id for batch in trace.tool_call_chain for call_id in batch]
     assert sorted(chained) == sorted(call.id for call in trace.tool_calls)
     assert trace.quick_turn is None
+
+
+def ai_text(message_id: str, content: str) -> StreamEvent:
+    return event("messages-tuple", {"type": "ai", "id": message_id, "content": content, "tool_calls": []})
+
+
+def test_quick_turn_watcher_waits_for_accumulated_content():
+    adapter = DeerFlowTraceAdapter(request(mode="quick"))
+    adapter.start()
+    watcher = deerflow_module._QuickTurnWatcher()
+    watcher.start(skill="systematic-literature-review", existing_message_ids=("m1",))
+
+    e1 = event("messages-tuple", {"type": "ai", "id": "m2", "content": ""})
+    adapter.feed(e1)
+    watcher.feed(e1, adapter)
+    assert watcher.target_id is None
+
+    e2 = event("messages-tuple", {"type": "ai", "id": "m2", "content": "Now "})
+    adapter.feed(e2)
+    watcher.feed(e2, adapter)
+    assert watcher.target_id == "m2"
+    assert watcher.complete is False
+
+    e3 = event("messages-tuple", {"type": "tool", "id": "r9", "tool_call_id": "t9", "name": "bash", "content": "x"})
+    adapter.feed(e3)
+    watcher.feed(e3, adapter)
+    assert watcher.complete is True
+    assert watcher.content == "Now "
+
+
+def test_quick_mode_captures_first_text_turn_after_skill_load():
+    holder = {}
+
+    def client_factory(**kwargs):
+        holder["client"] = ScriptedClient(
+            events=[
+                ai_read_skill("systematic-literature-review"),
+                tool_result(),
+                ai_text("m2", "I will search for papers on the topic."),
+                ai_text("m3", "this turn must not be captured"),
+                AssertionError,
+            ],
+            **kwargs,
+        )
+        return holder["client"]
+
+    result = _execute_deerflow(request(mode="quick"), client_factory=client_factory)
+
+    assert result.success is True
+    assert result.route_observation.observed_route == "systematic-literature-review"
+    assert result.trace.quick_turn is not None
+    assert result.trace.quick_turn.message_id == "m2"
+    assert result.trace.quick_turn.skill == "systematic-literature-review"
+    assert result.trace.quick_turn.content == "I will search for papers on the topic."
+    assert holder["client"].stream_closed is True
+    assert holder["client"].options["subagent_enabled"] is False
+
+
+def test_quick_mode_none_route_runs_to_end_without_quick_turn():
+    holder = {}
+
+    def client_factory(**kwargs):
+        holder["client"] = ScriptedClient(
+            events=[ai_text("m1", "Direct answer"), event("end", {"usage": {}})],
+            **kwargs,
+        )
+        return holder["client"]
+
+    result = _execute_deerflow(request(mode="quick"), client_factory=client_factory)
+
+    assert result.success is True
+    assert result.route_observation.observed_route == "none"
+    assert result.trace.quick_turn is None
+
+
+def test_quick_mode_breaks_immediately_on_ambiguous_route():
+    holder = {}
+
+    def client_factory(**kwargs):
+        holder["client"] = ScriptedClient(
+            events=[
+                event(
+                    "messages-tuple",
+                    {
+                        "type": "ai",
+                        "id": "m1",
+                        "content": "",
+                        "tool_calls": [
+                            {"id": "t1", "name": "read_file", "args": {"path": "/mnt/skills/public/systematic-literature-review/SKILL.md"}},
+                            {"id": "t2", "name": "read_file", "args": {"path": "/mnt/skills/public/academic-paper-review/SKILL.md"}},
+                        ],
+                    },
+                ),
+                tool_result("t1"),
+                tool_result("t2"),
+                AssertionError,
+            ],
+            **kwargs,
+        )
+        return holder["client"]
+
+    result = _execute_deerflow(request(mode="quick"), client_factory=client_factory)
+
+    assert result.route_observation.observed_route == "ambiguous"
+    assert result.trace.quick_turn is None
+
+
+def test_quick_mode_stream_end_without_text_turn_leaves_quick_turn_none():
+    holder = {}
+
+    def client_factory(**kwargs):
+        holder["client"] = ScriptedClient(
+            events=[
+                ai_read_skill("systematic-literature-review"),
+                tool_result(),
+                event(
+                    "messages-tuple",
+                    {
+                        "type": "ai",
+                        "id": "m2",
+                        "content": "",
+                        "tool_calls": [{"id": "t2", "name": "bash", "args": {"cmd": "ls"}}],
+                    },
+                ),
+                tool_result("t2", "files"),
+                event("end", {"usage": {}}),
+            ],
+            **kwargs,
+        )
+        return holder["client"]
+
+    result = _execute_deerflow(request(mode="quick"), client_factory=client_factory)
+
+    assert result.success is True
+    assert result.route_observation.observed_route == "systematic-literature-review"
+    assert result.trace.quick_turn is None

@@ -18,7 +18,7 @@ from deerflow.config.app_config import (
 )
 from skill_eval.agent_runner import AgentRunRequest, AgentRunResult, SandboxMode
 from skill_eval.routing import RouteObservation, RoutingObserver
-from skill_eval.trace_schema import AgentArtifact, AgentToolCall, AgentTrace
+from skill_eval.trace_schema import AgentArtifact, AgentToolCall, AgentTrace, QuickTurnCapture
 
 _ARTIFACT_HEAD_BYTES = 6_000
 _ARTIFACT_TAIL_BYTES = 2_000
@@ -245,6 +245,42 @@ class DeerFlowTraceAdapter:
                 self._artifact_paths.setdefault(path, None)
 
 
+class _QuickTurnWatcher:
+    """Track the first non-empty AI text turn after a skill-load routing decision."""
+
+    def __init__(self) -> None:
+        self.skill: str | None = None
+        self.target_id: str | None = None
+        self.content: str = ""
+        self.complete: bool = False
+        self._excluded_ids: set[str] = set()
+
+    def start(self, *, skill: str, existing_message_ids: tuple[str, ...]) -> None:
+        self.skill = skill
+        self._excluded_ids = set(existing_message_ids)
+
+    def feed(self, event: StreamEvent, adapter: DeerFlowTraceAdapter) -> None:
+        if self.skill is None or self.complete:
+            return
+        if event.type == "end":
+            if self.target_id is not None:
+                self.content = adapter.ai_message_content(self.target_id)
+                self.complete = True
+            return
+        if event.type != "messages-tuple":
+            return
+        message_id = str(event.data.get("id") or "")
+        if self.target_id is None:
+            if event.data.get("type") != "ai" or message_id in self._excluded_ids:
+                return
+            if adapter.ai_message_content(message_id).strip():
+                self.target_id = message_id
+            return
+        if message_id != self.target_id:
+            self.content = adapter.ai_message_content(self.target_id)
+            self.complete = True
+
+
 def snapshot_artifact(client: Any, thread_id: str, path: str) -> AgentArtifact:
     payload = client.get_artifact(thread_id, path)
     if isinstance(payload, tuple):
@@ -305,8 +341,9 @@ def _execute_deerflow(
 
     stream = None
     saw_end = False
-    stopped_on_route = False
+    stopped_early = False
     stream_failed = False
+    watcher = _QuickTurnWatcher() if request.mode == "quick" else None
     try:
         with _sandbox_context(request.sandbox):
             stream = client.stream(request.user_input, thread_id=request.thread_id)
@@ -316,8 +353,20 @@ def _execute_deerflow(
                 if stream_event.type == "end":
                     saw_end = True
                 if request.mode == "routing_probe" and route_ready:
-                    stopped_on_route = True
+                    stopped_early = True
                     break
+                if watcher is not None:
+                    if route_ready and watcher.skill is None:
+                        decided = observer.decided_route
+                        if decided == "ambiguous":
+                            stopped_early = True
+                            break
+                        if decided is not None:
+                            watcher.start(skill=decided, existing_message_ids=adapter.ai_message_ids())
+                    watcher.feed(stream_event, adapter)
+                    if watcher.complete:
+                        stopped_early = True
+                        break
     except Exception as exc:
         stream_failed = True
         error = f"Stream error: {exc}"
@@ -333,7 +382,7 @@ def _execute_deerflow(
                 adapter.add_error(error)
                 observer.fail(error)
 
-    if not saw_end and not stopped_on_route and not stream_failed:
+    if not saw_end and not stopped_early and not stream_failed:
         error = "Stream ended without an end event"
         adapter.add_error(error)
         observer.fail(error)
@@ -346,10 +395,18 @@ def _execute_deerflow(
             except Exception as exc:
                 adapter.add_error(f"Artifact snapshot failed for {artifact_path}: {exc}")
 
+    quick_turn = None
+    if watcher is not None and watcher.complete and watcher.skill is not None and watcher.target_id is not None:
+        quick_turn = QuickTurnCapture(
+            message_id=watcher.target_id,
+            skill=watcher.skill,
+            content=watcher.content,
+        )
+
     observation = observer.finalize(stream_completed=saw_end)
     for error in observation.errors:
         adapter.add_error(error)
-    return _build_result(request, adapter, observation, artifacts=artifacts)
+    return _build_result(request, adapter, observation, artifacts=artifacts, quick_turn=quick_turn)
 
 
 def _build_result(
@@ -358,6 +415,7 @@ def _build_result(
     observation: RouteObservation,
     *,
     artifacts: list[AgentArtifact] | None = None,
+    quick_turn: QuickTurnCapture | None = None,
 ) -> AgentRunResult:
     raw_trace_path = None
     if request.trace_dir:
@@ -371,6 +429,8 @@ def _build_result(
     except OSError as exc:
         adapter.add_error(f"Raw trace write failed: {exc}")
         trace = adapter.build(thread_id=request.thread_id, artifacts=artifacts)
+    if quick_turn is not None:
+        trace = trace.model_copy(update={"quick_turn": quick_turn})
     if request.mode == "full" and trace.success and not trace.final_answer.strip() and not trace.artifacts:
         error = "Full run produced no final answer or artifact"
         trace = trace.model_copy(

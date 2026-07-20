@@ -44,6 +44,10 @@ class RoutingObserver:
         self._observed: RouteLabel | Literal["ambiguous"] | None = None
         self._completed = False
 
+    @property
+    def decided_route(self) -> RouteLabel | Literal["ambiguous"] | None:
+        return self._observed if self._completed else None
+
     def feed(self, event: StreamEvent) -> bool:
         if self._completed:
             return True
