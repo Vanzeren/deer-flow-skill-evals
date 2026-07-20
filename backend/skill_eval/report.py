@@ -8,7 +8,7 @@ from inspect_ai.scorer import NOANSWER
 from pydantic import BaseModel, Field
 
 from skill_eval.case_schema import CANDIDATE_SKILLS, RouteLabel, RoutingCase
-from skill_eval.judge import QualityJudgment
+from skill_eval.judge import QualityJudgment, QuickJudgment
 from skill_eval.routing import RouteEvidence
 
 type ObservedRoute = RouteLabel | Literal["ambiguous"]
@@ -170,6 +170,26 @@ class QualityCaseResult(BaseModel):
     evidence_log: str
 
 
+class QuickCaseResult(BaseModel):
+    case_id: str
+    observed_route: ObservedRoute | None = None
+    judgment: QuickJudgment | None = None
+    category: (
+        Literal[
+            "infrastructure_error",
+            "judge_failure",
+            "quick_turn_missing",
+            "route_mismatch",
+            "not_applicable_none_case",
+        ]
+        | None
+    ) = None
+    detail: str | None = None
+    turn_quality: int | None = None
+    quality_passed: bool = False
+    evidence_log: str
+
+
 class AcceptanceCheck(BaseModel):
     name: str
     actual: float | int
@@ -178,7 +198,7 @@ class AcceptanceCheck(BaseModel):
 
 
 class PocSummary(BaseModel):
-    schema_version: Literal["deerflow.agent-routing-poc.v1"] = "deerflow.agent-routing-poc.v1"
+    schema_version: Literal["deerflow.agent-routing-poc.v2"] = "deerflow.agent-routing-poc.v2"
     run_id: str
     mode: Literal["smoke", "full"]
     identity: RunIdentity
@@ -189,6 +209,12 @@ class PocSummary(BaseModel):
     infrastructure_failures: int
     acceptance: list[AcceptanceCheck]
     errors: list[str] = Field(default_factory=list)
+    quality_mode: Literal["quick", "full", "both"] = "full"
+    quick_results: list[QuickCaseResult] = Field(default_factory=list)
+    quick_passed_cases: int = 0
+    quick_turn_missing: int = 0
+    quick_judge_failures: int = 0
+    quick_infrastructure_failures: int = 0
 
 
 def extract_quality_results(log: EvalLog) -> list[QualityCaseResult]:
@@ -227,6 +253,59 @@ def extract_quality_results(log: EvalLog) -> list[QualityCaseResult]:
                 infrastructure_error=str(infrastructure_error) if infrastructure_error else None,
                 quality_passed=bool(quality_metadata.get("quality_passed", False)),
                 label_review_needed=bool(quality_metadata.get("label_review_needed", False)),
+                evidence_log=log_location,
+            )
+        )
+    return results
+
+
+def extract_quick_results(log: EvalLog) -> list[QuickCaseResult]:
+    results: list[QuickCaseResult] = []
+    log_location = str(getattr(log, "location", ""))
+    for sample in log.samples or []:
+        scores = sample.scores or {}
+        quick_score = scores.get("quick_turn_scorer")
+        routing_score = scores.get("routing_scorer")
+        if quick_score is None:
+            raise ValueError(f"Quick sample {sample.id} has no quick_turn_scorer output")
+        if routing_score is None:
+            raise ValueError(f"Quick sample {sample.id} has no routing_scorer output")
+        routing_metadata = routing_score.metadata or {}
+        quick_metadata = quick_score.metadata or {}
+        observed_route = routing_metadata.get("observed_route")
+
+        category = None
+        detail = None
+        judgment = None
+        turn_quality = None
+        if quick_metadata.get("infrastructure_error"):
+            category, detail = "infrastructure_error", str(quick_metadata["infrastructure_error"])
+        elif quick_metadata.get("judge_failure"):
+            category, detail = "judge_failure", str(quick_metadata["judge_failure"])
+        elif quick_metadata.get("quick_turn_missing"):
+            category, detail = "quick_turn_missing", quick_score.explanation
+        elif quick_metadata.get("route_mismatch"):
+            category, detail = "route_mismatch", quick_score.explanation
+        elif quick_metadata.get("not_applicable_none_case"):
+            category, detail = "not_applicable_none_case", quick_score.explanation
+        elif quick_score.value == NOANSWER:
+            category, detail = "judge_failure", str(quick_score.explanation or "quick scorer returned NOANSWER")
+        else:
+            try:
+                judgment = QuickJudgment.model_validate(quick_metadata["quick_judgment"])
+            except Exception as exc:
+                raise ValueError(f"Quick sample {sample.id} has invalid judgment: {exc}") from exc
+            turn_quality = judgment.turn_quality
+
+        results.append(
+            QuickCaseResult(
+                case_id=str(sample.id),
+                observed_route=observed_route,
+                judgment=judgment,
+                category=category,
+                detail=detail,
+                turn_quality=turn_quality,
+                quality_passed=bool(quick_metadata.get("quality_passed", False)),
                 evidence_log=log_location,
             )
         )
@@ -302,6 +381,22 @@ def render_poc_markdown(summary: PocSummary) -> str:
             )
     else:
         lines.append("- None.")
+
+    lines.extend(["", "## Quick quality (first turn after skill load)", ""])
+    if summary.quick_results:
+        judged = [result for result in summary.quick_results if result.judgment is not None]
+        lines.append(f"- Passed: {summary.quick_passed_cases}/{len(summary.quick_results)}")
+        lines.append(f"- quick_turn_missing: {summary.quick_turn_missing}; infrastructure: {summary.quick_infrastructure_failures}; judge failures: {summary.quick_judge_failures}")
+        if judged:
+            mean_quality = sum(result.turn_quality or 0 for result in judged) / len(judged)
+            lines.append(f"- Mean turn quality: {mean_quality:.2f}")
+        for result in summary.quick_results:
+            if result.judgment is not None:
+                lines.append(f"- `{result.case_id}`: turn_quality={result.turn_quality}, passed={result.quality_passed}, rationale: {result.judgment.rationale}")
+            else:
+                lines.append(f"- `{result.case_id}`: {result.category} `{result.detail}`")
+    else:
+        lines.append("- Skipped.")
 
     lines.extend(["", "## Quality judgments", ""])
     if summary.quality_results:

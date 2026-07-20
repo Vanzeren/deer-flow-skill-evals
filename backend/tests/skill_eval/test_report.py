@@ -4,16 +4,19 @@ from types import SimpleNamespace
 import pytest
 from inspect_ai.scorer import CORRECT, NOANSWER, Score
 
-from skill_eval.judge import QualityJudgment
+from skill_eval.case_schema import CANDIDATE_SKILLS
+from skill_eval.judge import QualityJudgment, QuickJudgment
 from skill_eval.report import (
     AcceptanceCheck,
     ClassMetrics,
     PocSummary,
     QualityCaseResult,
+    QuickCaseResult,
     RoutingEpochResult,
     RoutingMetrics,
     RunIdentity,
     extract_quality_results,
+    extract_quick_results,
     extract_routing_results,
     render_poc_markdown,
     routing_acceptance,
@@ -333,3 +336,140 @@ def test_markdown_report_contains_identity_metrics_evidence_and_acceptance():
     assert "## Acceptance checks" in markdown
     assert "config_sha256" in markdown
     assert "/repo/config.yaml" in markdown
+
+
+def quick_score(case_id, *, judgment=None, category_metadata=None, value=CORRECT, passed=True):
+    metadata = {"case_id": case_id}
+    if judgment is not None:
+        metadata["quick_judgment"] = judgment
+        metadata["quality_passed"] = passed
+    if category_metadata:
+        metadata.update(category_metadata)
+    return Score(value=value, explanation="detail text", metadata=metadata)
+
+
+def quick_sample(case_id, score):
+    return SimpleNamespace(
+        id=case_id,
+        epoch=1,
+        metadata={},
+        scores={
+            "routing_scorer": Score(
+                value=CORRECT,
+                metadata={"case_id": case_id, "observed_route": "systematic-literature-review"},
+            ),
+            "quick_turn_scorer": score,
+        },
+    )
+
+
+JUDGMENT = {
+    "turn_quality": 3,
+    "fatal_error": False,
+    "rationale": "Turn follows the loaded skill.",
+    "evidence_references": ["tool_chain[0]", "quick_turn"],
+}
+
+
+def test_extract_quick_results_reads_judgments_and_categories():
+    log = SimpleNamespace(
+        samples=[
+            quick_sample("a", quick_score("a", judgment=JUDGMENT)),
+            quick_sample("b", quick_score("b", category_metadata={"quick_turn_missing": True}, value=NOANSWER)),
+            quick_sample("c", quick_score("c", category_metadata={"not_applicable_none_case": True}, value=NOANSWER)),
+            quick_sample("d", quick_score("d", category_metadata={"route_mismatch": True}, value=NOANSWER)),
+            quick_sample("e", quick_score("e", category_metadata={"judge_failure": "parse"}, value=NOANSWER)),
+            quick_sample("f", quick_score("f", category_metadata={"infrastructure_error": "boom"}, value=NOANSWER)),
+        ],
+        location="logs/quick.eval",
+    )
+
+    results = extract_quick_results(log)
+
+    assert len(results) == 6
+    judged = results[0]
+    assert judged.judgment is not None
+    assert judged.turn_quality == 3
+    assert judged.quality_passed is True
+    assert judged.category is None
+    assert [result.category for result in results[1:]] == [
+        "quick_turn_missing",
+        "not_applicable_none_case",
+        "route_mismatch",
+        "judge_failure",
+        "infrastructure_error",
+    ]
+    assert all(result.evidence_log == "logs/quick.eval" for result in results)
+
+
+def test_extract_quick_results_requires_scorer_output():
+    log = SimpleNamespace(samples=[SimpleNamespace(id="x", epoch=1, metadata={}, scores={})], location="l")
+
+    with pytest.raises(ValueError, match="quick_turn_scorer"):
+        extract_quick_results(log)
+
+
+def make_poc_summary() -> PocSummary:
+    return PocSummary(
+        run_id="test-run",
+        mode="full",
+        identity=RunIdentity(
+            agent_model="default",
+            judge_model="mockllm/judge",
+            inspect_ai_version="0.3.test",
+            deerflow_version="test",
+            case_file_sha256="a" * 64,
+            skill_file_sha256={skill: "b" * 64 for skill in CANDIDATE_SKILLS},
+            runtime_config={},
+            started_at=datetime.now(UTC),
+            ended_at=datetime.now(UTC),
+            inspect_logs=["logs/routing.eval"],
+        ),
+        routing=make_balanced_summary(valid_run_rate=0.95, macro_precision=0.8, macro_recall=0.8),
+        quality_results=[],
+        quality_passed_cases=0,
+        judge_failures=0,
+        infrastructure_failures=0,
+        acceptance=[],
+    )
+
+
+def test_markdown_includes_quick_section():
+    summary = make_poc_summary()
+    summary = summary.model_copy(
+        update={
+            "quality_mode": "both",
+            "quick_results": [
+                QuickCaseResult(
+                    case_id="a",
+                    observed_route="systematic-literature-review",
+                    judgment=QuickJudgment(
+                        turn_quality=3,
+                        fatal_error=False,
+                        rationale="solid turn",
+                        evidence_references=["tool_chain[0]", "quick_turn"],
+                    ),
+                    category=None,
+                    detail=None,
+                    turn_quality=3,
+                    quality_passed=True,
+                    evidence_log="logs/quick.eval",
+                ),
+                QuickCaseResult(
+                    case_id="b",
+                    category="quick_turn_missing",
+                    detail="quick turn not captured before the stream ended",
+                    quality_passed=False,
+                    evidence_log="logs/quick.eval",
+                ),
+            ],
+            "quick_passed_cases": 1,
+            "quick_turn_missing": 1,
+        }
+    )
+
+    markdown = render_poc_markdown(summary)
+
+    assert "## Quick quality (first turn after skill load)" in markdown
+    assert "turn_quality=3" in markdown
+    assert "quick_turn_missing" in markdown
