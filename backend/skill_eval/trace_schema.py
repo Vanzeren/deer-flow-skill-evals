@@ -21,12 +21,20 @@ class AgentArtifact(BaseModel):
     truncated: bool
 
 
+class QuickTurnCapture(BaseModel):
+    message_id: str
+    skill: str
+    content: str
+
+
 class AgentTrace(BaseModel):
     input: str
     final_answer: str
     success: bool
     thread_id: str
     tool_calls: list[AgentToolCall] = Field(default_factory=list)
+    tool_call_chain: list[list[str]] = Field(default_factory=list)
+    quick_turn: QuickTurnCapture | None = None
     messages: list[dict[str, Any]] = Field(default_factory=list)
     artifacts: list[AgentArtifact] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)

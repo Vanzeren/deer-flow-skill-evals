@@ -70,6 +70,13 @@ class DeerFlowTraceAdapter:
     def artifact_paths(self) -> tuple[str, ...]:
         return tuple(self._artifact_paths)
 
+    def ai_message_ids(self) -> tuple[str, ...]:
+        return tuple(self._ai_messages)
+
+    def ai_message_content(self, message_id: str) -> str:
+        message = self._ai_messages.get(message_id)
+        return str(message["content"]) if message is not None else ""
+
     def start(self) -> None:
         self._start_time = time.monotonic()
         if self._live_raw_trace_path is not None:
@@ -127,6 +134,7 @@ class DeerFlowTraceAdapter:
                 encoding="utf-8",
             )
 
+        tool_call_chain = [[call["id"] for call in message["tool_calls"]] for message in self._messages if message["type"] == "ai" and message["tool_calls"]]
         final_answer = ""
         if self._last_ai_msg_id:
             final_answer = str(self._ai_messages[self._last_ai_msg_id]["content"])
@@ -137,6 +145,7 @@ class DeerFlowTraceAdapter:
             success=not self._errors,
             thread_id=thread_id,
             tool_calls=[self._tool_calls[call_id] for call_id in self._tool_call_order],
+            tool_call_chain=tool_call_chain,
             messages=list(self._messages),
             artifacts=artifacts or [],
             errors=list(self._errors),

@@ -407,3 +407,42 @@ def test_stream_exception_does_not_add_false_missing_end_error():
     assert result.success is False
     assert result.trace.errors == ["Stream error: connection lost"]
     assert result.route_observation.errors == ["Stream error: connection lost"]
+
+
+def test_adapter_builds_tool_call_chain_grouped_by_ai_message():
+    adapter = DeerFlowTraceAdapter(request())
+    adapter.start()
+    adapter.feed(
+        event(
+            "messages-tuple",
+            {
+                "type": "ai",
+                "id": "m1",
+                "content": "",
+                "tool_calls": [
+                    {"id": "t1", "name": "read_file", "args": {"path": "a"}},
+                    {"id": "t2", "name": "bash", "args": {"cmd": "ls"}},
+                ],
+            },
+        )
+    )
+    adapter.feed(event("messages-tuple", {"type": "tool", "id": "r1", "tool_call_id": "t1", "name": "read_file", "content": "x"}))
+    adapter.feed(event("messages-tuple", {"type": "ai", "id": "m2", "content": "thinking"}))
+    adapter.feed(
+        event(
+            "messages-tuple",
+            {
+                "type": "ai",
+                "id": "m3",
+                "content": "",
+                "tool_calls": [{"id": "t3", "name": "write_file", "args": {"path": "b"}}],
+            },
+        )
+    )
+
+    trace = adapter.build(thread_id="thread-1")
+
+    assert trace.tool_call_chain == [["t1", "t2"], ["t3"]]
+    chained = [call_id for batch in trace.tool_call_chain for call_id in batch]
+    assert sorted(chained) == sorted(call.id for call in trace.tool_calls)
+    assert trace.quick_turn is None
