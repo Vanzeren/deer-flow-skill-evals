@@ -12,7 +12,7 @@ from skill_eval.judge import (
     load_candidate_skill_descriptions,
 )
 from skill_eval.routing import RouteObservation
-from skill_eval.trace_schema import AgentArtifact, AgentToolCall, AgentTrace
+from skill_eval.trace_schema import AgentArtifact, AgentToolCall, AgentTrace, QuickTurnCapture
 
 
 class FakeModel:
@@ -34,7 +34,7 @@ def valid_judgment_json(evidence=None, **updates):
         "overall_quality": 3,
         "fatal_error": False,
         "reasons": ["The observable run satisfies the bounded task."],
-        "evidence": evidence or ["tool_call[0]", "final_answer"],
+        "evidence": evidence or ["tool_chain[0]", "final_answer"],
     }
     payload.update(updates)
     return json.dumps(payload)
@@ -68,6 +68,7 @@ def full_trace():
                 result="body",
             )
         ],
+        tool_call_chain=[["t1"]],
         artifacts=[
             AgentArtifact(
                 path="/mnt/user-data/outputs/report.md",
@@ -118,20 +119,18 @@ def test_judge_bundle_omits_expected_label_and_rationale(
     )
 
     payload = bundle.model_dump_json()
-
-    assert "expected_route" not in payload
-    assert routing_case.rationale not in payload
-    assert "message[0]" in payload
-    assert "tool_call[0]" in payload
-    assert "tool_result[0]" in payload
+    assert "message[" not in payload
+    assert "tool_call[" not in payload
+    assert "tool_result[" not in payload
+    assert "tool_chain[0]" in payload
     assert "artifact[report.md]" in payload
     assert "final_answer" in payload
 
 
 def test_large_evidence_is_head_tail_truncated_with_hash():
     item = bounded_evidence(
-        "tool_result[0]",
-        "tool_result",
+        "tool_chain[0]",
+        "tool_chain",
         "x" * 100_000,
         remaining_bytes=20_000,
     )
@@ -144,8 +143,8 @@ def test_large_evidence_is_head_tail_truncated_with_hash():
 
 def test_exhausted_evidence_budget_retains_omission_marker():
     item = bounded_evidence(
-        "tool_result[0]",
-        "tool_result",
+        "tool_chain[0]",
+        "tool_chain",
         "observable result",
         remaining_bytes=0,
     )
@@ -234,7 +233,7 @@ async def test_judge_repairs_out_of_range_score_once(valid_bundle):
 
 @pytest.mark.asyncio
 async def test_judge_rejects_unknown_evidence_without_repair(valid_bundle):
-    model = FakeModel([valid_judgment_json(evidence=["tool_call[999]", "final_answer"])])
+    model = FakeModel([valid_judgment_json(evidence=["tool_chain[999]", "final_answer"])])
 
     with pytest.raises(JudgeFailure, match="unknown evidence"):
         await judge_quality(valid_bundle, model)
@@ -242,18 +241,122 @@ async def test_judge_rejects_unknown_evidence_without_repair(valid_bundle):
 
 
 @pytest.mark.asyncio
-async def test_judge_requires_trace_evidence(valid_bundle):
+async def test_judge_requires_process_evidence(valid_bundle):
     model = FakeModel([valid_judgment_json(evidence=["final_answer"])])
 
-    with pytest.raises(JudgeFailure, match="trace or tool evidence"):
+    with pytest.raises(JudgeFailure, match="tool chain or error evidence"):
         await judge_quality(valid_bundle, model)
 
 
 @pytest.mark.asyncio
 async def test_judge_auto_adds_output_evidence_when_missing(valid_bundle):
-    model = FakeModel([valid_judgment_json(evidence=["tool_call[0]"])])
+    model = FakeModel([valid_judgment_json(evidence=["tool_chain[0]"])])
     judgment = await judge_quality(valid_bundle, model)
     output_kinds = {"final_answer", "artifact"}
     bundle_ids = {item.id for item in valid_bundle.evidence}
     cited_output = [e for e in judgment.evidence if e in bundle_ids and any(item.kind in output_kinds for item in valid_bundle.evidence if item.id == e)]
     assert cited_output, "judgment should have auto-added output evidence"
+
+
+def test_tool_chain_evidence_expands_concurrent_batch(routing_case, route_observation):
+    trace = AgentTrace(
+        input="Synthesize three papers.",
+        final_answer="answer",
+        success=True,
+        thread_id="thread-1",
+        tool_calls=[
+            AgentToolCall(id="t1", message_id="m1", name="read_file", args={"path": "SKILL.md"}, result="body"),
+            AgentToolCall(id="t2", message_id="m1", name="bash", args={"cmd": "ls"}, result="files"),
+            AgentToolCall(id="t3", message_id="m2", name="write_file", args={"path": "out.md"}, result="ok"),
+        ],
+        tool_call_chain=[["t1", "t2"], ["t3"]],
+    )
+
+    bundle = build_judge_evidence(
+        case=routing_case,
+        trace=trace,
+        observation=route_observation,
+        skill_descriptions={
+            "systematic-literature-review": "multi-paper",
+            "academic-paper-review": "one-paper",
+        },
+    )
+
+    chain_items = [item for item in bundle.evidence if item.kind == "tool_chain"]
+    assert [item.id for item in chain_items] == ["tool_chain[0]", "tool_chain[1]"]
+    first = json.loads(chain_items[0].content)
+    assert [call["name"] for call in first] == ["read_file", "bash"]
+    assert first[0]["result"] == "body"
+    assert bundle.evaluation_target == "final_output"
+    assert all(item.kind != "message" for item in bundle.evidence)
+
+
+def test_quick_target_excludes_captured_turn_batch_and_final_answer(routing_case, route_observation):
+    trace = AgentTrace(
+        input="Review the paper.",
+        final_answer="",
+        success=True,
+        thread_id="thread-1",
+        tool_calls=[
+            AgentToolCall(id="t1", message_id="m1", name="read_file", args={"path": "SKILL.md"}, result="skill"),
+            AgentToolCall(id="t2", message_id="m2", name="bash", args={"cmd": "ls"}, result="x"),
+        ],
+        tool_call_chain=[["t1"], ["t2"]],
+        quick_turn=QuickTurnCapture(message_id="m2", skill="systematic-literature-review", content="Plan: ..."),
+    )
+
+    bundle = build_judge_evidence(
+        case=routing_case,
+        trace=trace,
+        observation=route_observation,
+        skill_descriptions={
+            "systematic-literature-review": "multi-paper",
+            "academic-paper-review": "one-paper",
+        },
+        target="quick_turn",
+    )
+
+    ids = [item.id for item in bundle.evidence]
+    assert ids == ["tool_chain[0]", "quick_turn"]
+    assert bundle.evaluation_target == "quick_turn"
+    quick_item = bundle.evidence[-1]
+    assert quick_item.kind == "quick_turn"
+    assert quick_item.content == "Plan: ..."
+
+
+def test_quick_target_requires_captured_turn(routing_case, full_trace, route_observation):
+    with pytest.raises(ValueError, match="quick turn"):
+        build_judge_evidence(
+            case=routing_case,
+            trace=full_trace,
+            observation=route_observation,
+            skill_descriptions={
+                "systematic-literature-review": "multi-paper",
+                "academic-paper-review": "one-paper",
+            },
+            target="quick_turn",
+        )
+
+
+@pytest.mark.asyncio
+async def test_judgment_may_cite_only_output_when_no_process_evidence(routing_case, route_observation):
+    trace = AgentTrace(
+        input="Say hi.",
+        final_answer="hi",
+        success=True,
+        thread_id="thread-1",
+    )
+    bundle = build_judge_evidence(
+        case=routing_case,
+        trace=trace,
+        observation=route_observation,
+        skill_descriptions={
+            "systematic-literature-review": "multi-paper",
+            "academic-paper-review": "one-paper",
+        },
+    )
+    model = FakeModel([valid_judgment_json(evidence=["final_answer"])])
+
+    judgment = await judge_quality(bundle, model)
+
+    assert judgment.overall_quality == 3

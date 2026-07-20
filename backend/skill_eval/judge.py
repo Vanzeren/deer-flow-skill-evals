@@ -12,8 +12,8 @@ from skill_eval.trace_schema import AgentTrace
 
 _EVIDENCE_TOTAL_BYTES = 80_000
 _EVIDENCE_ITEM_BYTES = 12_000
-_TRACE_EVIDENCE_KINDS = {"message", "tool_call", "tool_result", "error"}
-_OUTPUT_EVIDENCE_KINDS = {"artifact", "final_answer"}
+_PROCESS_EVIDENCE_KINDS = {"tool_chain", "error"}
+_OUTPUT_EVIDENCE_KINDS = {"artifact", "final_answer", "quick_turn"}
 
 _SYSTEMATIC_REVIEW_RUBRIC = """Systematic literature review:
 - handle multi-paper scope and requested constraints coherently;
@@ -49,12 +49,11 @@ _SCORE_ANCHORS = """All quality fields use these 0-4 anchors:
 
 
 type EvidenceKind = Literal[
-    "message",
-    "tool_call",
-    "tool_result",
+    "tool_chain",
     "error",
     "artifact",
     "final_answer",
+    "quick_turn",
 ]
 
 
@@ -71,6 +70,7 @@ class JudgeEvidenceBundle(BaseModel):
     user_input: str
     candidate_skills: dict[str, str]
     observed_route: str
+    evaluation_target: Literal["quick_turn", "final_output"] = "final_output"
     evidence: list[EvidenceItem]
     expected_output: str | None = None
 
@@ -163,48 +163,41 @@ def build_judge_evidence(
     trace: AgentTrace,
     observation: RouteObservation,
     skill_descriptions: dict[str, str],
+    target: Literal["final_output", "quick_turn"] = "final_output",
 ) -> JudgeEvidenceBundle:
     expected_candidates = set(CANDIDATE_SKILLS)
     if set(skill_descriptions) != expected_candidates:
         raise ValueError("skill descriptions must contain exactly: " + ", ".join(CANDIDATE_SKILLS))
+    quick_turn = trace.quick_turn
+    if target == "quick_turn" and quick_turn is None:
+        raise ValueError("quick_turn target requires a captured quick turn")
+
+    calls_by_id = {call.id: call for call in trace.tool_calls}
+    batches = trace.tool_call_chain
+    if target == "quick_turn" and quick_turn is not None:
+        batches = [batch for batch in batches if batch and calls_by_id[batch[0]].message_id != quick_turn.message_id]
 
     raw_items: list[tuple[str, EvidenceKind, str]] = []
-    for index, message in enumerate(trace.messages):
-        raw_items.append(
-            (
-                f"message[{index}]",
-                "message",
-                json.dumps(message, ensure_ascii=False, sort_keys=True, default=str),
+    for index, batch in enumerate(batches):
+        if not batch:
+            continue
+        calls = []
+        for call_id in batch:
+            call = calls_by_id[call_id]
+            calls.append(
+                {
+                    "id": call.id,
+                    "name": call.name,
+                    "args": call.args,
+                    "result": call.result,
+                    "error": call.error,
+                }
             )
-        )
-    for index, tool_call in enumerate(trace.tool_calls):
         raw_items.append(
             (
-                f"tool_call[{index}]",
-                "tool_call",
-                json.dumps(
-                    {
-                        "id": tool_call.id,
-                        "message_id": tool_call.message_id,
-                        "name": tool_call.name,
-                        "args": tool_call.args,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    default=str,
-                ),
-            )
-        )
-        raw_items.append(
-            (
-                f"tool_result[{index}]",
-                "tool_result",
-                json.dumps(
-                    {"result": tool_call.result, "error": tool_call.error},
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    default=str,
-                ),
+                f"tool_chain[{index}]",
+                "tool_chain",
+                json.dumps(calls, ensure_ascii=False, sort_keys=True, default=str),
             )
         )
     for index, error in enumerate(trace.errors):
@@ -224,7 +217,10 @@ def build_judge_evidence(
                 json.dumps(artifact.model_dump(), ensure_ascii=False, sort_keys=True),
             )
         )
-    raw_items.append(("final_answer", "final_answer", trace.final_answer))
+    if target == "quick_turn" and quick_turn is not None:
+        raw_items.append(("quick_turn", "quick_turn", quick_turn.content))
+    else:
+        raw_items.append(("final_answer", "final_answer", trace.final_answer))
 
     remaining = _EVIDENCE_TOTAL_BYTES
     items: list[EvidenceItem] = []
@@ -245,9 +241,19 @@ def build_judge_evidence(
         user_input=case.input,
         candidate_skills={candidate: skill_descriptions[candidate] for candidate in CANDIDATE_SKILLS},
         observed_route=str(observation.observed_route or "unavailable"),
+        evaluation_target=target,
         evidence=items,
         expected_output=case.expected_output,
     )
+
+
+def _strip_fences(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.removeprefix("```json").removeprefix("```").strip()
+        if text.endswith("```"):
+            text = text[:-3].strip()
+    return text
 
 
 def build_judge_prompt(bundle: JudgeEvidenceBundle) -> str:
@@ -283,18 +289,10 @@ async def judge_quality(bundle: JudgeEvidenceBundle, model: Any) -> QualityJudgm
     except Exception as exc:
         raise JudgeFailure(f"judge model call failed: {exc}") from exc
 
-    def _strip_fences(text: str) -> str:
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.removeprefix("```json").removeprefix("```").strip()
-            if text.endswith("```"):
-                text = text[:-3].strip()
-        return text
-
     try:
         judgment = QualityJudgment.model_validate_json(_strip_fences(output.completion))
     except (ValidationError, ValueError) as exc:
-        repair_prompt = _build_repair_prompt(output.completion, exc)
+        repair_prompt = _build_repair_prompt(output.completion, exc, QualityJudgment)
         try:
             repaired_output = await model.generate(repair_prompt)
             judgment = QualityJudgment.model_validate_json(_strip_fences(repaired_output.completion))
@@ -302,19 +300,19 @@ async def judge_quality(bundle: JudgeEvidenceBundle, model: Any) -> QualityJudgm
             raise JudgeFailure(f"judge output invalid after format repair: {repair_exc}") from repair_exc
 
     try:
-        _validate_evidence_references(bundle, judgment)
+        _validate_evidence_references(bundle, judgment.evidence)
     except JudgeFailure:
-        # If judge didn't cite final_answer/artifact, still accept it
-        # but fix the evidence list to include output evidence type
-        output_ids = {item.id for item in bundle.evidence if item.kind in ("final_answer", "artifact")}
-        judgment.evidence.extend(sorted(output_ids))
-        _validate_evidence_references(bundle, judgment)
+        output_ids = sorted(item.id for item in bundle.evidence if item.kind in _OUTPUT_EVIDENCE_KINDS)
+        for reference in output_ids:
+            if reference not in judgment.evidence:
+                judgment.evidence.append(reference)
+        _validate_evidence_references(bundle, judgment.evidence)
 
     return judgment
 
 
-def _build_repair_prompt(output: str, error: Exception) -> str:
-    schema = json.dumps(QualityJudgment.model_json_schema(), ensure_ascii=False, sort_keys=True)
+def _build_repair_prompt(output: str, error: Exception, schema_model: type[BaseModel]) -> str:
+    schema = json.dumps(schema_model.model_json_schema(), ensure_ascii=False, sort_keys=True)
     return f"""format correction only; do not reconsider scores or reasons.
 Return only corrected JSON matching this schema:
 {schema}
@@ -326,14 +324,15 @@ Parse or schema error:
 
 def _validate_evidence_references(
     bundle: JudgeEvidenceBundle,
-    judgment: QualityJudgment,
+    references: list[str],
 ) -> None:
     items = {item.id: item for item in bundle.evidence}
-    unknown = [reference for reference in judgment.evidence if reference not in items]
+    unknown = [reference for reference in references if reference not in items]
     if unknown:
         raise JudgeFailure(f"unknown evidence reference(s): {', '.join(unknown)}")
-    referenced_kinds = {items[reference].kind for reference in judgment.evidence}
-    if not referenced_kinds.intersection(_TRACE_EVIDENCE_KINDS):
-        raise JudgeFailure("judgment must cite trace or tool evidence")
+    referenced_kinds = {items[reference].kind for reference in references}
+    process_ids = {item.id for item in bundle.evidence if item.kind in _PROCESS_EVIDENCE_KINDS}
+    if process_ids and not referenced_kinds.intersection(_PROCESS_EVIDENCE_KINDS):
+        raise JudgeFailure("judgment must cite tool chain or error evidence")
     if not referenced_kinds.intersection(_OUTPUT_EVIDENCE_KINDS):
-        raise JudgeFailure("judgment must cite final answer or artifact evidence")
+        raise JudgeFailure("judgment must cite output evidence")
