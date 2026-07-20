@@ -32,7 +32,7 @@ def judgment_json(**updates):
         "overall_quality": 3,
         "fatal_error": False,
         "reasons": ["Observable behavior is sound."],
-        "evidence": ["tool_call[0]", "final_answer"],
+        "evidence": ["tool_chain[0]", "final_answer"],
     }
     payload.update(updates)
     return json.dumps(payload)
@@ -59,6 +59,7 @@ def quality_state():
                 result="skill body",
             )
         ],
+        tool_call_chain=[["t1"]],
     )
     observation = RouteObservation(
         observed_route="systematic-literature-review",
@@ -142,7 +143,7 @@ async def test_quality_scorer_rejects_failed_agent_run_before_judging(monkeypatc
 
 @pytest.mark.asyncio
 async def test_quality_judge_failure_returns_noanswer(monkeypatch):
-    model = FakeModel(judgment_json(evidence=["tool_call[999]", "final_answer"]))
+    model = FakeModel(judgment_json(evidence=["tool_chain[999]", "final_answer"]))
     monkeypatch.setattr("skill_eval.inspect_scorer.get_model", lambda _: model)
 
     score = await quality_judge_scorer("fake/judge", descriptions())(
