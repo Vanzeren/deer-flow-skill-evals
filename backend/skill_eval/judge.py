@@ -33,6 +33,13 @@ _NO_SKILL_RUBRIC = """No skill:
 - avoid unnecessary skill loading and tool work;
 - remain correct, relevant, and proportionate to the request."""
 
+_QUICK_TURN_RUBRIC = """Quick-turn rubric — you are scoring exactly one assistant turn:
+the first text turn the agent produced after loading the named skill.
+- the turn follows the loaded skill's workflow, format, and constraints;
+- the turn responds to the user's actual request;
+- the turn is coherent and self-sufficient given the observable evidence.
+Do not score later steps; do not infer work that is not in the evidence."""
+
 _COMMON_PROCESS_RUBRIC = """Common process rubric — assess observable execution only:
 - tool choice and ordering are coherent;
 - tool errors are handled rather than ignored;
@@ -88,6 +95,31 @@ class QualityJudgment(BaseModel):
     evidence: list[str] = Field(min_length=1)
 
     @field_validator("reasons", "evidence")
+    @classmethod
+    def reject_blank_entries(cls, values: list[str]) -> list[str]:
+        normalized = [value.strip() for value in values]
+        if any(not value for value in normalized):
+            raise ValueError("entries must not be blank")
+        return normalized
+
+
+class QuickJudgment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    turn_quality: int = Field(ge=0, le=4)
+    fatal_error: bool = False
+    rationale: str = Field(min_length=1)
+    evidence_references: list[str] = Field(min_length=1)
+
+    @field_validator("rationale")
+    @classmethod
+    def reject_blank_rationale(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("rationale must not be blank")
+        return normalized
+
+    @field_validator("evidence_references")
     @classmethod
     def reject_blank_entries(cls, values: list[str]) -> list[str]:
         normalized = [value.strip() for value in values]
@@ -307,6 +339,55 @@ async def judge_quality(bundle: JudgeEvidenceBundle, model: Any) -> QualityJudgm
             if reference not in judgment.evidence:
                 judgment.evidence.append(reference)
         _validate_evidence_references(bundle, judgment.evidence)
+
+    return judgment
+
+
+def build_quick_judge_prompt(bundle: JudgeEvidenceBundle) -> str:
+    schema = json.dumps(QuickJudgment.model_json_schema(), ensure_ascii=False, sort_keys=True)
+    payload = bundle.model_dump_json()
+    return f"""Evaluate only the observable behavior in the evidence bundle below.
+The bundle captures the first assistant text turn after the skill named in observed_route was loaded.
+Score that single turn only. Do not infer hidden reasoning or unobserved work.
+Cite only stable evidence IDs present in the bundle.
+Return JSON matching this schema and no prose outside JSON:
+{schema}
+
+{_QUICK_TURN_RUBRIC}
+
+{_SCORE_ANCHORS}
+
+Evidence bundle:
+{payload}"""
+
+
+async def judge_quick_turn(bundle: JudgeEvidenceBundle, model: Any) -> QuickJudgment:
+    prompt = build_quick_judge_prompt(bundle)
+    if bundle.expected_output:
+        prompt += f"\n\n## Expected Output Reference\n\nThe following describes what a good first turn should cover. Compare the agent's actual turn against this reference when scoring turn_quality:\n\n{bundle.expected_output}\n"
+    try:
+        output = await model.generate(prompt)
+    except Exception as exc:
+        raise JudgeFailure(f"judge model call failed: {exc}") from exc
+
+    try:
+        judgment = QuickJudgment.model_validate_json(_strip_fences(output.completion))
+    except (ValidationError, ValueError) as exc:
+        repair_prompt = _build_repair_prompt(output.completion, exc, QuickJudgment)
+        try:
+            repaired_output = await model.generate(repair_prompt)
+            judgment = QuickJudgment.model_validate_json(_strip_fences(repaired_output.completion))
+        except Exception as repair_exc:
+            raise JudgeFailure(f"judge output invalid after format repair: {repair_exc}") from repair_exc
+
+    try:
+        _validate_evidence_references(bundle, judgment.evidence_references)
+    except JudgeFailure:
+        output_ids = sorted(item.id for item in bundle.evidence if item.kind in _OUTPUT_EVIDENCE_KINDS)
+        for reference in output_ids:
+            if reference not in judgment.evidence_references:
+                judgment.evidence_references.append(reference)
+        _validate_evidence_references(bundle, judgment.evidence_references)
 
     return judgment
 

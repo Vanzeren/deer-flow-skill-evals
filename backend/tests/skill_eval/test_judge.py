@@ -2,13 +2,16 @@ import json
 
 import pytest
 from inspect_ai.model import ModelOutput
+from pydantic import ValidationError
 
 from skill_eval.case_schema import RoutingCase
 from skill_eval.judge import (
     JudgeFailure,
+    QuickJudgment,
     bounded_evidence,
     build_judge_evidence,
     judge_quality,
+    judge_quick_turn,
     load_candidate_skill_descriptions,
 )
 from skill_eval.routing import RouteObservation
@@ -358,5 +361,100 @@ async def test_judgment_may_cite_only_output_when_no_process_evidence(routing_ca
     model = FakeModel([valid_judgment_json(evidence=["final_answer"])])
 
     judgment = await judge_quality(bundle, model)
-
     assert judgment.overall_quality == 3
+
+
+def valid_quick_judgment_json(evidence=None, **updates):
+    payload = {
+        "turn_quality": 3,
+        "fatal_error": False,
+        "rationale": "The turn follows the loaded skill workflow.",
+        "evidence_references": evidence or ["tool_chain[0]", "quick_turn"],
+    }
+    payload.update(updates)
+    return json.dumps(payload)
+
+
+@pytest.fixture
+def quick_bundle(routing_case, route_observation):
+    trace = AgentTrace(
+        input="Review the paper.",
+        final_answer="",
+        success=True,
+        thread_id="thread-1",
+        tool_calls=[
+            AgentToolCall(id="t1", message_id="m1", name="read_file", args={"path": "SKILL.md"}, result="skill"),
+        ],
+        tool_call_chain=[["t1"]],
+        quick_turn=QuickTurnCapture(message_id="m2", skill="systematic-literature-review", content="Plan: ..."),
+    )
+    return build_judge_evidence(
+        case=routing_case,
+        trace=trace,
+        observation=route_observation,
+        skill_descriptions={
+            "systematic-literature-review": "multi-paper",
+            "academic-paper-review": "one-paper",
+        },
+        target="quick_turn",
+    )
+
+
+@pytest.mark.asyncio
+async def test_quick_judge_parses_structured_result(quick_bundle):
+    model = FakeModel([valid_quick_judgment_json()])
+
+    judgment = await judge_quick_turn(quick_bundle, model)
+
+    assert judgment.turn_quality == 3
+    assert judgment.fatal_error is False
+    assert "first assistant text turn" in model.prompts[0]
+    assert "expected_route" not in model.prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_quick_judge_repairs_format_once(quick_bundle):
+    model = FakeModel(["not json", valid_quick_judgment_json()])
+
+    judgment = await judge_quick_turn(quick_bundle, model)
+
+    assert judgment.turn_quality == 3
+    assert len(model.prompts) == 2
+
+
+@pytest.mark.asyncio
+async def test_quick_judge_rejects_second_parse_failure(quick_bundle):
+    model = FakeModel(["not json", "still not json"])
+
+    with pytest.raises(JudgeFailure, match="after format repair"):
+        await judge_quick_turn(quick_bundle, model)
+
+
+@pytest.mark.asyncio
+async def test_quick_judge_rejects_unknown_evidence(quick_bundle):
+    model = FakeModel([valid_quick_judgment_json(evidence=["tool_chain[9]", "quick_turn"])])
+
+    with pytest.raises(JudgeFailure, match="unknown evidence"):
+        await judge_quick_turn(quick_bundle, model)
+
+
+@pytest.mark.asyncio
+async def test_quick_judge_requires_process_evidence(quick_bundle):
+    model = FakeModel([valid_quick_judgment_json(evidence=["quick_turn"])])
+
+    with pytest.raises(JudgeFailure, match="tool chain or error evidence"):
+        await judge_quick_turn(quick_bundle, model)
+
+
+@pytest.mark.asyncio
+async def test_quick_judge_auto_adds_output_evidence_when_missing(quick_bundle):
+    model = FakeModel([valid_quick_judgment_json(evidence=["tool_chain[0]"])])
+
+    judgment = await judge_quick_turn(quick_bundle, model)
+
+    assert "quick_turn" in judgment.evidence_references
+
+
+def test_quick_judgment_rejects_blank_rationale():
+    with pytest.raises(ValidationError):
+        QuickJudgment.model_validate_json(valid_quick_judgment_json(rationale="  "))
