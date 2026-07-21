@@ -21,6 +21,7 @@ from app.gateway.routers.uploads import UploadResponse
 from deerflow.agents.middlewares.view_image_middleware import ViewImageMiddleware
 from deerflow.agents.thread_state import DeltaThreadState, ThreadState
 from deerflow.client import DeerFlowClient
+from deerflow.config.extensions_config import ExtensionsConfig, McpServerConfig
 from deerflow.config.paths import Paths
 from deerflow.skills.types import SkillCategory
 from deerflow.uploads.manager import PathTraversalError
@@ -1605,13 +1606,9 @@ class TestMcpConfig:
 
     def test_update_mcp_config(self, client):
         # Set up current config with skills
-        current_config = MagicMock()
-        current_config.skills = {}
+        current_config = ExtensionsConfig()
 
-        reloaded_server = MagicMock()
-        reloaded_server.model_dump.return_value = {"enabled": True, "type": "sse"}
-        reloaded_config = MagicMock()
-        reloaded_config.mcp_servers = {"new-server": reloaded_server}
+        reloaded_config = ExtensionsConfig(mcp_servers={"new-server": McpServerConfig(enabled=True, type="sse")})
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump({}, f)
@@ -1671,9 +1668,7 @@ class TestSkillsManagement:
         skill = self._make_skill(enabled=True)
         updated_skill = self._make_skill(enabled=False)
 
-        ext_config = MagicMock()
-        ext_config.mcp_servers = {}
-        ext_config.skills = {}
+        ext_config = ExtensionsConfig()
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump({}, f)
@@ -2395,13 +2390,9 @@ class TestScenarioConfigManagement:
             config_file.write_text("{}")
 
             # --- MCP update ---
-            current_config = MagicMock()
-            current_config.skills = {}
+            current_config = ExtensionsConfig()
 
-            reloaded_server = MagicMock()
-            reloaded_server.model_dump.return_value = {"enabled": True, "type": "sse"}
-            reloaded_config = MagicMock()
-            reloaded_config.mcp_servers = {"my-mcp": reloaded_server}
+            reloaded_config = ExtensionsConfig(mcp_servers={"my-mcp": McpServerConfig(enabled=True, type="sse")})
 
             client._agent = MagicMock()  # Simulate existing agent
             with (
@@ -2428,9 +2419,7 @@ class TestScenarioConfigManagement:
             toggled.category = "custom"
             toggled.enabled = False
 
-            ext_config = MagicMock()
-            ext_config.mcp_servers = {}
-            ext_config.skills = {}
+            ext_config = ExtensionsConfig()
 
             client._agent = MagicMock()  # Simulate re-created agent
             with (
@@ -2938,20 +2927,17 @@ class TestGatewayConformance:
         assert "test" in parsed.mcp_servers
 
     def test_update_mcp_config(self, client, tmp_path):
-        server = MagicMock()
-        server.model_dump.return_value = {
-            "enabled": True,
-            "type": "stdio",
-            "command": "npx",
-            "args": [],
-            "env": {},
-            "url": None,
-            "headers": {},
-            "description": "",
-        }
-        ext_config = MagicMock()
-        ext_config.mcp_servers = {"srv": server}
-        ext_config.skills = {}
+        server = McpServerConfig(
+            enabled=True,
+            type="stdio",
+            command="npx",
+            args=[],
+            env={},
+            url=None,
+            headers={},
+            description="",
+        )
+        ext_config = ExtensionsConfig(mcp_servers={"srv": server})
 
         config_file = tmp_path / "extensions_config.json"
         config_file.write_text("{}")
@@ -2961,7 +2947,7 @@ class TestGatewayConformance:
             patch("deerflow.client.ExtensionsConfig.resolve_config_path", return_value=config_file),
             patch("deerflow.client.reload_extensions_config", return_value=ext_config),
         ):
-            result = client.update_mcp_config({"srv": server.model_dump.return_value})
+            result = client.update_mcp_config({"srv": server.model_dump()})
 
         parsed = McpConfigResponse(**result)
         assert "srv" in parsed.mcp_servers
@@ -3720,10 +3706,8 @@ class TestBugAgentInvalidationInconsistency:
         client._agent = MagicMock()
         client._agent_config_key = ("model", True, False, False)
 
-        current_config = MagicMock()
-        current_config.skills = {}
-        reloaded = MagicMock()
-        reloaded.mcp_servers = {}
+        current_config = ExtensionsConfig()
+        reloaded = ExtensionsConfig()
 
         with tempfile.TemporaryDirectory() as tmp:
             config_file = Path(tmp) / "ext.json"
