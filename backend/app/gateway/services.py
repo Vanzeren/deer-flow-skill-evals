@@ -666,20 +666,30 @@ class _RawCheckpointReadAccessor:
     async def ahistory(self, config: dict[str, Any], *, limit: int | None = None) -> list[_RawCheckpointSnapshot]:
         if limit is not None and limit <= 0:
             return []
+        result: list[_RawCheckpointSnapshot] = []
         before = None
         walk_config = config
         if config.get("configurable", {}).get("checkpoint_id"):
+            # Pregel's get_state_history treats config.checkpoint_id as the
+            # inclusive start of the walk, while alist(before=...) is
+            # exclusive — fetch the anchor explicitly so the degraded path
+            # matches the graph path.
             before = config
             walk_config = {
                 **config,
                 "configurable": {k: v for k, v in config.get("configurable", {}).items() if k != "checkpoint_id"},
             }
-        result: list[_RawCheckpointSnapshot] = []
-        async for tup in self.checkpointer.alist(walk_config, before=before, limit=limit):
-            self._gate(tup)
-            result.append(_RawCheckpointSnapshot(config, tup))
-            if limit is not None and len(result) >= limit:
-                break
+            anchor = await self.checkpointer.aget_tuple(before)
+            self._gate(anchor)
+            if anchor is not None:
+                result.append(_RawCheckpointSnapshot(config, anchor))
+        if limit is None or len(result) < limit:
+            remaining = None if limit is None else limit - len(result)
+            async for tup in self.checkpointer.alist(walk_config, before=before, limit=remaining):
+                self._gate(tup)
+                result.append(_RawCheckpointSnapshot(config, tup))
+                if limit is not None and len(result) >= limit:
+                    break
         return result
 
 

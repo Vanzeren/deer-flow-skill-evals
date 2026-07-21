@@ -211,7 +211,24 @@ def test_full_mode_state_reads_degrade_to_raw_checkpointer_when_factory_fails(_s
 
         history_response = client.post(f"/api/threads/{_THREAD_ID}/history", json={"limit": 10})
         assert history_response.status_code == 200, history_response.text
-        assert len(history_response.json()) >= 2
+        entries = history_response.json()
+        assert len(entries) >= 2
+
+        # History pagination: config.checkpoint_id is the *inclusive* anchor
+        # (pregel semantics), so the degraded path must include it too.
+        anchor_id = entries[1]["checkpoint_id"]
+        paged_response = client.post(f"/api/threads/{_THREAD_ID}/history", json={"limit": 10, "before": anchor_id})
+        assert paged_response.status_code == 200, paged_response.text
+        assert paged_response.json()[0]["checkpoint_id"] == anchor_id
+
+        thread_response = client.get(f"/api/threads/{_THREAD_ID}")
+        assert thread_response.status_code == 200, thread_response.text
+        assert _message_wire_shape(thread_response.json()["values"]["messages"]) == [
+            ("human", "question-0", "h0"),
+            ("ai", "answer-1", "a1"),
+            ("human", "question-1", "h1"),
+            ("ai", "answer-3", "a3"),
+        ]
 
         # The fail-closed gate still applies on the degraded path: a delta
         # checkpoint is a precise 409, never silently served as partial state.
