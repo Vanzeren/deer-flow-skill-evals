@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 from app.gateway.authz import require_permission
 from app.gateway.deps import get_current_user, get_feedback_repo, get_run_event_store, get_run_manager, get_run_store, get_stream_bridge
 from app.gateway.pagination import trim_run_message_page
-from app.gateway.services import build_checkpoint_state_accessor, sse_consumer, start_run, wait_for_run_completion
+from app.gateway.services import build_checkpoint_state_accessor, build_thread_checkpoint_state_accessor, sse_consumer, start_run, wait_for_run_completion
 from deerflow.runtime import CancelOutcome, RunRecord, RunStatus, serialize_channel_values_for_api
 from deerflow.utils.messages import ORIGINAL_USER_CONTENT_KEY, get_original_user_content_text, message_to_text
 from deerflow.workspace_changes import get_workspace_changes_response
@@ -386,7 +386,7 @@ async def _find_target_run_id(thread_id: str, message_id: str, target_message: A
 
 
 async def _find_base_checkpoint_before_human(thread_id: str, human_message_id: str, request: Request) -> Any:
-    accessor, base_config = build_checkpoint_state_accessor(request, thread_id=thread_id)
+    accessor, base_config = await build_thread_checkpoint_state_accessor(request, thread_id=thread_id)
     try:
         raw_checkpoints = await accessor.ahistory(base_config, limit=REGENERATE_HISTORY_RAW_SCAN_LIMIT)
         checkpoints = [item for item in raw_checkpoints if not _is_duration_only_checkpoint(item)]
@@ -422,7 +422,7 @@ async def _find_base_checkpoint_before_human(thread_id: str, human_message_id: s
 
 
 async def _prepare_regenerate_payload(thread_id: str, message_id: str, request: Request) -> RegeneratePrepareResponse:
-    accessor, latest_config = build_checkpoint_state_accessor(request, thread_id=thread_id)
+    accessor, latest_config = await build_thread_checkpoint_state_accessor(request, thread_id=thread_id)
     try:
         latest_checkpoint = await accessor.aget(latest_config)
     except Exception as exc:

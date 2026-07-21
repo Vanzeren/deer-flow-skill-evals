@@ -720,6 +720,7 @@ def test_latest_thread_readers_use_materialized_snapshot_values() -> None:
 
     asyncio.run(_seed())
     accessor = _FakeStateAccessor(_materialized_snapshot())
+    thread_accessor = AsyncMock(return_value=(accessor, {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}))
 
     with (
         patch(
@@ -729,7 +730,7 @@ def test_latest_thread_readers_use_materialized_snapshot_values() -> None:
         ),
         patch(
             "app.gateway.routers.threads.build_thread_checkpoint_state_accessor",
-            new=AsyncMock(return_value=(accessor, {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}})),
+            new=thread_accessor,
         ),
         TestClient(app) as client,
     ):
@@ -743,6 +744,7 @@ def test_latest_thread_readers_use_materialized_snapshot_values() -> None:
     assert [message["id"] for message in thread_response.json()["values"]["messages"]] == ["h1", "a1"]
     assert [message["id"] for message in state_response.json()["values"]["messages"]] == ["h1", "a1"]
     assert [message["id"] for message in history_response.json()[0]["values"]["messages"]] == ["h1", "a1"]
+    assert [call.kwargs["thread_id"] for call in thread_accessor.await_args_list] == [thread_id, thread_id]
 
 
 def test_get_thread_status_uses_raw_pending_writes_for_materialized_checkpoint() -> None:

@@ -1179,7 +1179,7 @@ async def get_thread_history(
     """
     checkpointer = get_checkpointer(request)
     try:
-        accessor, config = build_checkpoint_state_accessor(
+        accessor, config = await build_thread_checkpoint_state_accessor(
             request,
             thread_id=thread_id,
             checkpoint_id=body.before,

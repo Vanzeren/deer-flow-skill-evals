@@ -98,7 +98,11 @@ def _patch_checkpoint_accessor(monkeypatch):
             config["configurable"]["checkpoint_id"] = checkpoint_id
         return FakeAccessor(request.app.state.checkpointer), config
 
+    async def build_thread_accessor(request, *, thread_id, checkpoint_id=None):
+        return build_accessor(request, thread_id=thread_id, checkpoint_id=checkpoint_id)
+
     monkeypatch.setattr(thread_runs, "build_checkpoint_state_accessor", build_accessor)
+    monkeypatch.setattr(thread_runs, "build_thread_checkpoint_state_accessor", build_thread_accessor)
 
 
 class FakeEventStore:
@@ -299,7 +303,7 @@ def test_run_wait_readers_preserve_terminal_error_when_accessor_builder_fails(ro
 
 
 def test_prepare_regenerate_payload_returns_clean_input_and_base_checkpoint():
-    from app.gateway.routers.thread_runs import _prepare_regenerate_payload
+    from app.gateway.routers import thread_runs
 
     human = HumanMessage(
         id="human-1",
@@ -326,7 +330,12 @@ def test_prepare_regenerate_payload_returns_clean_input_and_base_checkpoint():
         ]
     )
 
-    response = asyncio.run(_prepare_regenerate_payload("thread-1", "ai-1", _request(checkpointer, event_store)))
+    original_builder = thread_runs.build_thread_checkpoint_state_accessor
+    thread_builder = AsyncMock(side_effect=original_builder)
+    with patch.object(thread_runs, "build_thread_checkpoint_state_accessor", thread_builder):
+        response = asyncio.run(thread_runs._prepare_regenerate_payload("thread-1", "ai-1", _request(checkpointer, event_store)))
+
+    assert [call.kwargs["thread_id"] for call in thread_builder.await_args_list] == ["thread-1", "thread-1"]
 
     assert response.checkpoint == {
         "checkpoint_ns": "",
