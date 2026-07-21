@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Annotated, NotRequired, TypedDict
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph.message import add_messages
 from langgraph.types import Overwrite
 
 from app.gateway import services as gateway_services
 from deerflow.runtime import context_compaction
+from deerflow.runtime.checkpoint_state import CheckpointStateAccessor
 from deerflow.runtime.context_compaction import compact_thread_context
 
 
@@ -167,6 +170,69 @@ async def test_compact_thread_context_real_mutation_graph_finishes_without_sched
     assert [message.id for message in snapshot.values["messages"]] == ["h2"]
     assert snapshot.values["summary_text"] == "COMPRESSED SUMMARY"
     assert snapshot.next == ()
+
+
+@pytest.mark.asyncio
+async def test_compact_thread_context_preserves_middleware_contributed_channels(monkeypatch):
+    """Compaction must not drop channels the base ThreadState does not know.
+
+    Contract lock for fork inheritance: the compaction write carries only
+    messages + summary_text (base channels), so a middleware-contributed
+    channel survives even though the mutation graph compiles with the base
+    schema. If LangGraph ever stops cloning unknown channels into forked
+    checkpoints, this test fails before production state is lost.
+    """
+    from deerflow.runtime.checkpoint_state import build_state_mutation_graph
+
+    class ExtensionState(TypedDict):
+        messages: Annotated[list, add_messages]
+        memory_notes: NotRequired[str]
+
+    messages = [
+        HumanMessage(id="h1", content="old question"),
+        AIMessage(id="a1", content="old answer"),
+        HumanMessage(id="h2", content="latest question"),
+    ]
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                checkpointer=InMemorySaver(),
+                checkpoint_channel_mode="full",
+                store=None,
+            )
+        )
+    )
+    seed_graph = build_state_mutation_graph("seed", "full", ExtensionState)
+    seed_accessor = CheckpointStateAccessor.bind(seed_graph, request.app.state.checkpointer, mode="full")
+    seed_config = {"configurable": {"thread_id": "thread-ext-compaction", "checkpoint_ns": ""}}
+    await seed_accessor.aupdate(
+        seed_config,
+        {"messages": messages, "memory_notes": "extension-value"},
+        as_node="seed",
+    )
+
+    # Production path: compact uses the base-schema mutation accessor.
+    accessor, config = gateway_services.build_checkpoint_state_mutation_accessor(
+        request,
+        thread_id="thread-ext-compaction",
+        as_node="manual_compaction",
+    )
+    monkeypatch.setattr(
+        context_compaction,
+        "_create_compaction_middleware",
+        lambda **_kwargs: _FakeCompactionMiddleware(),
+    )
+
+    result = await compact_thread_context(
+        accessor,
+        "thread-ext-compaction",
+        app_config=SimpleNamespace(),
+    )
+    snapshot = await seed_accessor.aget(config)
+
+    assert result.compacted is True
+    assert [message.id for message in snapshot.values["messages"]] == ["h2"]
+    assert snapshot.values["memory_notes"] == "extension-value"
 
 
 @pytest.mark.asyncio

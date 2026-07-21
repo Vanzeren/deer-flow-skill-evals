@@ -45,7 +45,12 @@ from deerflow.runtime import (
     build_state_mutation_graph,
     run_agent,
 )
-from deerflow.runtime.checkpoint_mode import INTERNAL_CHECKPOINT_MODE_KEY, inject_checkpoint_mode
+from deerflow.runtime.checkpoint_mode import (
+    INTERNAL_CHECKPOINT_MODE_KEY,
+    CheckpointModeMismatchError,
+    checkpoint_tuple_uses_delta,
+    inject_checkpoint_mode,
+)
 from deerflow.runtime.checkpoint_state import graph_state_schema
 from deerflow.runtime.goal import goal_thread_lock
 from deerflow.runtime.runs.naming import resolve_root_run_name
@@ -590,23 +595,92 @@ def build_checkpoint_state_mutation_accessor(
 # Cache of factory-built accessor graphs. Accessor operations (aget_state /
 # aupdate_state) never execute graph nodes or middleware, so per-request
 # variations (user, model, skills) cannot affect materialization semantics;
-# the compiled graph is stable per (assistant_id, mode). The factory identity
-# is re-validated on every call so patched/plugged factories take effect
-# immediately. Bounded: cleared when too many distinct assistants appear.
+# the compiled graph is stable per (assistant_id, mode, app_config). The
+# factory and app_config identities are re-validated on every call so patched
+# factories take effect immediately and a config.yaml hot-reload (which
+# rebuilds the AppConfig object) never serves a stale compiled graph — the
+# cached reference keeps the old config alive, so id-reuse cannot produce a
+# false hit. Bounded: cleared when too many distinct assistants appear.
 _STATE_ACCESSOR_GRAPH_CACHE_MAX = 64
-_state_accessor_graph_cache: dict[tuple[str | None, str], tuple[Any, Any]] = {}
+_state_accessor_graph_cache: dict[tuple[str | None, str], tuple[Any, Any, Any]] = {}
 
 
 def _state_accessor_graph(agent_factory: Any, assistant_id: str | None, mode: str, config: dict[str, Any]) -> Any:
+    app_config = (config.get("context") or {}).get("app_config")
     key = (assistant_id, mode)
     cached = _state_accessor_graph_cache.get(key)
-    if cached is not None and cached[0] is agent_factory:
-        return cached[1]
+    if cached is not None and cached[0] is agent_factory and cached[1] is app_config:
+        return cached[2]
     if len(_state_accessor_graph_cache) >= _STATE_ACCESSOR_GRAPH_CACHE_MAX:
         _state_accessor_graph_cache.clear()
     graph = agent_factory(config=config)
-    _state_accessor_graph_cache[key] = (agent_factory, graph)
+    _state_accessor_graph_cache[key] = (agent_factory, app_config, graph)
     return graph
+
+
+class _RawCheckpointSnapshot:
+    """StateSnapshot-shaped view over a raw checkpoint tuple (full mode only).
+
+    ``next``/``tasks`` are not derivable without the compiled graph and
+    degrade to empty; everything the read endpoints serialize (values,
+    metadata, config ancestry, created_at) comes straight from the tuple.
+    """
+
+    __slots__ = ("config", "values", "metadata", "parent_config", "created_at", "tasks", "next")
+
+    def __init__(self, config: dict[str, Any], tup: Any | None) -> None:
+        self.config = getattr(tup, "config", None) or config
+        checkpoint = getattr(tup, "checkpoint", None) or {}
+        self.values = dict(checkpoint.get("channel_values") or {})
+        self.metadata = dict(getattr(tup, "metadata", None) or {})
+        self.parent_config = getattr(tup, "parent_config", None)
+        self.created_at = self.metadata.get("created_at", "")
+        self.tasks: tuple = ()
+        self.next: tuple = ()
+
+
+class _RawCheckpointReadAccessor:
+    """Degraded full-mode read accessor for when the agent factory is down.
+
+    Full-mode checkpoints persist complete ``channel_values``, so reads do not
+    need the compiled graph. The fail-closed delta gate still applies: delta
+    checkpoints are rejected with :class:`CheckpointModeMismatchError` instead
+    of being served as partial state. Writes are unsupported — mutation paths
+    keep using the graph-backed accessor.
+    """
+
+    def __init__(self, checkpointer: Any, mode: str) -> None:
+        self.checkpointer = checkpointer
+        self.mode = mode
+
+    @staticmethod
+    def _gate(tup: Any) -> None:
+        if checkpoint_tuple_uses_delta(tup):
+            raise CheckpointModeMismatchError("Thread requires delta mode; materialize and convert its checkpoints before using full mode.")
+
+    async def aget(self, config: dict[str, Any]) -> _RawCheckpointSnapshot:
+        tup = await self.checkpointer.aget_tuple(config)
+        self._gate(tup)
+        return _RawCheckpointSnapshot(config, tup)
+
+    async def ahistory(self, config: dict[str, Any], *, limit: int | None = None) -> list[_RawCheckpointSnapshot]:
+        if limit is not None and limit <= 0:
+            return []
+        before = None
+        walk_config = config
+        if config.get("configurable", {}).get("checkpoint_id"):
+            before = config
+            walk_config = {
+                **config,
+                "configurable": {k: v for k, v in config.get("configurable", {}).items() if k != "checkpoint_id"},
+            }
+        result: list[_RawCheckpointSnapshot] = []
+        async for tup in self.checkpointer.alist(walk_config, before=before, limit=limit):
+            self._gate(tup)
+            result.append(_RawCheckpointSnapshot(config, tup))
+            if limit is not None and len(result) >= limit:
+                break
+        return result
 
 
 def build_checkpoint_state_accessor(
@@ -629,7 +703,22 @@ def build_checkpoint_state_accessor(
     inject_checkpoint_mode(config, ctx.checkpoint_channel_mode)
 
     agent_factory = resolve_agent_factory(assistant_id)
-    graph = _state_accessor_graph(agent_factory, assistant_id, ctx.checkpoint_channel_mode, config)
+    try:
+        graph = _state_accessor_graph(agent_factory, assistant_id, ctx.checkpoint_channel_mode, config)
+    except Exception:
+        if ctx.checkpoint_channel_mode != "full":
+            # Delta materialization needs the graph's channel table; there is
+            # no degraded path. Surface the factory failure as-is.
+            raise
+        # Full-mode checkpoints carry complete channel_values: degrade to raw
+        # checkpointer reads so state endpoints survive a broken agent factory
+        # (bad model config, MCP server down, misconfigured skill).
+        logger.warning(
+            "Agent factory unavailable for thread %s; falling back to raw checkpointer reads",
+            thread_id,
+            exc_info=True,
+        )
+        return _RawCheckpointReadAccessor(ctx.checkpointer, ctx.checkpoint_channel_mode), config
     accessor = CheckpointStateAccessor.bind(
         graph,
         ctx.checkpointer,

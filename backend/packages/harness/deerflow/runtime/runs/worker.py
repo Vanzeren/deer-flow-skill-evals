@@ -39,7 +39,7 @@ from deerflow.runtime.checkpoint_mode import (
     aensure_checkpoint_mode_compatible,
     inject_checkpoint_mode,
 )
-from deerflow.runtime.checkpoint_state import CheckpointStateAccessor, build_state_mutation_graph
+from deerflow.runtime.checkpoint_state import CheckpointStateAccessor, build_state_mutation_graph, graph_state_schema
 from deerflow.runtime.context_keys import CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY
 from deerflow.runtime.goal import (
     DEFAULT_MAX_GOAL_CONTINUATIONS,
@@ -1202,7 +1202,11 @@ async def _rollback_to_pre_run_checkpoint(
         logger.warning("Run %s rollback skipped: agent accessor unavailable", run_id)
         return
 
-    mutation_graph = build_state_mutation_graph("rollback_restore", accessor.mode)
+    # The restored checkpoint inherits every channel from the pre-run fork;
+    # compile the mutation graph with the thread's effective schema so
+    # middleware-contributed channels survive (the base ThreadState fallback
+    # would silently drop them).
+    mutation_graph = build_state_mutation_graph("rollback_restore", accessor.mode, graph_state_schema(getattr(accessor, "graph", None)))
     mutation_accessor = CheckpointStateAccessor.bind(mutation_graph, checkpointer, mode=accessor.mode)
     restored_config = await mutation_accessor.aupdate(
         rollback_point.config,

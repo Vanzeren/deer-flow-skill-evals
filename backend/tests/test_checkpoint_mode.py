@@ -8,6 +8,7 @@ from deerflow.runtime.checkpoint_mode import (
     CHECKPOINT_MODE_METADATA_KEY,
     CheckpointModeMismatchError,
     aensure_checkpoint_mode_compatible,
+    checkpoint_metadata_uses_delta,
     ensure_checkpoint_mode_compatible,
     inject_checkpoint_mode,
 )
@@ -71,6 +72,46 @@ async def test_delta_mode_accepts_plain_full_checkpoint() -> None:
         checkpoint={"channel_values": {"messages": ["legacy"]}},
     )
     await aensure_checkpoint_mode_compatible(saver, _config(), "delta")
+
+
+@pytest.mark.anyio
+async def test_full_mode_accessor_rejects_real_delta_checkpoint_on_sqlite(tmp_path) -> None:
+    """Fail-closed gate against a real saver, not mocks.
+
+    Seeds a delta checkpoint (marker + LangGraph delta counters) into a real
+    AsyncSqliteSaver, reopens the thread with a full-mode accessor, and
+    asserts every accessor surface raises before state is read or written.
+    This is the integration boundary the corruption-prevention design relies
+    on; the mock-based tests above cannot catch a wiring regression between
+    the accessor, the marker, and a real backend.
+    """
+    from langchain_core.messages import HumanMessage
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+    from langgraph.types import Overwrite
+
+    from deerflow.runtime.checkpoint_state import CheckpointStateAccessor, build_state_mutation_graph
+
+    config = _config()
+    async with AsyncSqliteSaver.from_conn_string(str(tmp_path / "gate.db")) as saver:
+        await saver.setup()
+        delta_accessor = CheckpointStateAccessor.bind(build_state_mutation_graph("seed", "delta"), saver, mode="delta")
+        await delta_accessor.aupdate(
+            config,
+            {"messages": Overwrite([HumanMessage(content="hi", id="h1")])},
+            as_node="seed",
+        )
+
+        # Sanity: the seeded head really is a delta checkpoint.
+        seeded = await saver.aget_tuple(config)
+        assert checkpoint_metadata_uses_delta(seeded.metadata)
+
+        full_accessor = CheckpointStateAccessor.bind(build_state_mutation_graph("read", "full"), saver, mode="full")
+        with pytest.raises(CheckpointModeMismatchError, match="requires delta mode"):
+            await full_accessor.aget(config)
+        with pytest.raises(CheckpointModeMismatchError, match="requires delta mode"):
+            await full_accessor.aupdate(config, {"title": "x"}, as_node="read")
+        with pytest.raises(CheckpointModeMismatchError, match="requires delta mode"):
+            await full_accessor.ahistory(config)
 
 
 def test_yaml_mode_change_is_rejected_when_graph_is_reconstructed(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

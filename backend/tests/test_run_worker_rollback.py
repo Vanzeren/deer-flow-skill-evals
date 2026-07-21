@@ -2,7 +2,7 @@ import asyncio
 import copy
 from contextlib import suppress
 from types import SimpleNamespace
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, NotRequired, TypedDict
 from unittest.mock import AsyncMock, call, patch
 
 import pytest
@@ -568,6 +568,70 @@ def _build_message_and_artifact_graph(checkpointer: Any):
     builder.set_entry_point("append")
     builder.set_finish_point("append")
     return builder.compile(checkpointer=checkpointer)
+
+
+class _ExtensionFullState(TypedDict):
+    """Full-mode schema with a channel base ThreadState does not know about.
+
+    Mirrors a custom ``AgentMiddleware.state_schema`` contribution (memory,
+    todos, uploads, …): absent from the base schema the mutation graph falls
+    back to, so a base-schema restore silently drops it.
+    """
+
+    messages: Annotated[list[AnyMessage], add_messages]
+    memory_notes: NotRequired[str]
+
+
+class _ExtensionDeltaState(TypedDict):
+    messages: Annotated[list[AnyMessage], DeltaChannel(merge_message_writes, snapshot_frequency=1000)]
+    memory_notes: NotRequired[str]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "mode,state_schema",
+    [("full", _ExtensionFullState), ("delta", _ExtensionDeltaState)],
+)
+async def test_rollback_preserves_middleware_contributed_channels(mode, state_schema):
+    """The rollback mutation graph must compile with the thread's effective schema.
+
+    Regression: ``_rollback_to_pre_run_checkpoint`` used to build the mutation
+    graph from the base ThreadState fallback, silently dropping channels
+    contributed by custom middleware from the restored checkpoint.
+    """
+    checkpointer = InMemorySaver()
+
+    async def _step(state: dict[str, Any]) -> dict[str, Any]:
+        n = len(state.get("messages") or [])
+        return {"messages": [HumanMessage(content=f"turn-{n}")], "memory_notes": f"note-{n}"}
+
+    builder = StateGraph(state_schema)
+    builder.add_node("step", _step)
+    builder.set_entry_point("step")
+    builder.set_finish_point("step")
+    graph = builder.compile(checkpointer=checkpointer)
+
+    accessor = CheckpointStateAccessor.bind(graph, checkpointer, mode=mode)
+    thread_config = {"configurable": {"thread_id": "thread-1"}}
+
+    await graph.ainvoke({}, thread_config)
+    rollback_point = await _capture_rollback_point(accessor, checkpointer, thread_config)
+    assert rollback_point is not None
+
+    await graph.ainvoke({}, thread_config)
+
+    await _rollback_to_pre_run_checkpoint(
+        accessor=accessor,
+        checkpointer=checkpointer,
+        thread_id="thread-1",
+        run_id="run-1",
+        rollback_point=rollback_point,
+        snapshot_capture_failed=False,
+    )
+
+    latest_snapshot = await accessor.aget(thread_config)
+    assert [message.content for message in latest_snapshot.values["messages"]] == ["turn-0"]
+    assert latest_snapshot.values["memory_notes"] == "note-0"
 
 
 @pytest.mark.anyio
