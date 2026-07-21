@@ -227,8 +227,19 @@ def test_full_mode_state_reads_degrade_to_raw_checkpointer_when_factory_fails(_s
         assert paged_response.status_code == 200, paged_response.text
         assert paged_response.json()[0]["checkpoint_id"] == anchor_id
 
+        app.state.thread_store.get = AsyncMock(
+            return_value={
+                "thread_id": _THREAD_ID,
+                "assistant_id": None,
+                "status": "interrupted",
+                "created_at": latest_created_at,
+                "updated_at": latest_created_at,
+                "metadata": {},
+            }
+        )
         thread_response = client.get(f"/api/threads/{_THREAD_ID}")
         assert thread_response.status_code == 200, thread_response.text
+        assert thread_response.json()["status"] == "interrupted"
         assert _message_wire_shape(thread_response.json()["values"]["messages"]) == [
             ("human", "question-0", "h0"),
             ("ai", "answer-1", "a1"),
@@ -245,3 +256,21 @@ def test_full_mode_state_reads_degrade_to_raw_checkpointer_when_factory_fails(_s
         delta_response = client.get("/api/threads/thread-degraded-delta/state")
         assert delta_response.status_code == 409, delta_response.text
         assert "requires delta mode" in delta_response.json()["detail"]
+
+
+def test_mutation_accessor_fails_closed_when_thread_metadata_lookup_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = make_authed_test_app()
+    app.state.thread_store.get = AsyncMock(side_effect=RuntimeError("metadata store unavailable"))
+    resolve_factory = AsyncMock()
+    monkeypatch.setattr(gateway_services, "resolve_agent_factory", resolve_factory)
+
+    with pytest.raises(RuntimeError, match="metadata store unavailable"):
+        asyncio.run(
+            gateway_services.build_thread_checkpoint_state_mutation_accessor(
+                SimpleNamespace(app=app),
+                thread_id="custom-assistant-thread",
+                as_node="manual_state_update",
+            )
+        )
+
+    resolve_factory.assert_not_called()

@@ -626,7 +626,7 @@ class _RawCheckpointSnapshot:
     metadata, config ancestry, created_at) comes straight from the tuple.
     """
 
-    __slots__ = ("config", "values", "metadata", "parent_config", "created_at", "tasks", "next")
+    __slots__ = ("config", "values", "metadata", "parent_config", "created_at", "tasks", "tasks_known", "next")
 
     def __init__(self, config: dict[str, Any], tup: Any | None) -> None:
         self.config = getattr(tup, "config", None) or config
@@ -636,6 +636,7 @@ class _RawCheckpointSnapshot:
         self.parent_config = getattr(tup, "parent_config", None)
         self.created_at = checkpoint.get("ts") or self.metadata.get("created_at", "")
         self.tasks: tuple = ()
+        self.tasks_known = False
         self.next: tuple = ()
 
 
@@ -738,11 +739,17 @@ def build_checkpoint_state_accessor(
     return accessor, config
 
 
-async def resolve_thread_assistant_id(request: Request, thread_id: str) -> str | None:
+async def resolve_thread_assistant_id(
+    request: Request,
+    thread_id: str,
+    *,
+    fail_closed: bool = False,
+) -> str | None:
     """Return the assistant_id recorded in thread metadata, or ``None``.
 
-    Missing store/record degrades to ``None`` (the default lead agent),
-    matching the pre-boundary behavior of the state endpoints.
+    Missing records degrade to ``None`` (the default lead agent). Store
+    failures do the same for read callers, while mutation callers set
+    ``fail_closed`` so they cannot compile a write graph with the wrong schema.
     """
     from app.gateway.deps import get_thread_store
 
@@ -751,6 +758,8 @@ async def resolve_thread_assistant_id(request: Request, thread_id: str) -> str |
         record = await thread_store.get(thread_id)
     except Exception:
         logger.warning("Failed to resolve assistant_id for thread %s", thread_id, exc_info=True)
+        if fail_closed:
+            raise
         return None
     return record.get("assistant_id") if isinstance(record, dict) else None
 
@@ -760,6 +769,7 @@ async def build_thread_checkpoint_state_accessor(
     *,
     thread_id: str,
     checkpoint_id: str | None = None,
+    fail_closed: bool = False,
 ) -> tuple[CheckpointStateAccessor, dict[str, Any]]:
     """Single resolution boundary for state endpoints.
 
@@ -767,7 +777,7 @@ async def build_thread_checkpoint_state_accessor(
     with the default lead schema would drop channels contributed by a custom
     ``AgentMiddleware.state_schema`` from the response.
     """
-    assistant_id = await resolve_thread_assistant_id(request, thread_id)
+    assistant_id = await resolve_thread_assistant_id(request, thread_id, fail_closed=fail_closed)
     return build_checkpoint_state_accessor(
         request,
         thread_id=thread_id,
@@ -793,6 +803,7 @@ async def build_thread_checkpoint_state_mutation_accessor(
         request,
         thread_id=thread_id,
         checkpoint_id=checkpoint_id,
+        fail_closed=True,
     )
     state_schema = graph_state_schema(getattr(read_accessor, "graph", None))
     return build_checkpoint_state_mutation_accessor(

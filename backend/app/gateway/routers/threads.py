@@ -455,7 +455,7 @@ async def _fetch_raw_pending_writes(checkpointer: Any, config: dict[str, Any]) -
     return list(getattr(raw_tuple, "pending_writes", ()) or ())
 
 
-def _derive_thread_status(snapshot: Any, pending_writes: list[Any]) -> str:
+def _derive_thread_status(snapshot: Any, pending_writes: list[Any], *, fallback_status: str = "idle") -> str:
     """Derive thread status from the materialized snapshot plus the raw
     pending writes attached to the resolved checkpoint."""
     if snapshot is None:
@@ -469,6 +469,9 @@ def _derive_thread_status(snapshot: Any, pending_writes: list[Any]) -> str:
     for task in tasks:
         if getattr(task, "error", None) is not None:
             return "error"
+
+    if not getattr(snapshot, "tasks_known", True):
+        return fallback_status
 
     if tasks:
         return "interrupted"
@@ -884,7 +887,8 @@ async def get_thread(thread_id: str, request: Request) -> ThreadResponse:
             "updated_at": coerce_iso(metadata.get("updated_at", snapshot.created_at or metadata.get("created_at", ""))),
             "metadata": {key: value for key, value in metadata.items() if key not in ("created_at", "updated_at", "step", "source", "writes", "parents")},
         }
-    status = _derive_thread_status(snapshot, pending_writes) if checkpoint_id else record.get("status", "idle")
+    stored_status = record.get("status", "idle")
+    status = _derive_thread_status(snapshot, pending_writes, fallback_status=stored_status) if checkpoint_id else stored_status
 
     return ThreadResponse(
         thread_id=thread_id,
