@@ -187,6 +187,9 @@ def test_full_mode_state_reads_degrade_to_raw_checkpointer_when_factory_fails(_s
     inject_checkpoint_mode(config, "full")
     for i in range(2):
         asyncio.run(full_graph.ainvoke({"messages": [HumanMessage(content=f"question-{i}", id=f"h{i}")]}, config))
+    latest = asyncio.run(checkpointer.aget_tuple(config))
+    assert latest is not None
+    latest_created_at = latest.checkpoint["ts"]
 
     def _broken_factory(assistant_id=None):
         def _factory(config):
@@ -200,6 +203,8 @@ def test_full_mode_state_reads_degrade_to_raw_checkpointer_when_factory_fails(_s
         state_response = client.get(f"/api/threads/{_THREAD_ID}/state")
         assert state_response.status_code == 200, state_response.text
         values = state_response.json()["values"]
+        assert state_response.json()["created_at"] == latest_created_at
+        assert state_response.json()["checkpoint"]["ts"] == latest_created_at
         assert _message_wire_shape(values["messages"]) == [
             ("human", "question-0", "h0"),
             ("ai", "answer-1", "a1"),
@@ -213,6 +218,7 @@ def test_full_mode_state_reads_degrade_to_raw_checkpointer_when_factory_fails(_s
         assert history_response.status_code == 200, history_response.text
         entries = history_response.json()
         assert len(entries) >= 2
+        assert all(entry["created_at"] for entry in entries)
 
         # History pagination: config.checkpoint_id is the *inclusive* anchor
         # (pregel semantics), so the degraded path must include it too.

@@ -634,7 +634,7 @@ class _RawCheckpointSnapshot:
         self.values = dict(checkpoint.get("channel_values") or {})
         self.metadata = dict(getattr(tup, "metadata", None) or {})
         self.parent_config = getattr(tup, "parent_config", None)
-        self.created_at = self.metadata.get("created_at", "")
+        self.created_at = checkpoint.get("ts") or self.metadata.get("created_at", "")
         self.tasks: tuple = ()
         self.next: tuple = ()
 
