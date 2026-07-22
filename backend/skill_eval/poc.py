@@ -57,7 +57,7 @@ class PocConfig(BaseModel):
     skills_root: Path = Path("../skills/public")
     config_path: str | None = None
     smoke: bool = False
-    quality_mode: Literal["quick", "full", "both"] = "both"
+    modes: tuple[Literal["routing", "quick", "full"], ...] = ("routing", "quick", "full")
 
     @classmethod
     def from_env(
@@ -66,7 +66,7 @@ class PocConfig(BaseModel):
         case_file: str | Path | None = None,
         output_dir: str | Path | None = None,
         smoke: bool = False,
-        quality_mode: str = "both",
+        modes: tuple[str, ...] | None = None,
     ) -> "PocConfig":
         agent_model = os.getenv("AGENT_MODEL", "").strip()
         judge_model = os.getenv("JUDGE_MODEL", "").strip()
@@ -84,9 +84,10 @@ class PocConfig(BaseModel):
             "agent_model": agent_model,
             "judge_model": judge_model,
             "smoke": smoke,
-            "quality_mode": quality_mode,
             "config_path": os.getenv("DEER_FLOW_CONFIG_PATH") or None,
         }
+        if modes is not None:
+            values["modes"] = modes
         if case_file is not None:
             values["case_file"] = Path(case_file)
         if output_dir is not None:
@@ -185,31 +186,33 @@ def run_poc(config: PocConfig) -> tuple[PocSummary, int]:
     config.log_dir.mkdir(parents=True, exist_ok=True)
 
     trace_dir = config.output_dir / run_id / "traces"
-    routing_task = skills_routing_eval(
-        case_file=str(config.case_file),
-        agent_model=config.agent_model,
-        sample_ids=_SMOKE_CASE_IDS if config.smoke else None,
-        trace_dir=trace_dir,
-        config_path=config.config_path,
-        sandbox="local",
-    )
-    routing_epochs = 1 if config.smoke else 3
-    try:
-        routing_logs = inspect_eval(
-            routing_task,
-            model=None,
-            epochs=routing_epochs,
-            max_samples=1,
-            log_dir=str(config.log_dir),
-            fail_on_error=False,
-            score_on_error=True,
+    routing_log = None
+    if "routing" in config.modes:
+        routing_task = skills_routing_eval(
+            case_file=str(config.case_file),
+            agent_model=config.agent_model,
+            sample_ids=_SMOKE_CASE_IDS if config.smoke else None,
+            trace_dir=trace_dir,
+            config_path=config.config_path,
+            sandbox="local",
         )
-        routing_log = _single_log(routing_logs, "routing")
-    except Exception as exc:
-        raise PocInvalidEvaluationError(f"Routing evaluation failed: {exc}") from exc
+        routing_epochs = 1 if config.smoke else 3
+        try:
+            routing_logs = inspect_eval(
+                routing_task,
+                model=None,
+                epochs=routing_epochs,
+                max_samples=1,
+                log_dir=str(config.log_dir),
+                fail_on_error=False,
+                score_on_error=True,
+            )
+            routing_log = _single_log(routing_logs, "routing")
+        except Exception as exc:
+            raise PocInvalidEvaluationError(f"Routing evaluation failed: {exc}") from exc
 
     quick_log = None
-    if config.quality_mode in {"quick", "both"}:
+    if "quick" in config.modes:
         quick_task = skills_quick_eval(
             case_file=str(config.case_file),
             agent_model=config.agent_model,
@@ -235,7 +238,7 @@ def run_poc(config: PocConfig) -> tuple[PocSummary, int]:
             raise PocInvalidEvaluationError(f"Quick quality evaluation failed: {exc}") from exc
 
     quality_log = None
-    if not config.smoke and config.quality_mode in {"full", "both"}:
+    if not config.smoke and "full" in config.modes:
         quality_task = skills_quality_eval(
             case_file=str(config.case_file),
             agent_model=config.agent_model,
@@ -259,19 +262,21 @@ def run_poc(config: PocConfig) -> tuple[PocSummary, int]:
         except Exception as exc:
             raise PocInvalidEvaluationError(f"Quality evaluation failed: {exc}") from exc
 
-    planned_routing_runs = 3 if config.smoke else 60
     errors: list[str] = []
-    try:
-        routing_results = extract_routing_results(routing_log)
-    except Exception as exc:
-        routing_results = []
-        errors.append(f"Cannot extract routing results: {exc}")
-    routing_metrics = summarize_routing(
-        routing_results,
-        planned_runs=planned_routing_runs,
-    )
-    if len(routing_results) != planned_routing_runs:
-        errors.append(f"Expected {planned_routing_runs} routing results, found {len(routing_results)}")
+    routing_metrics = None
+    if routing_log is not None:
+        planned_routing_runs = 3 if config.smoke else 60
+        try:
+            routing_results = extract_routing_results(routing_log)
+        except Exception as exc:
+            routing_results = []
+            errors.append(f"Cannot extract routing results: {exc}")
+        routing_metrics = summarize_routing(
+            routing_results,
+            planned_runs=planned_routing_runs,
+        )
+        if len(routing_results) != planned_routing_runs:
+            errors.append(f"Expected {planned_routing_runs} routing results, found {len(routing_results)}")
 
     quality_results = []
     if quality_log is not None:
@@ -292,7 +297,9 @@ def run_poc(config: PocConfig) -> tuple[PocSummary, int]:
         if len(quick_results) != expected_quick:
             errors.append(f"Expected {expected_quick} quick quality results, found {len(quick_results)}")
 
-    inspect_logs = [str(getattr(routing_log, "location", ""))]
+    inspect_logs: list[str] = []
+    if routing_log is not None:
+        inspect_logs.append(str(getattr(routing_log, "location", "")))
     if quality_log is not None:
         inspect_logs.append(str(getattr(quality_log, "location", "")))
     if quick_log is not None:
@@ -321,10 +328,10 @@ def run_poc(config: PocConfig) -> tuple[PocSummary, int]:
     acceptance = _acceptance_checks(
         routing_metrics,
         quality_passed_cases=quality_passed_cases,
-        include_quality=not config.smoke and config.quality_mode in {"full", "both"},
+        include_quality=not config.smoke and "full" in config.modes,
         quick_passed_cases=quick_passed_cases,
         quick_judgeable_cases=quick_judgeable,
-        include_quick=not config.smoke and config.quality_mode in {"quick", "both"},
+        include_quick=not config.smoke and "quick" in config.modes,
     )
     summary = PocSummary(
         run_id=run_id,
@@ -335,7 +342,7 @@ def run_poc(config: PocConfig) -> tuple[PocSummary, int]:
         quality_passed_cases=quality_passed_cases,
         judge_failures=judge_failures,
         infrastructure_failures=infrastructure_failures,
-        quality_mode=config.quality_mode,
+        modes=list(config.modes),
         quick_results=quick_results,
         quick_passed_cases=quick_passed_cases,
         quick_turn_missing=quick_turn_missing,
@@ -365,26 +372,30 @@ def _acceptance_checks(
     quick_judgeable_cases: int = 0,
     include_quick: bool = False,
 ) -> list[AcceptanceCheck]:
-    checks = [
-        AcceptanceCheck(
-            name="valid routing run rate",
-            actual=routing_metrics.valid_run_rate,
-            threshold=">= 0.95",
-            passed=routing_metrics.valid_run_rate >= 0.95,
-        ),
-        AcceptanceCheck(
-            name="macro routing precision",
-            actual=routing_metrics.macro_precision,
-            threshold=">= 0.80",
-            passed=routing_metrics.macro_precision >= 0.80,
-        ),
-        AcceptanceCheck(
-            name="macro routing recall",
-            actual=routing_metrics.macro_recall,
-            threshold=">= 0.80",
-            passed=routing_metrics.macro_recall >= 0.80,
-        ),
-    ]
+    checks: list[AcceptanceCheck] = []
+    if routing_metrics is not None:
+        checks.extend(
+            [
+                AcceptanceCheck(
+                    name="valid routing run rate",
+                    actual=routing_metrics.valid_run_rate,
+                    threshold=">= 0.95",
+                    passed=routing_metrics.valid_run_rate >= 0.95,
+                ),
+                AcceptanceCheck(
+                    name="macro routing precision",
+                    actual=routing_metrics.macro_precision,
+                    threshold=">= 0.80",
+                    passed=routing_metrics.macro_precision >= 0.80,
+                ),
+                AcceptanceCheck(
+                    name="macro routing recall",
+                    actual=routing_metrics.macro_recall,
+                    threshold=">= 0.80",
+                    passed=routing_metrics.macro_recall >= 0.80,
+                ),
+            ]
+        )
     if include_quality:
         checks.append(
             AcceptanceCheck(
@@ -408,12 +419,13 @@ def _acceptance_checks(
 
 
 def exit_code_for(summary: PocSummary) -> int:
-    expected_routing_runs = 3 if summary.mode == "smoke" else 60
-    full_quality_expected = 4 if (summary.mode == "full" and summary.quality_mode in {"full", "both"}) else 0
-    quick_expected = (3 if summary.mode == "smoke" else 4) if summary.quality_mode in {"quick", "both"} else 0
+    routing_enabled = summary.routing is not None
+    expected_routing_runs = (3 if summary.mode == "smoke" else 60) if routing_enabled else 0
+    full_quality_expected = 4 if (summary.mode == "full" and "full" in summary.modes) else 0
+    quick_expected = (3 if summary.mode == "smoke" else 4) if "quick" in summary.modes else 0
     evaluation_invalid = (
         bool(summary.errors)
-        or len(summary.routing.results) != expected_routing_runs
+        or (routing_enabled and len(summary.routing.results) != expected_routing_runs)
         or summary.judge_failures > 0
         or summary.infrastructure_failures > 0
         or len(summary.quality_results) != full_quality_expected
@@ -424,10 +436,11 @@ def exit_code_for(summary: PocSummary) -> int:
     )
     if evaluation_invalid:
         return 2
+    routing_ok = summary.routing is None or routing_acceptance(summary.routing)
     full_quality_passed = full_quality_expected == 0 or summary.quality_passed_cases >= 3
     quick_judgeable = sum(result.judgment is not None for result in summary.quick_results)
     quick_passed = quick_expected == 0 or summary.mode == "smoke" or quick_judgeable == 0 or summary.quick_passed_cases / quick_judgeable >= 0.75
-    return 0 if routing_acceptance(summary.routing) and full_quality_passed and quick_passed else 1
+    return 0 if routing_ok and full_quality_passed and quick_passed else 1
 
 
 def _write_summary(run_dir: Path, summary: PocSummary) -> None:
@@ -448,7 +461,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--case-file")
     parser.add_argument("--output-dir")
-    parser.add_argument("--quality-mode", choices=["quick", "full", "both"], default="both")
+    parser.add_argument("--mode", action="append", choices=["routing", "quick", "full"], default=None)
     return parser
 
 
@@ -459,7 +472,7 @@ def main(argv: list[str] | None = None) -> int:
             case_file=args.case_file,
             output_dir=args.output_dir,
             smoke=args.smoke,
-            quality_mode=args.quality_mode,
+            modes=tuple(dict.fromkeys(args.mode)) if args.mode else None,
         )
         summary, exit_code = run_poc(config)
     except (PocConfigurationError, PocInvalidEvaluationError) as exc:

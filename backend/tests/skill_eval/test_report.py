@@ -503,7 +503,7 @@ def test_markdown_renders_quick_metrics_when_present():
     ]
     summary = summary.model_copy(
         update={
-            "quality_mode": "both",
+            "modes": ["routing", "quick", "full"],
             "quick_results": quick_results,
             "quick_passed_cases": 1,
             "quick_turn_missing": 1,
@@ -527,7 +527,7 @@ def test_markdown_includes_quick_section():
     summary = make_poc_summary()
     summary = summary.model_copy(
         update={
-            "quality_mode": "both",
+            "modes": ["routing", "quick", "full"],
             "quick_results": [
                 QuickCaseResult(
                     case_id="a",
@@ -562,3 +562,17 @@ def test_markdown_includes_quick_section():
     assert "## Quick quality (first turn after skill load)" in markdown
     assert "turn_quality=3" in markdown
     assert "quick_turn_missing" in markdown
+
+
+def test_markdown_renders_skipped_routing_sections_when_routing_absent():
+    summary = make_poc_summary().model_copy(update={"routing": None, "modes": ["quick", "full"]})
+
+    markdown = render_poc_markdown(summary)
+
+    assert "## Confusion matrix\n\n- Skipped." in markdown
+    assert "## Per-class routing metrics\n\n- Skipped." in markdown
+    assert "## Failed or unstable routing cases\n\n- Skipped." in markdown
+
+
+def test_schema_version_is_v3():
+    assert make_poc_summary().schema_version == "deerflow.agent-routing-poc.v3"

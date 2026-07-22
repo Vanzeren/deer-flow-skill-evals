@@ -316,7 +316,7 @@ def test_exit_codes_separate_quality_failure_and_invalid_evaluation(
     assert exit_code_for(invalid) == 2
 
 
-def test_quality_mode_quick_skips_full_quality(
+def test_quick_mode_skips_full_quality(
     monkeypatch,
     valid_config,
     preflight_record,
@@ -333,13 +333,68 @@ def test_quality_mode_quick_skips_full_quality(
     monkeypatch.setattr("skill_eval.poc.inspect_eval", fake_eval)
     monkeypatch.setattr("skill_eval.poc.preflight", lambda config: preflight_record)
 
-    summary, exit_code = run_poc(valid_config.model_copy(update={"quality_mode": "quick"}))
+    summary, exit_code = run_poc(valid_config.model_copy(update={"modes": ("routing", "quick")}))
 
     assert len(calls) == 2
     assert summary.quality_results == []
     assert len(summary.quick_results) == 4
     assert exit_code == 0
     assert all("dimension thresholds" not in check.name for check in summary.acceptance)
+
+
+def test_routing_only_run(
+    monkeypatch,
+    valid_config,
+    preflight_record,
+):
+    cases = read_routing_cases(valid_config.case_file)
+    logs = [routing_log(cases)]
+    calls = []
+
+    def fake_eval(*args, **kwargs):
+        calls.append((args, kwargs))
+        return [logs.pop(0)]
+
+    monkeypatch.setattr("skill_eval.poc.inspect_eval", fake_eval)
+    monkeypatch.setattr("skill_eval.poc.preflight", lambda config: preflight_record)
+
+    summary, exit_code = run_poc(valid_config.model_copy(update={"modes": ("routing",)}))
+
+    assert len(calls) == 1
+    assert summary.routing is not None
+    assert summary.routing.planned_runs == 60
+    assert summary.quick_results == []
+    assert summary.quality_results == []
+    assert summary.quick_metrics is None
+    assert len(summary.acceptance) == 3
+    assert all("quick" not in check.name and "quality" not in check.name for check in summary.acceptance)
+    assert exit_code == 0
+
+
+def test_quick_only_run_without_routing(
+    monkeypatch,
+    valid_config,
+    preflight_record,
+):
+    cases = read_routing_cases(valid_config.case_file)
+    quality_cases = [case for case in cases if "quality" in case.tags]
+    logs = [quick_log(quality_cases)]
+    calls = []
+
+    def fake_eval(*args, **kwargs):
+        calls.append((args, kwargs))
+        return [logs.pop(0)]
+
+    monkeypatch.setattr("skill_eval.poc.inspect_eval", fake_eval)
+    monkeypatch.setattr("skill_eval.poc.preflight", lambda config: preflight_record)
+
+    summary, _ = run_poc(valid_config.model_copy(update={"modes": ("quick",)}))
+
+    assert len(calls) == 1
+    assert summary.routing is None
+    assert len(summary.quick_results) == 4
+    assert summary.quality_results == []
+    assert exit_code_for(summary) == 0
 
 
 def test_quick_turn_missing_invalidates_evaluation(
@@ -397,7 +452,7 @@ def test_quick_gate_fails_below_75_percent_of_judgeable(
     assert exit_code_for(summary) == 1
 
 
-def test_parser_defaults_and_accepts_quality_mode():
+def test_parser_mode_append_and_default():
     parser = _build_parser()
-    assert parser.parse_args([]).quality_mode == "both"
-    assert parser.parse_args(["--quality-mode", "quick"]).quality_mode == "quick"
+    assert parser.parse_args([]).mode is None
+    assert parser.parse_args(["--mode", "routing", "--mode", "quick"]).mode == ["routing", "quick"]

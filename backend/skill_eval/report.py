@@ -238,18 +238,18 @@ class AcceptanceCheck(BaseModel):
 
 
 class PocSummary(BaseModel):
-    schema_version: Literal["deerflow.agent-routing-poc.v2"] = "deerflow.agent-routing-poc.v2"
+    schema_version: Literal["deerflow.agent-routing-poc.v3"] = "deerflow.agent-routing-poc.v3"
     run_id: str
     mode: Literal["smoke", "full"]
     identity: RunIdentity
-    routing: RoutingMetrics
+    routing: RoutingMetrics | None
     quality_results: list[QualityCaseResult]
     quality_passed_cases: int
     judge_failures: int
     infrastructure_failures: int
     acceptance: list[AcceptanceCheck]
     errors: list[str] = Field(default_factory=list)
-    quality_mode: Literal["quick", "full", "both"] = "full"
+    modes: list[Literal["routing", "quick", "full"]] = ["routing", "full"]
     quick_results: list[QuickCaseResult] = Field(default_factory=list)
     quick_passed_cases: int = 0
     quick_turn_missing: int = 0
@@ -380,48 +380,71 @@ def render_poc_markdown(summary: PocSummary) -> str:
             f"- Inspect logs: {', '.join(f'`{path}`' for path in identity.inspect_logs) or 'none'}",
             f"- Agent execution failures: {summary.infrastructure_failures}",
             f"- Judge failures: {summary.judge_failures}",
-            "",
-            "## Confusion matrix",
-            "",
-            "| Expected \\\\ Observed | systematic-literature-review | academic-paper-review | none | ambiguous |",
-            "|---|---:|---:|---:|---:|",
         ]
     )
-    for expected in _EXPECTED_LABELS:
-        row = summary.routing.confusion.get(expected, {})
-        lines.append(f"| {expected} | " + " | ".join(str(row.get(observed, 0)) for observed in _OBSERVED_LABELS) + " |")
-    lines.extend(
-        [
-            "",
-            "## Per-class routing metrics",
-            "",
-            "| Class | Precision | Recall | F1 | Support |",
-            "|---|---:|---:|---:|---:|",
-        ]
-    )
-    for label in _EXPECTED_LABELS:
-        metric = summary.routing.per_class[label]
-        lines.append(f"| {label} | {metric.precision:.3f} | {metric.recall:.3f} | {metric.f1:.3f} | {metric.support} |")
-    lines.extend(
-        [
-            f"| **Macro** | **{summary.routing.macro_precision:.3f}** | **{summary.routing.macro_recall:.3f}** | **{summary.routing.macro_f1:.3f}** | — |",
-            "",
-            f"- Valid runs: {summary.routing.valid_runs}/{summary.routing.planned_runs} ({summary.routing.valid_run_rate:.1%})",
-            f"- Stable cases: {summary.routing.stable_cases}/{summary.routing.total_cases} ({summary.routing.stability_rate:.1%})",
-            "",
-            "## Failed or unstable routing cases",
-            "",
-        ]
-    )
-    failures = [result for result in summary.routing.results if result.infrastructure_error or result.observed_route != result.expected_route]
-    if failures:
-        for result in failures:
-            evidence_ids = ", ".join(item.id for item in result.evidence) or "none"
-            lines.append(
-                f"- `{result.case_id}` epoch {result.epoch}: expected `{result.expected_route}`, observed `{result.observed_route}`, error `{result.infrastructure_error or 'none'}`, evidence {evidence_ids}, log `{result.log_location}`"
-            )
+    routing = summary.routing
+    if routing is None:
+        lines.extend(
+            [
+                "",
+                "## Confusion matrix",
+                "",
+                "- Skipped.",
+                "",
+                "## Per-class routing metrics",
+                "",
+                "- Skipped.",
+                "",
+                "## Failed or unstable routing cases",
+                "",
+                "- Skipped.",
+            ]
+        )
     else:
-        lines.append("- None.")
+        lines.extend(
+            [
+                "",
+                "## Confusion matrix",
+                "",
+                "| Expected \\\\ Observed | systematic-literature-review | academic-paper-review | none | ambiguous |",
+                "|---|---:|---:|---:|---:|",
+            ]
+        )
+        for expected in _EXPECTED_LABELS:
+            row = routing.confusion.get(expected, {})
+            lines.append(f"| {expected} | " + " | ".join(str(row.get(observed, 0)) for observed in _OBSERVED_LABELS) + " |")
+        lines.extend(
+            [
+                "",
+                "## Per-class routing metrics",
+                "",
+                "| Class | Precision | Recall | F1 | Support |",
+                "|---|---:|---:|---:|---:|",
+            ]
+        )
+        for label in _EXPECTED_LABELS:
+            metric = routing.per_class[label]
+            lines.append(f"| {label} | {metric.precision:.3f} | {metric.recall:.3f} | {metric.f1:.3f} | {metric.support} |")
+        lines.extend(
+            [
+                f"| **Macro** | **{routing.macro_precision:.3f}** | **{routing.macro_recall:.3f}** | **{routing.macro_f1:.3f}** | — |",
+                "",
+                f"- Valid runs: {routing.valid_runs}/{routing.planned_runs} ({routing.valid_run_rate:.1%})",
+                f"- Stable cases: {routing.stable_cases}/{routing.total_cases} ({routing.stability_rate:.1%})",
+                "",
+                "## Failed or unstable routing cases",
+                "",
+            ]
+        )
+        failures = [result for result in routing.results if result.infrastructure_error or result.observed_route != result.expected_route]
+        if failures:
+            for result in failures:
+                evidence_ids = ", ".join(item.id for item in result.evidence) or "none"
+                lines.append(
+                    f"- `{result.case_id}` epoch {result.epoch}: expected `{result.expected_route}`, observed `{result.observed_route}`, error `{result.infrastructure_error or 'none'}`, evidence {evidence_ids}, log `{result.log_location}`"
+                )
+        else:
+            lines.append("- None.")
 
     lines.extend(["", "## Quick quality (first turn after skill load)", ""])
     if summary.quick_results:
