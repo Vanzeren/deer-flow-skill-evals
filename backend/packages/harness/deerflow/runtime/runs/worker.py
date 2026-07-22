@@ -295,6 +295,12 @@ async def run_agent(
     accessor: CheckpointStateAccessor | None = None
     rollback_point: RollbackPoint | None = None
     journal = None
+    # Journal construction moved ahead of preflight so every terminal run can
+    # emit a receipt. Completion persistence keeps its prior boundary: before
+    # #4272 the journal did not exist until preflight had succeeded, so early
+    # checkpoint failures / cancellation while waiting did not write an empty
+    # completion snapshot into RunStore.
+    persist_completion = False
     # Buffers subagent step events for batched persistence (#3779); assigned once
     # streaming starts and flushed in the finally block. Pre-bound to None so the
     # finally is safe even if an exception fires before streaming begins.
@@ -356,6 +362,8 @@ async def run_agent(
                     selected_checkpoint_config,
                     mode,
                 )
+
+        persist_completion = True
 
         # 1. Mark running
         await run_manager.set_status(run_id, RunStatus.running)
@@ -762,7 +770,7 @@ async def run_agent(
             except Exception:
                 logger.warning("Failed to persist terminal status for run %s after delivery receipt", run_id, exc_info=True)
 
-        if journal is not None and receipt_durable:
+        if journal is not None and receipt_durable and persist_completion:
             try:
                 # Persist token usage + convenience fields to RunStore
                 completion = journal.get_completion_data()

@@ -96,6 +96,75 @@ async def test_delivery_event_presented_zero_without_artifact_production():
 
 
 @pytest.mark.anyio
+async def test_delivery_event_is_singleton_across_goal_continuations(monkeypatch):
+    run_manager = RunManager()
+    record = await run_manager.create("thread-1")
+    store = MemoryRunEventStore()
+    stream_calls = 0
+    continuation_calls = 0
+
+    class ContinuingAgent:
+        async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
+            nonlocal stream_calls
+            stream_calls += 1
+            journal = config["context"]["__run_journal"]
+            tool_call_id = f"call_{stream_calls}"
+            journal._remember_current_run_tool_calls(
+                AIMessage(content="", tool_calls=[{"id": tool_call_id, "name": "present_files", "args": {}}]),
+                caller="lead_agent",
+            )
+            artifacts = ["/mnt/user-data/outputs/report.md"]
+            if stream_calls == 2:
+                artifacts.append("/mnt/user-data/outputs/appendix.md")
+            journal.on_tool_end(
+                Command(
+                    update={
+                        "artifacts": artifacts,
+                        "messages": [ToolMessage("Successfully presented files", tool_call_id=tool_call_id)],
+                    }
+                ),
+                run_id=uuid4(),
+            )
+            yield {"messages": []}
+
+    async def prepare_continuation(**kwargs):
+        nonlocal continuation_calls
+        continuation_calls += 1
+        if continuation_calls == 1:
+            return {"messages": []}
+        return None
+
+    monkeypatch.setattr("deerflow.runtime.runs.worker._prepare_goal_continuation_input", prepare_continuation)
+
+    await run_agent(
+        _make_bridge(),
+        run_manager,
+        record,
+        ctx=RunContext(checkpointer=None, event_store=store),
+        agent_factory=lambda *, config: ContinuingAgent(),
+        graph_input={},
+        config={},
+    )
+
+    delivery = await _delivery_events(store, "thread-1", record.run_id)
+    assert stream_calls == 2
+    assert len(delivery) == 1
+    assert delivery[0]["content"] == {
+        "presented": 2,
+        "paths": [
+            "/mnt/user-data/outputs/report.md",
+            "/mnt/user-data/outputs/appendix.md",
+        ],
+        "by_tool": {
+            "present_files": [
+                "/mnt/user-data/outputs/report.md",
+                "/mnt/user-data/outputs/appendix.md",
+            ]
+        },
+    }
+
+
+@pytest.mark.anyio
 async def test_delivery_event_emitted_exactly_once_on_error_path():
     run_manager = RunManager()
     record = await run_manager.create("thread-1")
@@ -189,6 +258,7 @@ async def test_delivery_write_failure_leaves_durable_status_inflight_for_recover
 @pytest.mark.anyio
 async def test_delivery_event_emitted_when_checkpoint_preflight_fails(monkeypatch):
     run_manager = RunManager()
+    run_manager.update_run_completion = AsyncMock(wraps=run_manager.update_run_completion)
     record = await run_manager.create("thread-1")
     store = MemoryRunEventStore()
     compatibility_check = AsyncMock(side_effect=RuntimeError("incompatible checkpoint"))
@@ -212,11 +282,13 @@ async def test_delivery_event_emitted_when_checkpoint_preflight_fails(monkeypatc
     assert delivery[0]["content"] == {"presented": 0, "paths": [], "by_tool": {}}
     fetched = await run_manager.get(record.run_id)
     assert fetched.status == RunStatus.error
+    run_manager.update_run_completion.assert_not_awaited()
 
 
 @pytest.mark.anyio
 async def test_delivery_event_emitted_when_cancelled_waiting_for_prior_finalization(monkeypatch):
     run_manager = RunManager()
+    run_manager.update_run_completion = AsyncMock(wraps=run_manager.update_run_completion)
     record = await run_manager.create("thread-1")
     store = MemoryRunEventStore()
     monkeypatch.setattr(
@@ -243,3 +315,4 @@ async def test_delivery_event_emitted_when_cancelled_waiting_for_prior_finalizat
     assert delivery[0]["content"] == {"presented": 0, "paths": [], "by_tool": {}}
     fetched = await run_manager.get(record.run_id)
     assert fetched.status == RunStatus.interrupted
+    run_manager.update_run_completion.assert_not_awaited()

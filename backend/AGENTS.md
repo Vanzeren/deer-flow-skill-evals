@@ -215,7 +215,9 @@ Blocking-IO runtime gate (`tests/blocking_io/`):
   for #1917); `test_sqlite_lifespan.py` (locks the offload around
   SQLite path resolution plus `ensure_sqlite_parent_dir`, fix for #1912);
   `test_jsonl_run_event_store.py` (locks `JsonlRunEventStore`'s async
-  API offloading its file IO via `asyncio.to_thread`);
+  API — including idempotent singleton-event writes — offloading its file IO
+  via `asyncio.to_thread`); `test_run_journal_callbacks.py` (locks
+  `RunJournal.run_inline` tool callbacks to in-memory/event-loop-safe work);
   `test_uploads_middleware.py` (locks `UploadsMiddleware.abefore_agent`
   offloading the uploads-directory scan off the event loop);
   `test_uploads_router.py` (locks Gateway upload/list/delete endpoints
@@ -454,6 +456,13 @@ detailed receipt when a worker crashed between those two writes. Event stores
 serialize `put_if_absent` with ordinary thread writers: memory and JSONL provide
 the documented single-process guarantee, while the DB store adds per-thread
 in-process locks and PostgreSQL advisory locks for cross-process writers.
+Moving journal construction ahead of preflight is receipt-only on early failure
+paths: a separate boundary flag preserves the previous completion-data
+semantics, so checkpoint incompatibility or cancellation while waiting for an
+older finalizing run does not persist an empty completion snapshot. Worker tests
+pin one accumulated receipt across multiple goal-continuation `_stream_once`
+calls; journal tests drive LangChain's real async callback dispatcher against a
+single journal to pin serialized, deduplicated parallel tool callbacks.
 Multi-worker deployments therefore require `run_events.backend: db` for shared,
 ordered delivery events; the current startup gate does not enforce that
 run-events setting.

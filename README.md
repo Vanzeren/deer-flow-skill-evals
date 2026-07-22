@@ -573,7 +573,10 @@ Gateway run history also records one terminal `run.delivery` receipt per run,
 including zero-output and crash-recovered runs. The receipt is persisted before
 the durable terminal run status and is idempotently backfilled during orphan
 recovery, so operators can distinguish “nothing was presented” from a missing
-delivery record after a restart or lease takeover.
+delivery record after a restart or lease takeover. Runs that fail checkpoint
+preflight (or are cancelled while waiting for prior finalization) keep the
+existing completion-data behavior: they receive the zero-delivery receipt but
+do not overwrite RunStore completion fields with an empty snapshot.
 
 #### LangSmith Tracing
 

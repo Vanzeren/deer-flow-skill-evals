@@ -1280,6 +1280,50 @@ class TestDeliveryTracking:
         assert j.run_inline is True
 
     @pytest.mark.anyio
+    async def test_concurrent_callbacks_on_one_journal_are_serialized(self, journal_setup):
+        from langchain_core.callbacks.manager import ahandle_event
+        from langchain_core.messages import ToolMessage
+        from langgraph.types import Command
+
+        j, _ = journal_setup
+        commands = []
+        for index, path in enumerate(("report.md", "report.md", "appendix.md"), start=1):
+            tool_call_id = f"call_{index}"
+            self._register_tool_call(j, tool_call_id, "present_files")
+            commands.append(
+                Command(
+                    update={
+                        "artifacts": [f"/mnt/user-data/outputs/{path}"],
+                        "messages": [ToolMessage("Successfully presented files", tool_call_id=tool_call_id)],
+                    }
+                )
+            )
+
+        # This is the real LangChain async callback dispatcher. Because the
+        # journal is run_inline, each synchronous mutation completes on the
+        # event-loop thread instead of racing in executor threads.
+        await asyncio.gather(
+            *(
+                ahandle_event(
+                    [j],
+                    "on_tool_end",
+                    "ignore_agent",
+                    command,
+                    run_id=uuid4(),
+                )
+                for command in commands
+            )
+        )
+
+        content = j.get_delivery_content()
+        assert content["presented"] == 2
+        assert set(content["paths"]) == {
+            "/mnt/user-data/outputs/report.md",
+            "/mnt/user-data/outputs/appendix.md",
+        }
+        assert set(content["by_tool"]["present_files"]) == set(content["paths"])
+
+    @pytest.mark.anyio
     async def test_concurrent_runs_keep_delivery_accumulators_isolated(self):
         from langchain_core.messages import ToolMessage
         from langgraph.types import Command
