@@ -307,6 +307,22 @@ async def run_agent(
         )
 
     try:
+        # Initialize the run-scoped journal before any fallible or cancellable
+        # preflight work. Every terminal run with an event store must reach the
+        # shared finally block with a journal available for its run.delivery
+        # receipt, including checkpoint validation failures and cancellation
+        # while waiting for an earlier run to finish finalizing.
+        if event_store is not None:
+            from deerflow.runtime.journal import RunJournal
+
+            journal = RunJournal(
+                run_id=run_id,
+                thread_id=thread_id,
+                event_store=event_store,
+                track_token_usage=getattr(run_events_config, "track_token_usage", True),
+                progress_reporter=lambda snapshot: run_manager.update_run_progress(run_id, **snapshot),
+            )
+
         await run_manager.wait_for_prior_finalizing(thread_id, run_id)
         mode = ctx.checkpoint_channel_mode
         inject_checkpoint_mode(config, mode)
@@ -339,23 +355,6 @@ async def run_agent(
                     selected_checkpoint_config,
                     mode,
                 )
-
-        # Initialize RunJournal + write human_message event.
-        # These are inside the try block so any exception (e.g. a DB
-        # error writing the event) flows through the except/finally
-        # path that publishes an "end" event to the SSE bridge —
-        # otherwise a failure here would leave the stream hanging
-        # with no terminator.
-        if event_store is not None:
-            from deerflow.runtime.journal import RunJournal
-
-            journal = RunJournal(
-                run_id=run_id,
-                thread_id=thread_id,
-                event_store=event_store,
-                track_token_usage=getattr(run_events_config, "track_token_usage", True),
-                progress_reporter=lambda snapshot: run_manager.update_run_progress(run_id, **snapshot),
-            )
 
         # 1. Mark running
         await run_manager.set_status(run_id, RunStatus.running)
@@ -698,6 +697,13 @@ async def run_agent(
 
         # Flush any buffered journal events and persist completion data
         if journal is not None:
+            try:
+                # Terminal delivery fact record (#4272 slice 1): exactly one
+                # run.delivery event per run, on every terminal outcome.
+                # Best-effort — must never alter the run outcome.
+                journal.record_delivery()
+            except Exception:
+                logger.warning("Failed to record delivery event for run %s (non-fatal)", run_id, exc_info=True)
             try:
                 await journal.flush()
             except Exception:

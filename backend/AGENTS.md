@@ -358,6 +358,25 @@ captures a pre-run and post-run snapshot of the thread-owned `workspace` and
 are size-limited; binary, large, and sensitive-looking paths are persisted as
 metadata only.
 
+**Run delivery receipts**: `RunJournal` records each non-empty artifact update
+once per tool `Command` for the terminal `run.delivery` event. When a command
+contains multiple messages, a unique tool name resolved from matching
+`ToolMessage` entries supplies attribution; additional command messages do not
+duplicate artifact paths or counts. If multiple different tool names resolve
+for one flat artifact update, the paths remain counted but unattributed because
+the command does not carry a per-path mapping. `RunJournal` callbacks set
+`run_inline=True`: they do only in-memory bookkeeping or schedule async writes,
+and staying on the run's event-loop thread serializes parallel tool callbacks
+before terminal delivery recording and flushing. Each worker creates a separate
+journal per run before cancellable/fallible preflight work, so checkpoint
+compatibility failures and cancellation while waiting for prior finalization
+still emit a zero-delivery receipt. Event stores own concurrency across journals:
+memory and JSONL are single-process backends, while the DB store adds per-thread
+in-process locks and PostgreSQL advisory locks for cross-process writers.
+Multi-worker deployments therefore require `run_events.backend: db` for shared,
+ordered delivery events; the current startup gate does not enforce that
+run-events setting.
+
 **RunManager / RunStore contract**:
 - `RunManager.get()` is async; direct callers must `await` it.
 - The history batch helpers `list_successful_regenerate_sources()` and `get_many_by_thread()` default to `user_id=AUTO`: they resolve the request user and fail closed when no user context exists. Migration/admin callers that intentionally need an unscoped read must pass `user_id=None` explicitly.

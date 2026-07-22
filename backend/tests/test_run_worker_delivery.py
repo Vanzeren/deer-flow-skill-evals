@@ -1,0 +1,182 @@
+"""Worker-level regression tests for the terminal run.delivery event (#4272 slice 1)."""
+
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from uuid import uuid4
+
+import pytest
+from langchain_core.messages import AIMessage, ToolMessage
+from langgraph.types import Command
+
+from deerflow.runtime.events.store.memory import MemoryRunEventStore
+from deerflow.runtime.runs.manager import RunManager
+from deerflow.runtime.runs.schemas import RunStatus
+from deerflow.runtime.runs.worker import RunContext, run_agent
+
+
+def _make_bridge():
+    return SimpleNamespace(publish=AsyncMock(), publish_end=AsyncMock(), cleanup=AsyncMock())
+
+
+async def _delivery_events(store: MemoryRunEventStore, thread_id: str, run_id: str) -> list[dict]:
+    events = await store.list_events(thread_id, run_id)
+    return [e for e in events if e["event_type"] == "run.delivery"]
+
+
+@pytest.mark.anyio
+async def test_delivery_event_records_present_files_paths_on_success():
+    run_manager = RunManager()
+    record = await run_manager.create("thread-1")
+    store = MemoryRunEventStore()
+
+    class DummyAgent:
+        async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
+            journal = config["context"]["__run_journal"]
+            ai = AIMessage(content="", tool_calls=[{"id": "call_1", "name": "present_files", "args": {}}])
+            journal._remember_current_run_tool_calls(ai, caller="lead_agent")
+            journal.on_tool_end(
+                Command(
+                    update={
+                        "artifacts": ["/mnt/user-data/outputs/report.md"],
+                        "messages": [ToolMessage("Successfully presented files", tool_call_id="call_1")],
+                    }
+                ),
+                run_id=uuid4(),
+            )
+            yield {"messages": []}
+
+    await run_agent(
+        _make_bridge(),
+        run_manager,
+        record,
+        ctx=RunContext(checkpointer=None, event_store=store),
+        agent_factory=lambda *, config: DummyAgent(),
+        graph_input={},
+        config={},
+    )
+    await asyncio.sleep(0)
+
+    delivery = await _delivery_events(store, "thread-1", record.run_id)
+    assert len(delivery) == 1
+    assert delivery[0]["content"]["presented"] == 1
+    assert delivery[0]["content"]["paths"] == ["/mnt/user-data/outputs/report.md"]
+    assert delivery[0]["content"]["by_tool"] == {"present_files": ["/mnt/user-data/outputs/report.md"]}
+    fetched = await run_manager.get(record.run_id)
+    assert fetched.status == RunStatus.success
+
+
+@pytest.mark.anyio
+async def test_delivery_event_presented_zero_without_artifact_production():
+    run_manager = RunManager()
+    record = await run_manager.create("thread-1")
+    store = MemoryRunEventStore()
+
+    class DummyAgent:
+        async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
+            yield {"messages": []}
+
+    await run_agent(
+        _make_bridge(),
+        run_manager,
+        record,
+        ctx=RunContext(checkpointer=None, event_store=store),
+        agent_factory=lambda *, config: DummyAgent(),
+        graph_input={},
+        config={},
+    )
+    await asyncio.sleep(0)
+
+    delivery = await _delivery_events(store, "thread-1", record.run_id)
+    assert len(delivery) == 1
+    assert delivery[0]["content"] == {"presented": 0, "paths": [], "by_tool": {}}
+    fetched = await run_manager.get(record.run_id)
+    assert fetched.status == RunStatus.success
+
+
+@pytest.mark.anyio
+async def test_delivery_event_emitted_exactly_once_on_error_path():
+    run_manager = RunManager()
+    record = await run_manager.create("thread-1")
+    store = MemoryRunEventStore()
+
+    class FailingAgent:
+        async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
+            raise RuntimeError("boom")
+            yield  # pragma: no cover - make this an async generator
+
+    await run_agent(
+        _make_bridge(),
+        run_manager,
+        record,
+        ctx=RunContext(checkpointer=None, event_store=store),
+        agent_factory=lambda *, config: FailingAgent(),
+        graph_input={},
+        config={},
+    )
+    await asyncio.sleep(0)
+
+    delivery = await _delivery_events(store, "thread-1", record.run_id)
+    assert len(delivery) == 1
+    assert delivery[0]["content"]["presented"] == 0
+    fetched = await run_manager.get(record.run_id)
+    assert fetched.status == RunStatus.error
+
+
+@pytest.mark.anyio
+async def test_delivery_event_emitted_when_checkpoint_preflight_fails(monkeypatch):
+    run_manager = RunManager()
+    record = await run_manager.create("thread-1")
+    store = MemoryRunEventStore()
+    compatibility_check = AsyncMock(side_effect=RuntimeError("incompatible checkpoint"))
+    monkeypatch.setattr("deerflow.runtime.runs.worker.aensure_checkpoint_mode_compatible", compatibility_check)
+
+    def unexpected_agent_factory(**kwargs):
+        raise AssertionError("agent must not be built after preflight failure")
+
+    await run_agent(
+        _make_bridge(),
+        run_manager,
+        record,
+        ctx=RunContext(checkpointer=object(), event_store=store),
+        agent_factory=unexpected_agent_factory,
+        graph_input={},
+        config={},
+    )
+
+    delivery = await _delivery_events(store, "thread-1", record.run_id)
+    assert len(delivery) == 1
+    assert delivery[0]["content"] == {"presented": 0, "paths": [], "by_tool": {}}
+    fetched = await run_manager.get(record.run_id)
+    assert fetched.status == RunStatus.error
+
+
+@pytest.mark.anyio
+async def test_delivery_event_emitted_when_cancelled_waiting_for_prior_finalization(monkeypatch):
+    run_manager = RunManager()
+    record = await run_manager.create("thread-1")
+    store = MemoryRunEventStore()
+    monkeypatch.setattr(
+        run_manager,
+        "wait_for_prior_finalizing",
+        AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+
+    def unexpected_agent_factory(**kwargs):
+        raise AssertionError("agent must not be built after preflight cancellation")
+
+    await run_agent(
+        _make_bridge(),
+        run_manager,
+        record,
+        ctx=RunContext(checkpointer=None, event_store=store),
+        agent_factory=unexpected_agent_factory,
+        graph_input={},
+        config={},
+    )
+
+    delivery = await _delivery_events(store, "thread-1", record.run_id)
+    assert len(delivery) == 1
+    assert delivery[0]["content"] == {"presented": 0, "paths": [], "by_tool": {}}
+    fetched = await run_manager.get(record.run_id)
+    assert fetched.status == RunStatus.interrupted
