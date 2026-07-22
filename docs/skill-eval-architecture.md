@@ -224,15 +224,16 @@ get_model → model.generate(prompt)
 
 `extract_quick_results()` / `summarize_quick()` — 提取 quick_turn_scorer 输出并聚合：judged 数、pass rate、turn_quality 均值与 0–4 分布、五类失败桶（infrastructure_error / judge_failure / quick_turn_missing / route_mismatch / not_applicable_none_case）。
 
-`render_poc_markdown()` — 生成人类可读的 summary.md 和 summary.json（含 quick 质量小节；不内嵌 messages）。
+`render_poc_markdown()` — 生成人类可读的 summary.md 和 summary.json（含 quick 质量小节；不内嵌 messages；routing 未运行时路由小节显示 Skipped）。schema_version 为 `deerflow.agent-routing-poc.v3`。
 
 ### `poc.py` — 一键入口
 
 ```python
 PocConfig.from_env()       # 读 AGENT_MODEL / JUDGE_MODEL 环境变量
 preflight(config)           # 校验 case 文件、skill 文件、模型可用、config 路径
-run_poc(config)             # routing eval（60 runs）→ quick/full quality eval
-                            # 由 --quality-mode quick|full|both 选择（默认 both）
+run_poc(config)             # 按 config.modes 跑 routing / quick / full 任意组合
+                            # 由可重复的 --mode 选择（默认三个全跑；
+                            # routing 不跑时 summary.routing=None）
 exit_code_for(summary)      # 0=全过 / 1=指标未达标 / 2=评测无效
 ```
 

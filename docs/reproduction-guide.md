@@ -84,21 +84,29 @@ export OPENAI_API_KEY=sk-your-key-here
 
 均在 `backend/` 目录下执行。
 
-### 4.0 质量评估模式：`--quality-mode quick|full|both`
+### 4.0 评估模式：`--mode routing|quick|full`
 
-POC 提供两种质量评估模式（路由评估不受影响，始终运行）：
+三种评估模式完全独立，`--mode` 可重复指定任意组合；**不指定 = 三个全跑**。路由评估不再必跑。
 
 | 模式 | 评估对象 | 单条成本 | 适用场景 |
 |---|---|---|---|
-| `quick` | Skill 加载成功后的**第一条 AI 文本输出**（Skill 的影响集中在这一次输出上） | 低（加载 Skill + 一轮输出即停） | 快速迭代、大批量评估 |
-| `full` | Agent 跑完整个任务后的**最终输出** | 高（完整任务执行） | 端到端质量确认 |
-| `both`（默认） | quick 和 full 都跑 | — | 完整报告 |
+| `routing` | 20 条 case × 3 epochs 的路由准确率（ smoke 为固定 3 条） | 低（路由确定即停） | 路由 benchmark |
+| `quick` | Skill 加载成功后的**第一条 AI 文本输出**（Skill 的影响集中在这一次输出上） | 低（加载 Skill + 一轮输出即停） | 快速迭代、大批量质量评估 |
+| `full` | Agent 跑完整个任务后的**最终输出**（smoke 下始终不可用） | 高（完整任务执行） | 端到端质量确认 |
 
-quality case 共 4 条，其中 3 条期望路由到具体 Skill（quick/full 都会评估），1 条期望 `none`（quick 模式下标记为 `not_applicable_none_case`，不参与 quick 质量门槛）。
+示例：
+
+```bash
+uv run python -m skill_eval.poc --mode routing                # 只跑路由
+uv run python -m skill_eval.poc --mode quick                  # 只跑 quick 质量（不跑路由 benchmark）
+uv run python -m skill_eval.poc --mode routing --mode quick   # 路由 + quick
+```
+
+quality case 共 4 条，其中 3 条期望路由到具体 Skill（quick/full 都会评估），1 条期望 `none`（quick 模式下标记为 `not_applicable_none_case`，不参与 quick 质量门槛）。quick/full 的运行不依赖路由 benchmark——每条 run 内部仍会观察路由用于判定。
 
 ### 4.1 Smoke（快速验证，推荐先跑）
 
-3 条路由 case + 3 条 quick 质量评估（默认 `both`；smoke 下 full 模式始终跳过），约 2–5 分钟。
+3 条路由 case + 3 条 quick 质量评估（默认模式组合；smoke 下 full 模式始终跳过），约 2–5 分钟。
 
 **用 DeepSeek：**
 
@@ -125,7 +133,7 @@ uv run python -m skill_eval.poc --smoke
 
 预期输出：3 条全部通过，exit code 0。
 
-> 只想跑路由评估（恢复旧行为）：加 `--quality-mode full` —— full 质量评估在 smoke 下始终跳过。
+> 只想跑路由评估：`uv run python -m skill_eval.poc --smoke --mode routing`。
 
 ### 4.2 全量
 
@@ -138,10 +146,10 @@ JUDGE_MODEL=openai-api/deepseek/deepseek-chat \
 uv run python -m skill_eval.poc
 ```
 
-快速迭代时只跑 quick 质量评估（省掉 full 的大头成本）：
+快速迭代时只跑 quick 质量评估（连 60 次路由 benchmark 也跳过，成本最低）：
 
 ```bash
-uv run python -m skill_eval.poc --quality-mode quick
+uv run python -m skill_eval.poc --mode quick
 ```
 
 预期输出：每次运行结果不同（LLM 有随机性），exit code：
@@ -167,11 +175,11 @@ backend/eval-results/<run-id>/
 
 ### 5.1 summary.json 关键字段
 
-`schema_version` 为 `deerflow.agent-routing-poc.v2`。
+`schema_version` 为 `deerflow.agent-routing-poc.v3`。
 
 ```json
 {
-  "quality_mode": "both",
+  "modes": ["routing", "quick", "full"],
   "routing": {
     "planned_runs": 60,
     "valid_runs": 58,
