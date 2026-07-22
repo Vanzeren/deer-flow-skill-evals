@@ -25,6 +25,7 @@ class QuickTurnCapture(BaseModel):
     message_id: str
     skill: str
     content: str
+    tool_calls: list[AgentToolCall] = Field(default_factory=list)
 
 
 class AgentTrace(BaseModel):

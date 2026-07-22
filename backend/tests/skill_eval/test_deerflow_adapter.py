@@ -452,7 +452,7 @@ def ai_text(message_id: str, content: str) -> StreamEvent:
     return event("messages-tuple", {"type": "ai", "id": message_id, "content": content, "tool_calls": []})
 
 
-def test_quick_turn_watcher_waits_for_accumulated_content():
+def test_quick_turn_watcher_waits_for_accumulated_output():
     adapter = DeerFlowTraceAdapter(request(mode="quick"))
     adapter.start()
     watcher = deerflow_module._QuickTurnWatcher()
@@ -474,6 +474,34 @@ def test_quick_turn_watcher_waits_for_accumulated_content():
     watcher.feed(e3, adapter)
     assert watcher.complete is True
     assert watcher.content == "Now "
+
+
+def test_quick_turn_watcher_accepts_tool_call_only_output():
+    adapter = DeerFlowTraceAdapter(request(mode="quick"))
+    adapter.start()
+    watcher = deerflow_module._QuickTurnWatcher()
+    watcher.start(skill="systematic-literature-review", existing_message_ids=("m1",))
+
+    tool_call_event = event(
+        "messages-tuple",
+        {
+            "type": "ai",
+            "id": "m2",
+            "content": "",
+            "tool_calls": [{"id": "t2", "name": "web_search", "args": {"query": "attention variants"}}],
+        },
+    )
+    adapter.feed(tool_call_event)
+    watcher.feed(tool_call_event, adapter)
+
+    assert watcher.target_id == "m2"
+    assert watcher.complete is False
+
+    result_event = tool_result("t2", "search results")
+    adapter.feed(result_event)
+    watcher.feed(result_event, adapter)
+
+    assert watcher.complete is True
 
 
 def test_quick_mode_captures_first_text_turn_after_skill_load():
@@ -553,7 +581,7 @@ def test_quick_mode_breaks_immediately_on_ambiguous_route():
     assert result.trace.quick_turn is None
 
 
-def test_quick_mode_stream_end_without_text_turn_leaves_quick_turn_none():
+def test_quick_mode_captures_tool_call_only_turn():
     holder = {}
 
     def client_factory(**kwargs):
@@ -581,4 +609,10 @@ def test_quick_mode_stream_end_without_text_turn_leaves_quick_turn_none():
 
     assert result.success is True
     assert result.route_observation.observed_route == "systematic-literature-review"
-    assert result.trace.quick_turn is None
+    assert result.trace.quick_turn is not None
+    assert result.trace.quick_turn.message_id == "m2"
+    assert result.trace.quick_turn.content == ""
+    assert len(result.trace.quick_turn.tool_calls) == 1
+    assert result.trace.quick_turn.tool_calls[0].name == "bash"
+    assert result.trace.quick_turn.tool_calls[0].args == {"cmd": "ls"}
+    assert result.trace.quick_turn.tool_calls[0].result == "files"

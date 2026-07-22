@@ -37,7 +37,7 @@ AgentTrace:
     tool_call_chain: list[list[str]] # 工具调用链：外层=按时间序的调用批次，
                                      # 内层=同一 AI 消息并发发起的 tool_call id
     quick_turn:  QuickTurnCapture | None  # quick 模式捕获的首轮输出
-                                          # {message_id, skill, content}
+                                          # {message_id, skill, content, tool_calls}
     artifacts:   list[AgentArtifact] # {path, mime_type, content}
     final_answer: str                # 最终文本
     errors:      list[str]           # 异常消息
@@ -56,7 +56,8 @@ AgentTrace:
 ```python
 type RunMode = "routing_probe" | "quick" | "full"
     # routing_probe: 路由确定即停，只做路由评估
-    # quick:         路由命中后继续到 Skill 加载后的第一条 AI 文本输出即停
+    # quick:         路由命中后继续到 Skill 加载后的第一条 AI 输出即停
+    #                （文本或 tool_call 任一出现均算输出）
     # full:          跑完整个任务，评估最终输出
 
 class AgentRunRequest:
@@ -81,7 +82,7 @@ class AgentRunner(ABC):
 
 **路由观察。** 子进程里嵌一个 `RoutingObserver`，逐事件 `feed()`，路由确定或 stream 结束后停止。
 
-**quick 捕获。** quick 模式下 `_QuickTurnWatcher` 在路由判定为具体 candidate 后开始监视：第一条**新出现的、累积文本非空的** AI 消息为目标轮；当事件流进入下一条消息或 stream end 时捕获完成并提前停止。`ambiguous` 立即停；`none` 退化为 routing_probe 行为；超时无文本轮 → `quick_turn=None`（不算 infrastructure failure）。
+**quick 捕获。** quick 模式下 `_QuickTurnWatcher` 在路由判定为具体 candidate 后开始监视：第一条**新出现且包含非空文本或至少一个 `tool_call`** 的 AI 消息为目标轮；当事件流进入下一条消息或 stream end 时捕获完成并提前停止。捕获结果同时保留 `content` 和该消息的结构化 `tool_calls`（名称、参数及已观察到的结果/错误），因此纯工具调用轮同样进入 Judge。`ambiguous` 立即停；`none` 退化为 routing_probe 行为；流结束仍没有任何文本或工具调用 → `quick_turn=None`（不算 infrastructure failure）。
 
 **沙箱。** 用 `LocalSandboxProvider` + `allow_host_bash=true`。需改环境变量时通过 `push_current_app_config` / `pop_current_app_config` 做临时 monkey-patch，跑完恢复。
 
@@ -161,7 +162,7 @@ tool_chain[B]   ← trace.tool_call_chain  (第 B 个并发批，展开为 {id, 
 error[N]        ← trace.errors
 artifact[...]   ← trace.artifacts        ({path, mime_type, content})
 final_answer    ← trace.final_answer      (仅 target="final_output")
-quick_turn      ← trace.quick_turn        (仅 target="quick_turn")
+quick_turn      ← trace.quick_turn        (仅 target="quick_turn"，JSON 包含 content + tool_calls)
 ```
 
 设计动机：完整消息历史体量太大，Judge 实际上跑不完；过程证据改由按并发批分组的工具调用链承载。quick target 下会排除被捕获轮自身发起的调用批。
@@ -238,6 +239,154 @@ exit_code_for(summary)      # 0=全过 / 1=指标未达标 / 2=评测无效
 ```
 
 quick 质量门槛：通过数 / 实际可判（judged）case 数 ≥ 75%；`quick_turn_missing`、`judge_failure`、infrastructure 失败出现即判评测无效（exit 2）。
+
+---
+
+## 四、如何接入新的 Agent Runtime
+
+这一节是当前实现的对接指南。早期的
+[`2026-07-07-skill-eval-deerflow-adapter.md`](superpowers/specs/2026-07-07-skill-eval-deerflow-adapter.md)
+是历史设计稿，其中的进程模型、事件类型和 trace 字段已经过时，不应作为实现依据。
+
+### 4.1 接入边界
+
+新 Runtime 只需要实现 `AgentRunner`，将自己的事件流归一化为稳定的
+`AgentRunResult`：
+
+```python
+class AgentRunner(Protocol):
+    async def run(self, request: AgentRunRequest) -> AgentRunResult: ...
+```
+
+必须返回的事实分为三组：
+
+| 事实 | 字段 | 要求 |
+|---|---|---|
+| 执行结果 | `success`、`thread_id`、`final_answer`、`errors` | 运行失败也要返回可解析的部分 trace，不要只抛异常 |
+| 路由结果 | `route_observation` | 基于真实 Skill 加载工具调用，不读取模型的自我声明 |
+| 可评分证据 | `trace.tool_calls`、`tool_call_chain`、`quick_turn`、`artifacts` | 保留稳定 ID，让 Judge 能引用并追溯到原始事件 |
+
+Generic scorer 只能读取这些归一化字段。Runtime 私有对象、LangGraph 消息或供应商响应
+不得泄漏到 scorer；需要深挖时通过 `raw_trace_ref` 找原始 JSONL。
+
+### 4.2 推荐实现顺序
+
+1. **先冻结输入输出契约。** 用 `AgentRunRequest.model_validate()` 和
+   `AgentRunResult.model_validate()` 覆盖子进程或网络边界，尽早暴露 schema 漂移。
+2. **实现纯事件 adapter。** `feed(event)` 只积累数据，`build()` 只生成
+   `AgentTrace`；不要在 scorer 中解析 Runtime 原生事件。
+3. **按 ID 合并消息。** 流式供应商会把同一条 AI 消息拆成多个 delta，文本需要累加，
+   tool call 需要按 `tool_call_id` 去重并关联结果。
+4. **再实现三种停止策略。** `routing_probe`、`quick`、`full` 共用同一条采集链，
+   只改变何时安全关闭 stream。
+5. **最后加进程隔离和超时。** 先用合成事件把 trace 转换测准，再接真实模型；否则
+   schema、模型和多进程问题会混在一起。
+
+### 4.3 DeerFlow 当前事件映射
+
+`DeerFlowClient.stream()` 当前主要产生以下事件：
+
+| 事件 | 处理方式 |
+|---|---|
+| `messages-tuple` / AI | 按 message ID 累加 `content`；从 `tool_calls` 建立调用记录和同批次调用链 |
+| `messages-tuple` / tool | 用 `tool_call_id` 回填 `result` / `error`；`Error:` 前缀也视为错误 |
+| `values` | 从完整消息快照补齐流式 delta 中缺失的 tool args，并收集 artifacts |
+| `end` | 记录 usage；只有看到它才能证明自然完成 |
+
+不要照早期设计稿等待独立的 `tool_call` / `tool_result` 事件。真实调用和返回都在
+`messages-tuple` 中，`values` 还是补齐参数的重要兜底。
+
+### 4.4 三种模式的停止边界
+
+| 模式 | 何时停止 | 容易误判的边界 |
+|---|---|---|
+| `routing_probe` | 某批候选 Skill 加载结果全部落定后立即关闭 stream | `none` 没有正向加载证据，只能等正常 `end` |
+| `quick` | 路由命中后，第一条新 AI 消息包含非空文本或至少一个 `tool_call`，且该消息到达边界后停止 | 纯 `tool_call` 也是输出，不能等文本；要把该轮调用嵌入 `quick_turn` |
+| `full` | 正常 `end` | 空 final answer 只有在存在 artifact 时才可能是有效产出 |
+
+路由必须等待 Skill `read_file(.../SKILL.md)` 的 ToolMessage 成功返回。只看到请求就停止，
+会把权限错误、路径错误或工具失败误记成成功路由。同一 AI 消息并发加载多个候选 Skill
+时，必须等整批返回后判为 `ambiguous`，不能采用“第一个返回者获胜”。
+
+### 4.5 Quick 输出和 Judge 证据
+
+`QuickTurnCapture` 是一条完整的 assistant 输出，而不是文本别名：
+
+```json
+{
+  "message_id": "m2",
+  "skill": "academic-paper-review",
+  "content": "",
+  "tool_calls": [
+    {"id": "t2", "name": "web_search", "args": {"query": "..."}}
+  ]
+}
+```
+
+文本和工具调用任一存在即可评估。`build_judge_evidence(target="quick_turn")` 会：
+
+- 从过程 `tool_chain` 中排除 quick turn 自己的调用批，避免同一调用重复计为过程证据；
+- 把 `content + tool_calls` 一起序列化进 `quick_turn` 输出证据；
+- 仍保留此前的 Skill 加载批作为过程证据。
+
+Judge 的引用校验要求：有过程证据时至少引用一个 `tool_chain` / `error`，并始终引用一个
+输出证据。真实 smoke 中出现过 Judge 只引用 `quick_turn`，导致
+`judgment must cite tool chain or error evidence`。这属于 `judge_failure`，不是 adapter 丢失
+quick turn。排查时先看 `quick_turn_missing`，再看 `judge_failure`，不要只看退出码 2。
+
+### 4.6 子进程和超时
+
+真实 DeerFlow runner 使用 `multiprocessing.get_context("spawn")` 隔离每个样本。这里有三个
+已经验证过的死锁/泄漏风险：
+
+- **先 `recv()`，再 `join()`。** 大 trace 可能塞满 pipe；先等子进程退出会形成互等。
+- **收到结果不等于子进程已退出。** 返回 payload 后只给有限退出宽限，仍存活就 terminate，
+  并记为 infrastructure failure。
+- **原始 trace 边跑边写。** 如果只在 `build()` 时落盘，超时杀进程后恰好没有任何现场。
+
+取消、超时、stream 异常和 `close()` 异常都必须回收子进程/生成器。不要把 partial trace
+包装成成功；也不要因为缺少 `end` 又追加一个虚假的重复错误。
+
+### 4.7 配置、成本与产物
+
+- 命令从 `backend/` 运行；`AGENT_MODEL` 和 `JUDGE_MODEL` 都是必填项，前者还必须出现在
+  DeerFlow `config.yaml` 的模型列表中。
+- API Key 只放环境变量或受支持的 secret 配置中，绝不能硬编码进临时运行脚本。
+- `config.yaml` 版本过旧会产生 upgrade 警告；先区分警告和真正的 preflight failure。
+- 全量 routing 是 20 cases × 3 epochs = 60 个独立子进程。开发阶段先跑
+  `--smoke --mode routing`（3 次），需要稳定性数据时才跑 60 次。
+- quick smoke 的退出码 2 可能来自 Judge 引用失败；它不等价于 Agent 或 adapter 失败。
+- `backend/eval-results/` 和 `backend/logs/` 是本地产物，均不应提交；前者已由根
+  `.gitignore` 明确忽略。
+
+### 4.8 验证清单
+
+接入完成前按以下顺序验证，失败时更容易定位层级：
+
+```bash
+cd backend
+
+# 1. 合成事件：不访问模型
+uv run pytest tests/skill_eval/test_deerflow_adapter.py -q
+
+# 2. Trace → Judge/Scorer 契约
+uv run pytest tests/skill_eval/test_judge.py tests/skill_eval/test_quick_scorer.py -q
+
+# 3. 全部 skill eval 回归
+uv run pytest tests/skill_eval -q
+
+# 4. 真实模型最小验证（3 个样本）
+uv run python -m skill_eval.poc --smoke --mode routing
+uv run python -m skill_eval.poc --smoke --mode quick
+```
+
+真实 quick smoke 至少检查以下字段，而不只看总退出码：
+
+- 命中 Skill 的 case：`quick_turn != null`；
+- 纯工具输出：`quick_turn.content == ""` 且 `quick_turn.tool_calls` 非空；
+- `quick_turn_missing == 0`；
+- `judge_failure` 与 `infrastructure_error` 分开统计；
+- `raw_trace_ref` 指向存在的 JSONL，超时样本也能保留已产生的事件。
 
 ---
 

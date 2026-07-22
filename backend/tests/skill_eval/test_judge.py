@@ -305,7 +305,20 @@ def test_quick_target_excludes_captured_turn_batch_and_final_answer(routing_case
             AgentToolCall(id="t2", message_id="m2", name="bash", args={"cmd": "ls"}, result="x"),
         ],
         tool_call_chain=[["t1"], ["t2"]],
-        quick_turn=QuickTurnCapture(message_id="m2", skill="systematic-literature-review", content="Plan: ..."),
+        quick_turn=QuickTurnCapture(
+            message_id="m2",
+            skill="systematic-literature-review",
+            content="Plan: ...",
+            tool_calls=[
+                AgentToolCall(
+                    id="t2",
+                    message_id="m2",
+                    name="bash",
+                    args={"cmd": "ls"},
+                    result="x",
+                )
+            ],
+        ),
     )
 
     bundle = build_judge_evidence(
@@ -324,7 +337,52 @@ def test_quick_target_excludes_captured_turn_batch_and_final_answer(routing_case
     assert bundle.evaluation_target == "quick_turn"
     quick_item = bundle.evidence[-1]
     assert quick_item.kind == "quick_turn"
-    assert quick_item.content == "Plan: ..."
+    captured_output = json.loads(quick_item.content)
+    assert captured_output["content"] == "Plan: ..."
+    assert captured_output["tool_calls"][0]["name"] == "bash"
+    assert captured_output["tool_calls"][0]["result"] == "x"
+
+
+def test_quick_target_accepts_tool_call_only_output(routing_case, route_observation):
+    quick_call = AgentToolCall(
+        id="t2",
+        message_id="m2",
+        name="web_search",
+        args={"query": "attention variants"},
+        result="results",
+    )
+    trace = AgentTrace(
+        input="Synthesize three papers.",
+        final_answer="",
+        success=True,
+        thread_id="thread-1",
+        tool_calls=[
+            AgentToolCall(id="t1", message_id="m1", name="read_file", args={"path": "SKILL.md"}, result="skill"),
+            quick_call,
+        ],
+        tool_call_chain=[["t1"], ["t2"]],
+        quick_turn=QuickTurnCapture(
+            message_id="m2",
+            skill="systematic-literature-review",
+            content="",
+            tool_calls=[quick_call],
+        ),
+    )
+
+    bundle = build_judge_evidence(
+        case=routing_case,
+        trace=trace,
+        observation=route_observation,
+        skill_descriptions={
+            "systematic-literature-review": "multi-paper",
+            "academic-paper-review": "one-paper",
+        },
+        target="quick_turn",
+    )
+
+    quick_output = json.loads(bundle.evidence[-1].content)
+    assert quick_output["content"] == ""
+    assert quick_output["tool_calls"] == [quick_call.model_dump()]
 
 
 def test_quick_target_requires_captured_turn(routing_case, full_trace, route_observation):
@@ -408,7 +466,8 @@ async def test_quick_judge_parses_structured_result(quick_bundle):
 
     assert judgment.turn_quality == 3
     assert judgment.fatal_error is False
-    assert "first assistant text turn" in model.prompts[0]
+    assert "first assistant output turn" in model.prompts[0]
+    assert "text, tool calls, or both" in model.prompts[0]
     assert "expected_route" not in model.prompts[0]
 
 

@@ -96,6 +96,34 @@ async def test_quick_scorer_passes_threshold_and_hides_labels(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_quick_scorer_judges_tool_call_only_turn(monkeypatch):
+    model = FakeModel(quick_judgment_json())
+    monkeypatch.setattr("skill_eval.inspect_scorer.get_model", lambda _: model)
+    state = quick_state()
+    state.metadata["agent_trace"]["quick_turn"] = {
+        "message_id": "m2",
+        "skill": "academic-paper-review",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "tc2",
+                "message_id": "m2",
+                "name": "web_search",
+                "args": {"query": "paper title"},
+                "result": "search results",
+                "error": None,
+            }
+        ],
+    }
+
+    score = await quick_turn_scorer("fake/judge", descriptions())(state, Target("academic-paper-review"))
+
+    assert score.value == CORRECT
+    assert "web_search" in model.prompts[0]
+    assert "quick_turn_missing" not in score.metadata
+
+
+@pytest.mark.asyncio
 async def test_quick_scorer_fails_below_threshold_or_fatal(monkeypatch):
     model = FakeModel(quick_judgment_json(turn_quality=2))
     monkeypatch.setattr("skill_eval.inspect_scorer.get_model", lambda _: model)

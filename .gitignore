@@ -25,6 +25,7 @@ bench_results.jsonl
 bench_optimized.jsonl
 results.jsonl
 backend/scripts/benchmark/*.jsonl
+/backend/eval-results/
 
 # Environment variables
 .env

@@ -34,9 +34,12 @@ _NO_SKILL_RUBRIC = """No skill:
 - remain correct, relevant, and proportionate to the request."""
 
 _QUICK_TURN_RUBRIC = """Quick-turn rubric — you are scoring exactly one assistant turn:
-the first text turn the agent produced after loading the named skill.
+the first output turn the agent produced after loading the named skill. It may contain
+text, tool calls, or both; do not penalize a turn solely because its text is empty when
+it contains a purposeful tool call.
 - the turn follows the loaded skill's workflow, format, and constraints;
 - the turn responds to the user's actual request;
+- any tool calls are purposeful and their arguments are relevant to the request;
 - the turn is coherent and self-sufficient given the observable evidence.
 Do not score later steps; do not infer work that is not in the evidence."""
 
@@ -250,7 +253,20 @@ def build_judge_evidence(
             )
         )
     if target == "quick_turn" and quick_turn is not None:
-        raw_items.append(("quick_turn", "quick_turn", quick_turn.content))
+        raw_items.append(
+            (
+                "quick_turn",
+                "quick_turn",
+                json.dumps(
+                    {
+                        "content": quick_turn.content,
+                        "tool_calls": [call.model_dump() for call in quick_turn.tool_calls],
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+            )
+        )
     else:
         raw_items.append(("final_answer", "final_answer", trace.final_answer))
 
@@ -347,7 +363,8 @@ def build_quick_judge_prompt(bundle: JudgeEvidenceBundle) -> str:
     schema = json.dumps(QuickJudgment.model_json_schema(), ensure_ascii=False, sort_keys=True)
     payload = bundle.model_dump_json()
     return f"""Evaluate only the observable behavior in the evidence bundle below.
-The bundle captures the first assistant text turn after the skill named in observed_route was loaded.
+The bundle captures the first assistant output turn after the skill named in observed_route was loaded.
+That output may contain text, tool calls, or both.
 Score that single turn only. Do not infer hidden reasoning or unobserved work.
 Cite only stable evidence IDs present in the bundle.
 Return JSON matching this schema and no prose outside JSON:

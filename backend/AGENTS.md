@@ -807,6 +807,10 @@ Key boundaries:
 - `state.output.completion` stores the agent final answer.
 - `state.metadata["agent_trace"]` stores `AgentTrace.model_dump()`.
 - Generic scorers read `AgentTrace`, not raw DeerFlow or LangGraph messages.
+- Quick mode captures the first post-skill-load AI message that contains either
+  non-empty text or a tool call. `QuickTurnCapture` preserves both `content` and
+  structured `tool_calls`, and the quick Judge receives both as one output
+  evidence item.
 - `MockAgentRunner` is the MVP runner for testing the Inspect integration before adding the DeerFlow adapter.
 - Phase 2 deterministic assertions extend the same pure assertion engine for tool arguments/results/errors/order/count, output rules, runtime limits, and unexpected clarification checks; no additional Inspect scorers are introduced for these checks.
 

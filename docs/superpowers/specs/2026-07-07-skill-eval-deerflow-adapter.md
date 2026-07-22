@@ -2,7 +2,15 @@
 
 **Goal:** Replace `MockAgentRunner` with a real `DeerFlowAgentRunner` that drives `DeerFlowClient` in-process, collects `AgentTrace` from the live agent run, and feeds it into the existing assertion/scorer pipeline — without changing the eval framework's scorer/assertion contract.
 
-**Status:** Spec — implementation follows approval.
+**Status:** Historical design record — implemented architecture has evolved.
+
+> **Do not use this file as the current integration guide.** The production
+> implementation now uses spawned child processes rather than an in-process
+> runner; DeerFlow tool calls/results arrive through `messages-tuple` events;
+> and quick mode accepts text and/or tool calls. See
+> [`docs/skill-eval-architecture.md`](../../skill-eval-architecture.md#四如何接入新的-agent-runtime)
+> for the current contract, stop conditions, validation ladder, and lessons
+> learned. This document remains unchanged below as the original design record.
 
 **Depends on:** Phase 1 (MVP mock runner) and Phase 2 (full deterministic assertions) being green.
 

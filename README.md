@@ -858,6 +858,8 @@ See [backend/docs/TUI.md](backend/docs/TUI.md) for the full guide.
 - [Configuration Guide](backend/docs/CONFIGURATION.md) - Setup and configuration instructions
 - [Architecture Overview](backend/CLAUDE.md) - Technical architecture details
 - [Backend Architecture](backend/README.md) - Backend architecture and API reference
+- [Skill Evaluation Architecture and Adapter Guide](docs/skill-eval-architecture.md) - Integrate a runtime with `AgentRunner`, normalize stream evidence, and avoid known routing/quick/Judge pitfalls
+- [Skill Evaluation Reproduction Guide](docs/reproduction-guide.md) - Run routing, quick, and full skill evaluations; quick mode treats either assistant text or tool calls as the first post-skill output
 
 ## ⚠️ Security Notice
 

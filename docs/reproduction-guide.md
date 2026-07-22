@@ -91,7 +91,7 @@ export OPENAI_API_KEY=sk-your-key-here
 | 模式 | 评估对象 | 单条成本 | 适用场景 |
 |---|---|---|---|
 | `routing` | 20 条 case × 3 epochs 的路由准确率（ smoke 为固定 3 条） | 低（路由确定即停） | 路由 benchmark |
-| `quick` | Skill 加载成功后的**第一条 AI 文本输出**（Skill 的影响集中在这一次输出上） | 低（加载 Skill + 一轮输出即停） | 快速迭代、大批量质量评估 |
+| `quick` | Skill 加载成功后的**第一条 AI 输出**，文本或 `tool_call` 都算（Skill 的影响集中在这一次输出上） | 低（加载 Skill + 一轮输出即停） | 快速迭代、大批量质量评估 |
 | `full` | Agent 跑完整个任务后的**最终输出**（smoke 下始终不可用） | 高（完整任务执行） | 端到端质量确认 |
 
 示例：
@@ -278,7 +278,7 @@ backend/eval-results/<run-id>/
 
 | 字段 | 含义 | 通过线 |
 |---|---|---|
-| `turn_quality` | Judge 对 Skill 加载后第一条 AI 文本输出的评分 | ≥ 3/4 |
+| `turn_quality` | Judge 对 Skill 加载后第一条 AI 输出（文本和/或 `tool_call`）的评分 | ≥ 3/4 |
 | `fatal_error` | 该轮输出是否不可恢复 | False |
 | `category` | 未评估原因（见下表），评估成功为 null | — |
 | `quick_metrics.pass_rate` | 通过数 / 实际可判 case 数（judged） | ≥ 0.75 |
@@ -291,7 +291,7 @@ quick 失败分类（互斥，体现在 `category` / `failure_buckets`）：
 |---|---|
 | `infrastructure_error` | Agent 运行或路由观察本身坏掉 |
 | `route_mismatch` | 实际路由 ≠ 期望路由（路由分由 routing 评估负责，不重复扣分） |
-| `quick_turn_missing` | 路由命中但到流结束也没捕到文本轮 |
+| `quick_turn_missing` | 路由命中但到流结束也没捕到文本或 `tool_call` 输出轮 |
 | `judge_failure` | Judge 输出修复一次后仍无法解析/校验 |
 | `not_applicable_none_case` | 期望路由为 none，quick 质量评估不适用 |
 
@@ -331,6 +331,23 @@ quick 失败分类（互斥，体现在 `category` / `failure_buckets`）：
 ### 某条 Agent 跑超时 / recursion limit
 
 DeerFlow 的 Agent 循环有 100 步限制。复杂的 skill 工作流可能触发。这不影响评测框架本身——会被记录为 infrastructure failure 并纳入 `valid_run_rate`。
+
+### quick smoke 退出码 2，但 `quick_turn_missing` 是 0
+
+先看 `quick_metrics.failure_buckets`。真实运行中 Judge 可能已经看到包含 `tool_calls` 的
+`quick_turn`，但没有同时引用必需的 `tool_chain` 过程证据，此时会记录为
+`judge_failure`。这说明 quick 捕获成功、Judge 输出校验失败，不要误判成 adapter 丢事件。
+
+### 为什么 routing 全量要跑 60 次
+
+全量 routing 用 20 个 case × 3 epochs 测随机稳定性。日常对接和调试先使用
+`--smoke --mode routing`，只运行固定 3 个 case 各一次；只有需要 stability 指标时才跑
+完整 60 次。
+
+### 评估产物出现在 `git status`
+
+运行产物应位于 `backend/eval-results/` 和 `backend/logs/`。仓库 `.gitignore` 已忽略这两个
+目录；如果产物曾被提交过，需要先从 Git index 移除，不能仅依赖 ignore 规则。
 
 ---
 

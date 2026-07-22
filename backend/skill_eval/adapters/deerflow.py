@@ -77,6 +77,12 @@ class DeerFlowTraceAdapter:
         message = self._ai_messages.get(message_id)
         return str(message["content"]) if message is not None else ""
 
+    def ai_message_tool_calls(self, message_id: str) -> tuple[AgentToolCall, ...]:
+        message = self._ai_messages.get(message_id)
+        if message is None:
+            return ()
+        return tuple(self._tool_calls[stored_call["id"]] for stored_call in message["tool_calls"] if stored_call["id"] in self._tool_calls)
+
     def start(self) -> None:
         self._start_time = time.monotonic()
         if self._live_raw_trace_path is not None:
@@ -246,7 +252,7 @@ class DeerFlowTraceAdapter:
 
 
 class _QuickTurnWatcher:
-    """Track the first non-empty AI text turn after a skill-load routing decision."""
+    """Track the first AI output turn after a skill-load routing decision."""
 
     def __init__(self) -> None:
         self.skill: str | None = None
@@ -273,7 +279,7 @@ class _QuickTurnWatcher:
         if self.target_id is None:
             if event.data.get("type") != "ai" or message_id in self._excluded_ids:
                 return
-            if adapter.ai_message_content(message_id).strip():
+            if adapter.ai_message_content(message_id).strip() or adapter.ai_message_tool_calls(message_id):
                 self.target_id = message_id
             return
         if message_id != self.target_id:
@@ -401,6 +407,7 @@ def _execute_deerflow(
             message_id=watcher.target_id,
             skill=watcher.skill,
             content=watcher.content,
+            tool_calls=list(adapter.ai_message_tool_calls(watcher.target_id)),
         )
 
     observation = observer.finalize(stream_completed=saw_end)
