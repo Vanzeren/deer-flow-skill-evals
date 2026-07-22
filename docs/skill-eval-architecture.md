@@ -351,6 +351,10 @@ quick turn。排查时先看 `quick_turn_missing`，再看 `judge_failure`，不
 
 - 命令从 `backend/` 运行；`AGENT_MODEL` 和 `JUDGE_MODEL` 都是必填项，前者还必须出现在
   DeerFlow `config.yaml` 的模型列表中。
+- DeepSeek 的 Inspect Judge 使用正式 V4 ID，例如
+  `openai-api/deepseek/deepseek-v4-flash`（默认）或
+  `openai-api/deepseek/deepseek-v4-pro`（更高成本）；不要使用即将停用的
+  `deepseek-chat` / `deepseek-reasoner` 兼容别名。
 - API Key 只放环境变量或受支持的 secret 配置中，绝不能硬编码进临时运行脚本。
 - `config.yaml` 版本过旧会产生 upgrade 警告；先区分警告和真正的 preflight failure。
 - 全量 routing 是 20 cases × 3 epochs = 60 个独立子进程。开发阶段先跑
