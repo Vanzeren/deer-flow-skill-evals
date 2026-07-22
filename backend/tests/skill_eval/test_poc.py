@@ -456,3 +456,11 @@ def test_parser_mode_append_and_default():
     parser = _build_parser()
     assert parser.parse_args([]).mode is None
     assert parser.parse_args(["--mode", "routing", "--mode", "quick"]).mode == ["routing", "quick"]
+
+
+def test_smoke_with_only_full_mode_is_rejected(valid_config, preflight_record, monkeypatch):
+    monkeypatch.setattr("skill_eval.poc.preflight", lambda config: preflight_record)
+    config = valid_config.model_copy(update={"smoke": True, "modes": ("full",)})
+
+    with pytest.raises(PocConfigurationError, match="full"):
+        run_poc(config)

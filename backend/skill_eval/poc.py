@@ -183,6 +183,8 @@ def run_poc(config: PocConfig) -> tuple[PocSummary, int]:
     started_at = datetime.now(UTC)
     run_id = started_at.strftime("%Y%m%dT%H%M%SZ") + f"-{uuid4().hex[:8]}"
     preflight_record = preflight(config)
+    if config.smoke and set(config.modes) == {"full"}:
+        raise PocConfigurationError("--smoke with only --mode full runs nothing: full quality is disabled in smoke mode")
     config.log_dir.mkdir(parents=True, exist_ok=True)
 
     trace_dir = config.output_dir / run_id / "traces"
