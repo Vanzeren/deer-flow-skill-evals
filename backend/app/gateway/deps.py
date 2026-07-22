@@ -326,6 +326,7 @@ async def langgraph_runtime(app: FastAPI, startup_config: AppConfig) -> AsyncGen
         app.state.run_manager = RunManager(
             store=app.state.run_store,
             run_ownership_config=run_ownership_config,
+            event_store=app.state.run_event_store,
         )
         # Startup recovery: mark inflight runs whose lease has expired as error.
         # In single-worker mode (SQLite / backend=memory), no run has a lease, so

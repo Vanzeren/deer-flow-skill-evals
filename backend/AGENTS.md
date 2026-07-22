@@ -445,8 +445,14 @@ and staying on the run's event-loop thread serializes parallel tool callbacks
 before terminal delivery recording and flushing. Each worker creates a separate
 journal per run before cancellable/fallible preflight work, so checkpoint
 compatibility failures and cancellation while waiting for prior finalization
-still emit a zero-delivery receipt. Event stores own concurrency across journals:
-memory and JSONL are single-process backends, while the DB store adds per-thread
+still emit a zero-delivery receipt. The worker flushes ordinary journal events,
+idempotently persists the run-scoped receipt, and only then persists the staged
+terminal run status. A receipt failure deliberately leaves the durable run row
+inflight so startup or periodic lease recovery can retry; orphan recovery uses
+the same singleton write before marking the run `error`, preserving an existing
+detailed receipt when a worker crashed between those two writes. Event stores
+serialize `put_if_absent` with ordinary thread writers: memory and JSONL provide
+the documented single-process guarantee, while the DB store adds per-thread
 in-process locks and PostgreSQL advisory locks for cross-process writers.
 Multi-worker deployments therefore require `run_events.backend: db` for shared,
 ordered delivery events; the current startup gate does not enforce that

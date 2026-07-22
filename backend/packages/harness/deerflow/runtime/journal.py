@@ -686,12 +686,11 @@ class RunJournal(BaseCallbackHandler):
                 self._produced_artifact_keys.add(key)
                 self._produced_artifacts.append(key)
 
-    def record_delivery(self) -> None:
-        """Buffer the terminal ``run.delivery`` event for this run (#4272 slice 1).
+    def get_delivery_content(self) -> dict[str, Any]:
+        """Return the terminal delivery fact accumulated for this run.
 
-        Called once by the worker before the final journal flush, on every
-        terminal outcome. This is a fact record, not a verdict: runs that
-        produced no artifacts emit ``presented: 0``.
+        This is a fact record, not a verdict: runs that produced no artifacts
+        emit ``presented: 0``.
         """
         by_tool: dict[str, list[str]] = {}
         paths: list[str] = []
@@ -699,10 +698,18 @@ class RunJournal(BaseCallbackHandler):
             paths.append(path)
             if tool_name:
                 by_tool.setdefault(tool_name, []).append(path)
+        return {"presented": len(paths), "paths": paths, "by_tool": by_tool}
+
+    def record_delivery(self) -> None:
+        """Buffer the terminal ``run.delivery`` event for this run (#4272 slice 1).
+
+        Kept for direct journal users. The worker uses the event store's
+        idempotent singleton write so crash recovery can safely backfill it.
+        """
         self._put(
             event_type="run.delivery",
             category="outputs",
-            content={"presented": len(paths), "paths": paths, "by_tool": by_tool},
+            content=self.get_delivery_content(),
         )
 
     async def flush(self) -> None:

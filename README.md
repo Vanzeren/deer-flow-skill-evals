@@ -569,6 +569,12 @@ logging:
 
 When enabled, every Gateway HTTP response includes `X-Trace-Id`, logs include `trace_id`, and Langfuse traces created by that request include `metadata.deerflow_trace_id` with the same value.
 
+Gateway run history also records one terminal `run.delivery` receipt per run,
+including zero-output and crash-recovered runs. The receipt is persisted before
+the durable terminal run status and is idempotently backfilled during orphan
+recovery, so operators can distinguish “nothing was presented” from a missing
+delivery record after a restart or lease takeover.
+
 #### LangSmith Tracing
 
 DeerFlow has built-in [LangSmith](https://smith.langchain.com) integration for observability. When enabled, all LLM calls, agent runs, and tool executions are traced and visible in the LangSmith dashboard.

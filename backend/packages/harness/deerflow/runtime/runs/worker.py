@@ -273,6 +273,7 @@ async def run_agent(
     event_store = ctx.event_store
     run_events_config = ctx.run_events_config
     thread_store = ctx.thread_store
+    terminal_status_kwargs = {"persist": False} if event_store is not None else {}
 
     run_id = record.run_id
     thread_id = record.thread_id
@@ -604,7 +605,12 @@ async def run_agent(
             await run_manager.set_finalizing(run_id, True)
             action = record.abort_action
             if action == "rollback":
-                await run_manager.set_status(run_id, RunStatus.error, error="Rolled back by user")
+                await run_manager.set_status(
+                    run_id,
+                    RunStatus.error,
+                    error="Rolled back by user",
+                    **terminal_status_kwargs,
+                )
                 try:
                     await _rollback_to_pre_run_checkpoint(
                         accessor=accessor,
@@ -618,13 +624,22 @@ async def run_agent(
                 except Exception:
                     logger.warning("Failed to rollback checkpoint for run %s", run_id, exc_info=True)
             else:
-                await run_manager.set_status(run_id, RunStatus.interrupted)
+                await run_manager.set_status(
+                    run_id,
+                    RunStatus.interrupted,
+                    **terminal_status_kwargs,
+                )
         elif llm_error_fallback_message or (journal is not None and journal.had_llm_error_fallback):
             error_msg = llm_error_fallback_message
             if error_msg is None and journal is not None:
                 error_msg = journal.llm_error_fallback_message
             error_msg = error_msg or "LLM provider failed after retries"
-            await run_manager.set_status(run_id, RunStatus.error, error=error_msg)
+            await run_manager.set_status(
+                run_id,
+                RunStatus.error,
+                error=error_msg,
+                **terminal_status_kwargs,
+            )
         else:
             runtime_context = runtime.context if isinstance(runtime.context, dict) else None
             # Guard middlewares that hard-stop a run by stripping tool_calls
@@ -641,13 +656,23 @@ async def run_agent(
             # collects the most severe / first / all reasons) instead of each
             # guard writing directly to the same key.
             stop_reason = runtime_context.get("stop_reason") if runtime_context is not None else None
-            await run_manager.set_status(run_id, RunStatus.success, stop_reason=stop_reason)
+            await run_manager.set_status(
+                run_id,
+                RunStatus.success,
+                stop_reason=stop_reason,
+                **terminal_status_kwargs,
+            )
 
     except asyncio.CancelledError:
         await run_manager.set_finalizing(run_id, True)
         action = record.abort_action
         if action == "rollback":
-            await run_manager.set_status(run_id, RunStatus.error, error="Rolled back by user")
+            await run_manager.set_status(
+                run_id,
+                RunStatus.error,
+                error="Rolled back by user",
+                **terminal_status_kwargs,
+            )
             try:
                 await _rollback_to_pre_run_checkpoint(
                     accessor=accessor,
@@ -661,13 +686,22 @@ async def run_agent(
             except Exception:
                 logger.warning("Run %s cancellation rollback failed", run_id, exc_info=True)
         else:
-            await run_manager.set_status(run_id, RunStatus.interrupted)
+            await run_manager.set_status(
+                run_id,
+                RunStatus.interrupted,
+                **terminal_status_kwargs,
+            )
             logger.info("Run %s was cancelled", run_id)
 
     except Exception as exc:
         error_msg = f"{exc}"
         logger.exception("Run %s failed: %s", run_id, error_msg)
-        await run_manager.set_status(run_id, RunStatus.error, error=error_msg)
+        await run_manager.set_status(
+            run_id,
+            RunStatus.error,
+            error=error_msg,
+            **terminal_status_kwargs,
+        )
         await bridge.publish(
             run_id,
             "error",
@@ -695,20 +729,40 @@ async def run_agent(
             except Exception:
                 logger.warning("Failed to record workspace changes for run %s", run_id, exc_info=True)
 
-        # Flush any buffered journal events and persist completion data
+        # Flush buffered journal events before the terminal receipt. The
+        # receipt uses a run-scoped idempotent write shared with recovery, then
+        # the staged terminal status is persisted. This ordering closes the
+        # crash window where a terminal run could otherwise outlive its receipt.
+        receipt_durable = event_store is None
         if journal is not None:
-            try:
-                # Terminal delivery fact record (#4272 slice 1): exactly one
-                # run.delivery event per run, on every terminal outcome.
-                # Best-effort — must never alter the run outcome.
-                journal.record_delivery()
-            except Exception:
-                logger.warning("Failed to record delivery event for run %s (non-fatal)", run_id, exc_info=True)
             try:
                 await journal.flush()
             except Exception:
                 logger.warning("Failed to flush journal for run %s", run_id, exc_info=True)
 
+            try:
+                await event_store.put_if_absent(
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    event_type="run.delivery",
+                    category="outputs",
+                    content=journal.get_delivery_content(),
+                )
+                receipt_durable = True
+            except Exception:
+                # Keep the durable run row inflight. Startup/periodic orphan
+                # reconciliation can then retry a zero-delivery receipt before
+                # terminalizing it, rather than preserving a receipt-less
+                # terminal status forever.
+                logger.warning("Failed to persist delivery receipt for run %s; terminal status remains retryable", run_id, exc_info=True)
+
+        if event_store is not None and receipt_durable:
+            try:
+                await run_manager.persist_current_status(run_id)
+            except Exception:
+                logger.warning("Failed to persist terminal status for run %s after delivery receipt", run_id, exc_info=True)
+
+        if journal is not None and receipt_durable:
             try:
                 # Persist token usage + convenience fields to RunStore
                 completion = journal.get_completion_data()

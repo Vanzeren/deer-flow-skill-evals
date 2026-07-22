@@ -12,6 +12,7 @@ from langgraph.types import Command
 from deerflow.runtime.events.store.memory import MemoryRunEventStore
 from deerflow.runtime.runs.manager import RunManager
 from deerflow.runtime.runs.schemas import RunStatus
+from deerflow.runtime.runs.store.memory import MemoryRunStore
 from deerflow.runtime.runs.worker import RunContext, run_agent
 
 
@@ -121,6 +122,68 @@ async def test_delivery_event_emitted_exactly_once_on_error_path():
     assert delivery[0]["content"]["presented"] == 0
     fetched = await run_manager.get(record.run_id)
     assert fetched.status == RunStatus.error
+
+
+@pytest.mark.anyio
+async def test_delivery_is_durable_before_terminal_run_status():
+    events = MemoryRunEventStore()
+
+    class OrderingRunStore(MemoryRunStore):
+        async def update_status(self, run_id, status, *, error=None, stop_reason=None):
+            if status not in {"pending", "running"}:
+                receipt = await events.list_events("thread-1", run_id, event_types=["run.delivery"])
+                assert len(receipt) == 1
+            return await super().update_status(run_id, status, error=error, stop_reason=stop_reason)
+
+    run_store = OrderingRunStore()
+    run_manager = RunManager(store=run_store)
+    record = await run_manager.create("thread-1")
+
+    class DummyAgent:
+        async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
+            yield {"messages": []}
+
+    await run_agent(
+        _make_bridge(),
+        run_manager,
+        record,
+        ctx=RunContext(checkpointer=None, event_store=events),
+        agent_factory=lambda *, config: DummyAgent(),
+        graph_input={},
+        config={},
+    )
+
+    assert (await run_store.get(record.run_id))["status"] == "success"
+
+
+@pytest.mark.anyio
+async def test_delivery_write_failure_leaves_durable_status_inflight_for_recovery():
+    class FailingReceiptStore(MemoryRunEventStore):
+        async def put_if_absent(self, **kwargs):
+            raise RuntimeError("event store unavailable")
+
+    run_store = MemoryRunStore()
+    run_manager = RunManager(store=run_store)
+    record = await run_manager.create("thread-1")
+
+    class DummyAgent:
+        async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
+            yield {"messages": []}
+
+    await run_agent(
+        _make_bridge(),
+        run_manager,
+        record,
+        ctx=RunContext(checkpointer=None, event_store=FailingReceiptStore()),
+        agent_factory=lambda *, config: DummyAgent(),
+        graph_input={},
+        config={},
+    )
+
+    # The in-memory record can finish for local callers, but the durable row
+    # remains recoverable instead of becoming a receipt-less terminal run.
+    assert record.status == RunStatus.success
+    assert (await run_store.get(record.run_id))["status"] == "running"
 
 
 @pytest.mark.anyio
