@@ -72,6 +72,21 @@ def test_summarize_omits_group_without_a_successful_pair() -> None:
     assert summarize._summarize([_row("full", 0, 10, 1000)], metrics=["write_total_ms"]) == []
 
 
+def test_summarize_excludes_profiled_pairs_from_baseline_medians() -> None:
+    rows = [
+        _row("full", 0, 10, 1000),
+        _row("delta", 0, 5, 200),
+        {**_row("full", 1, 1000, 1000), "profiled": True},
+        {**_row("delta", 1, 1000, 200), "profiled": True},
+    ]
+
+    result = summarize._summarize(rows, metrics=["write_total_ms"])
+
+    assert result[0]["paired_repetitions"] == 1
+    assert result[0]["full_write_total_ms"] == 10.0
+    assert result[0]["delta_write_total_ms"] == 5.0
+
+
 def test_summarize_sorts_numeric_update_counts_numerically() -> None:
     rows = []
     for update_count in (10, 2):
@@ -134,3 +149,20 @@ def test_main_writes_json_summary(tmp_path: Path, capsys: pytest.CaptureFixture[
     assert rc == 0
     output = json.loads(capsys.readouterr().out)
     assert output[0]["ratio_write_total_ms"] == 0.5
+
+
+def test_main_warns_when_profiled_rows_are_skipped(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = tmp_path / "results.jsonl"
+    rows = [
+        _row("full", 0, 10, 1000),
+        _row("delta", 0, 5, 200),
+        {**_row("full", 1, 1000, 1000), "profiled": True},
+        {**_row("delta", 1, 1000, 200), "profiled": True},
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    rc = summarize.main([str(path), "--metrics", "write_total_ms", "--json"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "Skipping 2 profiled row(s)" in captured.err

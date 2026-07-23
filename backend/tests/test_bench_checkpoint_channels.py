@@ -22,8 +22,14 @@ def _load_module():
 bench = _load_module()
 
 
-def test_parse_positive_int_csv_deduplicates_in_input_order() -> None:
+def test_parse_positive_int_csv_deduplicates_in_input_order(capsys: pytest.CaptureFixture[str]) -> None:
     assert bench._parse_positive_int_csv("100,10,100,500", option="--updates") == [100, 10, 500]
+    assert "ignored duplicate value(s): 100" in capsys.readouterr().err
+
+
+def test_parse_choice_csv_reports_duplicate_values(capsys: pytest.CaptureFixture[str]) -> None:
+    assert bench._parse_choice_csv("full,full,delta", option="--modes", choices=("full", "delta")) == ["full", "delta"]
+    assert "ignored duplicate value(s): full" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("value", ["", "0", "-1", "one", "1,,2"])
@@ -96,6 +102,10 @@ def test_oversized_filter_does_not_suppress_a_delta_only_diagnostic() -> None:
     assert skipped == []
 
 
+def test_help_explains_delta_only_runs_bypass_full_payload_cap() -> None:
+    assert "delta-only" in bench._build_parser().format_help()
+
+
 def test_cross_mode_validation_rejects_materialized_state_mismatch() -> None:
     rows = [
         {
@@ -154,6 +164,32 @@ def test_memory_smoke_case_materializes_expected_state(mode: str, tmp_path: Path
     assert row["logical_checkpoint_bytes"] is not None
 
 
+def test_memory_case_keeps_timings_when_private_storage_stats_change(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    case = bench.BenchmarkCase(
+        mode="delta",
+        backend="memory",
+        update_count=2,
+        payload_bytes=32,
+        repetition=0,
+        seed=1,
+    )
+
+    def fail_storage_stats(*_args, **_kwargs):
+        raise AttributeError("private saver layout changed")
+
+    monkeypatch.setattr(bench, "_memory_storage_stats", fail_storage_stats)
+
+    row = bench._run_case(case, work_dir=tmp_path)
+
+    assert row["success"] is True
+    assert row["write_total_ms"] >= 0
+    assert row["logical_checkpoint_bytes"] is None
+    assert row["logical_write_bytes"] is None
+    assert row["checkpoint_rows"] is None
+    assert row["write_rows"] is None
+    assert "private saver layout changed" in row["storage_stats_error"]
+
+
 @pytest.mark.parametrize("mode", ["full", "delta"])
 def test_sqlite_smoke_case_reports_durable_and_logical_storage(mode: str, tmp_path: Path) -> None:
     case = bench.BenchmarkCase(
@@ -178,8 +214,10 @@ def test_sqlite_smoke_case_reports_durable_and_logical_storage(mode: str, tmp_pa
 
 def test_controller_writes_versioned_jsonl_without_sensitive_case_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     output = tmp_path / "result.jsonl"
+    child_git_shas = []
 
-    def fake_run_child(case, *, timeout_seconds, profile_dir=None):
+    def fake_run_child(case, *, timeout_seconds, git_sha, profile_dir=None):
+        child_git_shas.append(git_sha)
         return {
             "schema_version": 1,
             "benchmark_version": 1,
@@ -197,6 +235,7 @@ def test_controller_writes_versioned_jsonl_without_sensitive_case_paths(monkeypa
         }
 
     monkeypatch.setattr(bench, "_run_child_case", fake_run_child)
+    monkeypatch.setattr(bench, "_resolve_git_sha", lambda: "controller-sha")
 
     rc = bench.main(
         [
@@ -220,6 +259,7 @@ def test_controller_writes_versioned_jsonl_without_sensitive_case_paths(monkeypa
     assert [row["mode"] for row in rows] == ["full", "delta"]
     assert all(row["schema_version"] == 1 for row in rows)
     assert all("work_dir" not in row and "database_path" not in row for row in rows)
+    assert child_git_shas == ["controller-sha", "controller-sha"]
 
 
 def test_profiled_case_writes_loadable_stats(tmp_path: Path) -> None:
@@ -236,5 +276,6 @@ def test_profiled_case_writes_loadable_stats(tmp_path: Path) -> None:
     row = bench._run_profiled_case(case, work_dir=tmp_path / "work", profile_path=profile_path)
 
     assert row["success"] is True
+    assert row["profiled"] is True
     assert profile_path.is_file()
     assert profile_path.stat().st_size > 0

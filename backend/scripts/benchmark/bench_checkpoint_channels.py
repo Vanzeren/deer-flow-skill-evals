@@ -39,6 +39,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
@@ -66,8 +67,15 @@ SCHEMA_VERSION = 1
 BENCHMARK_VERSION = 1
 PRODUCTION_SNAPSHOT_FREQUENCY = 1000
 DEFAULT_MAX_ESTIMATED_FULL_BYTES = 1024**3
+_GIT_SHA_ENV = "DEERFLOW_CHECKPOINT_BENCH_GIT_SHA"
 _MODES: tuple[Mode, ...] = ("full", "delta")
 _BACKENDS: tuple[Backend, ...] = ("memory", "sqlite")
+_STORAGE_STAT_FIELDS = (
+    "logical_checkpoint_bytes",
+    "logical_write_bytes",
+    "checkpoint_rows",
+    "write_rows",
+)
 
 
 class _FullBenchmarkState(TypedDict):
@@ -114,6 +122,7 @@ def _parse_positive_int_csv(value: str, *, option: str) -> list[int]:
         raise ValueError(f"{option} must be a comma-separated list of positive integers")
     result: list[int] = []
     seen: set[int] = set()
+    duplicates: list[int] = []
     try:
         parsed = [int(part.strip()) for part in value.split(",")]
     except ValueError as exc:
@@ -124,6 +133,13 @@ def _parse_positive_int_csv(value: str, *, option: str) -> list[int]:
         if item not in seen:
             result.append(item)
             seen.add(item)
+        elif item not in duplicates:
+            duplicates.append(item)
+    if duplicates:
+        print(
+            f"{option}: ignored duplicate value(s): {', '.join(str(item) for item in duplicates)}; use --repetitions for repeated samples.",
+            file=sys.stderr,
+        )
     return result
 
 
@@ -131,12 +147,20 @@ def _parse_choice_csv(value: str, *, option: str, choices: tuple[str, ...]) -> l
     if not value or value.startswith(",") or value.endswith(",") or ",," in value:
         raise ValueError(f"{option} must contain one or more of: {', '.join(choices)}")
     result: list[str] = []
+    duplicates: list[str] = []
     for raw in value.split(","):
         item = raw.strip()
         if item not in choices:
             raise ValueError(f"{option} contains unsupported value {item!r}; expected: {', '.join(choices)}")
         if item not in result:
             result.append(item)
+        elif item not in duplicates:
+            duplicates.append(item)
+    if duplicates:
+        print(
+            f"{option}: ignored duplicate value(s): {', '.join(duplicates)}; use --repetitions for repeated samples.",
+            file=sys.stderr,
+        )
     return result
 
 
@@ -259,9 +283,9 @@ def _config(case: BenchmarkCase) -> dict[str, Any]:
     return config
 
 
-def _base_row(case: BenchmarkCase) -> dict[str, Any]:
+def _resolve_git_sha() -> str:
     try:
-        git_sha = subprocess.run(
+        return subprocess.run(
             ["git", "rev-parse", "HEAD"],
             cwd=Path(__file__).resolve().parents[3],
             check=True,
@@ -270,7 +294,11 @@ def _base_row(case: BenchmarkCase) -> dict[str, Any]:
             timeout=5,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
-        git_sha = "unknown"
+        return "unknown"
+
+
+def _base_row(case: BenchmarkCase) -> dict[str, Any]:
+    git_sha = os.environ.get(_GIT_SHA_ENV) or _resolve_git_sha()
     try:
         langgraph_version = importlib.metadata.version("langgraph")
     except importlib.metadata.PackageNotFoundError:
@@ -280,6 +308,7 @@ def _base_row(case: BenchmarkCase) -> dict[str, Any]:
         "benchmark_version": BENCHMARK_VERSION,
         "success": True,
         "error": None,
+        "profiled": False,
         "git_sha": git_sha,
         "python_version": platform.python_version(),
         "langgraph_version": langgraph_version,
@@ -300,6 +329,17 @@ def _safe_error(error: BaseException | str, *, work_dir: Path | None = None) -> 
     if work_dir is not None:
         message = message.replace(str(work_dir), "<work-dir>")
     return message[:2000]
+
+
+def _collect_storage_stats(collector: Callable[[], dict[str, int]]) -> dict[str, Any]:
+    """Keep timing data usable when a saver's diagnostic layout changes."""
+    try:
+        return {**collector(), "storage_stats_error": None}
+    except Exception as exc:
+        return {
+            **dict.fromkeys(_STORAGE_STAT_FIELDS),
+            "storage_stats_error": _safe_error(exc),
+        }
 
 
 def _memory_storage_stats(saver: InMemorySaver, thread_id: str) -> dict[str, int]:
@@ -414,7 +454,7 @@ def _validate_materialized(case: BenchmarkCase, expected: list[BaseMessage], war
 def _run_memory_case(case: BenchmarkCase, messages: list[BaseMessage]) -> dict[str, Any]:
     saver = InMemorySaver()
     metrics, warm = _write_and_read(case, saver, messages)
-    stats = _memory_storage_stats(saver, _config(case)["configurable"]["thread_id"])
+    stats = _collect_storage_stats(lambda: _memory_storage_stats(saver, _config(case)["configurable"]["thread_id"]))
     cold_read_ms, cold = _cold_read(case, saver)
     actual_count, digest = _validate_materialized(case, messages, warm, cold)
     return {
@@ -438,7 +478,7 @@ def _run_sqlite_case(case: BenchmarkCase, messages: list[BaseMessage], db_path: 
     with SqliteSaver.from_conn_string(str(db_path)) as saver:
         saver.setup()
         metrics, warm = _write_and_read(case, saver, messages)
-        stats = _sqlite_storage_stats(saver, _config(case)["configurable"]["thread_id"])
+        stats = _collect_storage_stats(lambda: _sqlite_storage_stats(saver, _config(case)["configurable"]["thread_id"]))
         db_bytes = _file_size(db_path)
         wal_bytes = _file_size(Path(f"{db_path}-wal"))
         shm_bytes = _file_size(Path(f"{db_path}-shm"))
@@ -495,6 +535,7 @@ def _run_profiled_case(case: BenchmarkCase, *, work_dir: Path, profile_path: Pat
     profile_path.parent.mkdir(parents=True, exist_ok=True)
     profiler = cProfile.Profile()
     row = profiler.runcall(_run_case, case, work_dir=work_dir)
+    row["profiled"] = True
     profiler.dump_stats(profile_path)
     return row
 
@@ -541,12 +582,14 @@ def _profile_filename(case: BenchmarkCase) -> str:
     return f"{case.backend}-{case.mode}-updates-{case.update_count}-payload-{case.payload_bytes}-rep-{case.repetition}.prof"
 
 
-def _run_child_case(case: BenchmarkCase, *, timeout_seconds: float, profile_dir: Path | None = None) -> dict[str, Any]:
+def _run_child_case(case: BenchmarkCase, *, timeout_seconds: float, git_sha: str, profile_dir: Path | None = None) -> dict[str, Any]:
     encoded_case = json.dumps(asdict(case), separators=(",", ":"))
     command = [sys.executable, str(Path(__file__).resolve()), "--worker-case", encoded_case]
     if profile_dir is not None:
         command.extend(["--worker-profile", str(profile_dir / _profile_filename(case))])
     started = time.perf_counter()
+    child_env = os.environ.copy()
+    child_env[_GIT_SHA_ENV] = git_sha
     try:
         completed = subprocess.run(
             command,
@@ -554,7 +597,7 @@ def _run_child_case(case: BenchmarkCase, *, timeout_seconds: float, profile_dir:
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
-            env=os.environ.copy(),
+            env=child_env,
         )
     except subprocess.TimeoutExpired:
         return _failure_row(case, f"child process timed out after {timeout_seconds:g} seconds")
@@ -582,7 +625,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--timeout-seconds", type=float, default=900)
-    parser.add_argument("--max-estimated-full-bytes", type=int, default=DEFAULT_MAX_ESTIMATED_FULL_BYTES)
+    parser.add_argument(
+        "--max-estimated-full-bytes",
+        type=int,
+        default=DEFAULT_MAX_ESTIMATED_FULL_BYTES,
+        help=("Skip comparable pairs whose estimated cumulative full-mode payload exceeds this value. The cap applies only when full mode is selected; delta-only diagnostics bypass it."),
+    )
     parser.add_argument("--allow-large-cases", action="store_true", help="Disable the estimated cumulative full-payload safety cap")
     parser.add_argument("--profile-dir", type=Path, help="Write one cProfile file per case; profiling inflates timings")
     parser.add_argument("--output", type=Path)
@@ -646,13 +694,14 @@ def main(argv: list[str] | None = None) -> int:
         print("No benchmark cases remain after applying the safety cap.", file=sys.stderr)
         return 2
 
+    git_sha = _resolve_git_sha()
     rows: list[dict[str, Any]] = []
     for index, case in enumerate(cases, start=1):
         print(
             f"[{index}/{len(cases)}] {case.backend} {case.mode} updates={case.update_count} payload={case.payload_bytes} repetition={case.repetition}",
             file=sys.stderr,
         )
-        rows.append(_run_child_case(case, timeout_seconds=args.timeout_seconds, profile_dir=args.profile_dir))
+        rows.append(_run_child_case(case, timeout_seconds=args.timeout_seconds, git_sha=git_sha, profile_dir=args.profile_dir))
     _validate_cross_mode_rows(rows)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

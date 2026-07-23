@@ -94,6 +94,8 @@ def _group_sort_key(key: tuple[Any, ...]) -> tuple[tuple[int, Any], ...]:
 def _summarize(rows: list[dict[str, Any]], *, metrics: list[str]) -> list[dict[str, Any]]:
     groups: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
+        if row.get("profiled"):
+            continue
         groups[_group_key(row)].append(row)
 
     summaries: list[dict[str, Any]] = []
@@ -176,6 +178,9 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    profiled_rows = sum(1 for row in rows if row.get("profiled"))
+    if profiled_rows:
+        print(f"Skipping {profiled_rows} profiled row(s); profiled timings are excluded from baseline summaries.", file=sys.stderr)
     summaries = _summarize(rows, metrics=metrics)
     if args.json:
         json.dump(summaries, sys.stdout, ensure_ascii=False, indent=2)

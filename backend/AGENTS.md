@@ -829,12 +829,19 @@ correctness digests, write windows/percentiles, warm and graph-rebuilt cold read
 logical checkpoint/write bytes, SQLite DB/WAL/SHM footprint, reducer replay time,
 and peak RSS as versioned JSONL. The controller alternates mode order and rejects
 performance data when paired modes materialize different state. Its default 1 GiB
-estimated cumulative full-payload cap skips both modes of an oversized pair; use
-`--allow-large-cases` only on a provisioned machine. Summarize paired successful
-repetitions with `scripts/benchmark/summarize_checkpoint_channels.py` (all ratios
-are `delta/full`). `--profile-dir /tmp/checkpoint-profiles` writes one cProfile
-artifact per case for attribution; profiled timing rows are intentionally inflated
-and must not be mixed into baseline summaries. Example:
+estimated cumulative full-payload cap skips both modes of an oversized pair when
+`full` is selected; intentional `--modes delta` diagnostics bypass this
+full-payload cap, so size those runs explicitly. Use `--allow-large-cases` only
+on a provisioned machine. Duplicate CSV matrix values are ignored with a warning;
+use `--repetitions` for repeated samples. Summarize paired successful repetitions
+with `scripts/benchmark/summarize_checkpoint_channels.py` (all ratios are
+`delta/full`). `--profile-dir /tmp/checkpoint-profiles` writes one cProfile
+artifact per case for attribution. Profiled rows carry `profiled: true`, and the
+summarizer automatically excludes them from baseline summaries with a warning.
+Storage-size collection relies on saver-specific diagnostic layouts; if those
+layouts change, the timing/correctness row remains successful while storage
+fields become `null` and `storage_stats_error` records the diagnostic failure.
+Example:
 
 ```bash
 cd backend
