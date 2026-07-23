@@ -449,10 +449,14 @@ journal per run before cancellable/fallible preflight work, so checkpoint
 compatibility failures and cancellation while waiting for prior finalization
 still emit a zero-delivery receipt. The worker flushes ordinary journal events,
 idempotently persists the run-scoped receipt, and only then persists the staged
-terminal run status. A receipt failure deliberately leaves the durable run row
-inflight so startup or periodic lease recovery can retry; orphan recovery uses
-the same singleton write before marking the run `error`, preserving an existing
-detailed receipt when a worker crashed between those two writes. Event stores
+terminal run status. A receipt failure is retried on a short bounded schedule
+while the owning worker still knows the real outcome and holds the lease. If
+all attempts fail, the worker persists that real terminal status instead of
+leaving a successful run inflight for orphan recovery to rewrite as an error;
+the receipt remains best-effort in that outage case. Orphan recovery uses the
+same singleton write before marking genuinely abandoned runs `error`,
+preserving an existing detailed receipt when a worker crashed between those
+two writes. Event stores
 serialize `put_if_absent` with ordinary thread writers: memory and JSONL provide
 the documented single-process guarantee, while the DB store adds per-thread
 in-process locks and PostgreSQL advisory locks for cross-process writers.
@@ -464,8 +468,8 @@ pin one accumulated receipt across multiple goal-continuation `_stream_once`
 calls; journal tests drive LangChain's real async callback dispatcher against a
 single journal to pin serialized, deduplicated parallel tool callbacks.
 Multi-worker deployments therefore require `run_events.backend: db` for shared,
-ordered delivery events; the current startup gate does not enforce that
-run-events setting.
+ordered delivery events; the startup gate rejects process-local memory and
+JSONL event stores when `GATEWAY_WORKERS > 1`.
 
 **RunManager / RunStore contract**:
 - `RunManager.get()` is async; direct callers must `await` it.

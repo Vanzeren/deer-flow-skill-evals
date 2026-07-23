@@ -103,6 +103,55 @@ async def _checkpoint_thread_lock(thread_id: str) -> AsyncIterator[None]:
 
 # Valid stream_mode values for LangGraph's graph.astream()
 _VALID_LG_MODES = {"values", "updates", "checkpoints", "tasks", "debug", "messages", "custom"}
+_DELIVERY_RECEIPT_RETRY_DELAYS_SECONDS = (0.1, 0.5)
+
+
+async def _persist_delivery_receipt(
+    event_store: Any,
+    *,
+    thread_id: str,
+    run_id: str,
+    content: dict[str, Any],
+) -> bool:
+    """Persist a terminal receipt with short bounded retries.
+
+    The owning worker still knows the real terminal outcome and renews its
+    lease while this coroutine runs. Retrying here handles transient event
+    store failures without handing a successful run to orphan recovery, which
+    cannot reconstruct either the terminal status or the detailed receipt.
+    """
+    attempts = len(_DELIVERY_RECEIPT_RETRY_DELAYS_SECONDS) + 1
+    for attempt in range(attempts):
+        try:
+            await event_store.put_if_absent(
+                thread_id=thread_id,
+                run_id=run_id,
+                event_type="run.delivery",
+                category="outputs",
+                content=content,
+            )
+            return True
+        except Exception:
+            if attempt == attempts - 1:
+                logger.warning(
+                    "Failed to persist delivery receipt for run %s after %d attempts; preserving the real terminal status without a receipt",
+                    run_id,
+                    attempts,
+                    exc_info=True,
+                )
+                return False
+            delay = _DELIVERY_RECEIPT_RETRY_DELAYS_SECONDS[attempt]
+            logger.warning(
+                "Failed to persist delivery receipt for run %s (attempt %d/%d); retrying in %.1fs",
+                run_id,
+                attempt + 1,
+                attempts,
+                delay,
+                exc_info=True,
+            )
+            await asyncio.sleep(delay)
+
+    return False  # pragma: no cover - loop always returns
 
 
 def _build_runtime_context(
@@ -741,36 +790,30 @@ async def run_agent(
         # receipt uses a run-scoped idempotent write shared with recovery, then
         # the staged terminal status is persisted. This ordering closes the
         # crash window where a terminal run could otherwise outlive its receipt.
-        receipt_durable = event_store is None
         if journal is not None:
             try:
                 await journal.flush()
             except Exception:
                 logger.warning("Failed to flush journal for run %s", run_id, exc_info=True)
 
-            try:
-                await event_store.put_if_absent(
-                    thread_id=thread_id,
-                    run_id=run_id,
-                    event_type="run.delivery",
-                    category="outputs",
-                    content=journal.get_delivery_content(),
-                )
-                receipt_durable = True
-            except Exception:
-                # Keep the durable run row inflight. Startup/periodic orphan
-                # reconciliation can then retry a zero-delivery receipt before
-                # terminalizing it, rather than preserving a receipt-less
-                # terminal status forever.
-                logger.warning("Failed to persist delivery receipt for run %s; terminal status remains retryable", run_id, exc_info=True)
+            await _persist_delivery_receipt(
+                event_store,
+                thread_id=thread_id,
+                run_id=run_id,
+                content=journal.get_delivery_content(),
+            )
 
-        if event_store is not None and receipt_durable:
+        if event_store is not None:
             try:
+                # Even after bounded receipt retries are exhausted, persist the
+                # real worker outcome. Leaving a successful row inflight would
+                # let lease recovery rewrite it as an error with a synthetic
+                # zero receipt.
                 await run_manager.persist_current_status(run_id)
             except Exception:
-                logger.warning("Failed to persist terminal status for run %s after delivery receipt", run_id, exc_info=True)
+                logger.warning("Failed to persist terminal status for run %s after delivery receipt attempts", run_id, exc_info=True)
 
-        if journal is not None and receipt_durable and persist_completion:
+        if journal is not None and persist_completion:
             try:
                 # Persist token usage + convenience fields to RunStore
                 completion = journal.get_completion_data()

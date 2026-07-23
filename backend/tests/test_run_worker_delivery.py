@@ -226,11 +226,19 @@ async def test_delivery_is_durable_before_terminal_run_status():
 
 
 @pytest.mark.anyio
-async def test_delivery_write_failure_leaves_durable_status_inflight_for_recovery():
-    class FailingReceiptStore(MemoryRunEventStore):
-        async def put_if_absent(self, **kwargs):
-            raise RuntimeError("event store unavailable")
+async def test_delivery_write_retries_before_persisting_success():
+    class FlakyReceiptStore(MemoryRunEventStore):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
 
+        async def put_if_absent(self, **kwargs):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("transient event store outage")
+            return await super().put_if_absent(**kwargs)
+
+    event_store = FlakyReceiptStore()
     run_store = MemoryRunStore()
     run_manager = RunManager(store=run_store)
     record = await run_manager.create("thread-1")
@@ -243,16 +251,52 @@ async def test_delivery_write_failure_leaves_durable_status_inflight_for_recover
         _make_bridge(),
         run_manager,
         record,
-        ctx=RunContext(checkpointer=None, event_store=FailingReceiptStore()),
+        ctx=RunContext(checkpointer=None, event_store=event_store),
         agent_factory=lambda *, config: DummyAgent(),
         graph_input={},
         config={},
     )
 
-    # The in-memory record can finish for local callers, but the durable row
-    # remains recoverable instead of becoming a receipt-less terminal run.
+    assert event_store.attempts == 2
+    assert len(await _delivery_events(event_store, "thread-1", record.run_id)) == 1
+    assert (await run_store.get(record.run_id))["status"] == "success"
+
+
+@pytest.mark.anyio
+async def test_delivery_write_failure_preserves_real_durable_terminal_status():
+    class FailingReceiptStore(MemoryRunEventStore):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+
+        async def put_if_absent(self, **kwargs):
+            self.attempts += 1
+            raise RuntimeError("event store unavailable")
+
+    run_store = MemoryRunStore()
+    run_manager = RunManager(store=run_store)
+    record = await run_manager.create("thread-1")
+    event_store = FailingReceiptStore()
+
+    class DummyAgent:
+        async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
+            yield {"messages": []}
+
+    await run_agent(
+        _make_bridge(),
+        run_manager,
+        record,
+        ctx=RunContext(checkpointer=None, event_store=event_store),
+        agent_factory=lambda *, config: DummyAgent(),
+        graph_input={},
+        config={},
+    )
+
+    # A receipt outage must not let lease recovery rewrite a genuine success
+    # as an error. After bounded retries, preserve the worker's real outcome.
+    assert event_store.attempts > 1
     assert record.status == RunStatus.success
-    assert (await run_store.get(record.run_id))["status"] == "running"
+    assert (await run_store.get(record.run_id))["status"] == "success"
 
 
 @pytest.mark.anyio
