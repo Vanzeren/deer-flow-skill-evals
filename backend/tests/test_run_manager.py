@@ -62,15 +62,15 @@ class PermanentStatusRunStore(MemoryRunStore):
         )
 
 
-class FailingStatusRunStore(MemoryRunStore):
-    """Memory run store that always fails status updates."""
+class FailingTakeoverRunStore(MemoryRunStore):
+    """Memory run store that always fails takeover claims."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.status_update_attempts = 0
+        self.takeover_attempts = 0
 
-    async def update_status(self, run_id, status, *, error=None, stop_reason=None):
-        self.status_update_attempts += 1
+    async def claim_for_takeover(self, run_id, *, grace_seconds, error):
+        self.takeover_attempts += 1
         raise sqlite3.OperationalError("database is locked")
 
 
@@ -285,7 +285,7 @@ async def test_reconcile_orphaned_inflight_runs_marks_stale_rows_error():
 
 
 @pytest.mark.anyio
-async def test_reconcile_orphaned_run_backfills_delivery_before_terminal_status():
+async def test_reconcile_orphaned_run_backfills_delivery_after_atomic_takeover():
     """Lease recovery must durably backfill the terminal receipt exactly once."""
     store = MemoryRunStore()
     events = MemoryRunEventStore()
@@ -327,8 +327,8 @@ async def test_reconcile_preserves_delivery_written_before_worker_crash():
 
 
 @pytest.mark.anyio
-async def test_reconcile_leaves_run_inflight_when_delivery_backfill_fails():
-    """A receipt-store outage must not create a receipt-less terminal row."""
+async def test_reconcile_preserves_terminal_takeover_when_delivery_backfill_fails():
+    """A receipt-store outage must not undo an atomically claimed orphan."""
 
     class FailingReceiptStore(MemoryRunEventStore):
         async def put_if_absent(self, **kwargs):
@@ -340,8 +340,8 @@ async def test_reconcile_leaves_run_inflight_when_delivery_backfill_fails():
 
     recovered = await manager.reconcile_orphaned_inflight_runs(error="worker crashed", before="2026-01-01T00:00:01+00:00")
 
-    assert recovered == []
-    assert (await store.get("running-run"))["status"] == "running"
+    assert [record.run_id for record in recovered] == ["running-run"]
+    assert (await store.get("running-run"))["status"] == "error"
 
 
 @pytest.mark.anyio
@@ -362,9 +362,9 @@ async def test_reconcile_orphaned_inflight_runs_skips_live_local_run():
 
 
 @pytest.mark.anyio
-async def test_reconcile_orphaned_inflight_runs_skips_rows_when_error_status_is_not_persisted():
-    """Startup recovery must not report a row as recovered if the error update failed."""
-    store = FailingStatusRunStore()
+async def test_reconcile_orphaned_inflight_runs_skips_rows_when_takeover_claim_fails():
+    """Startup recovery must not report a row as recovered if the takeover claim failed."""
+    store = FailingTakeoverRunStore()
     await store.put("running-run", thread_id="thread-1", status="running", created_at="2026-01-01T00:00:00+00:00")
     manager = RunManager(
         store=store,
@@ -379,7 +379,7 @@ async def test_reconcile_orphaned_inflight_runs_skips_rows_when_error_status_is_
     stored = await store.get("running-run")
     assert recovered == []
     assert stored["status"] == "running"
-    assert store.status_update_attempts == 2
+    assert store.takeover_attempts == 2
 
 
 @pytest.mark.anyio

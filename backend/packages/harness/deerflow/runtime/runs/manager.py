@@ -714,7 +714,11 @@ class RunManager:
             )
             return True
         except Exception:
-            logger.warning("Failed to backfill delivery receipt for run %s; leaving it inflight for retry", record.run_id, exc_info=True)
+            logger.warning(
+                "Failed to backfill delivery receipt for recovered run %s; preserving its terminal status",
+                record.run_id,
+                exc_info=True,
+            )
             return False
 
     async def set_finalizing(self, run_id: str, finalizing: bool) -> None:
@@ -1171,19 +1175,34 @@ class RunManager:
                     # Still owned by a local task — skip
                     continue
 
+            try:
+                claimed = await self._call_store_with_retry(
+                    "claim_for_takeover",
+                    record.run_id,
+                    lambda: self._store.claim_for_takeover(
+                        record.run_id,
+                        grace_seconds=grace_seconds,
+                        error=error,
+                    ),
+                )
+            except Exception:
+                logger.warning("Failed to claim orphaned run %s for reconciliation", record.run_id, exc_info=True)
+                continue
+            if not claimed:
+                logger.info(
+                    "Skipped orphaned run %s recovery because the takeover claim no longer matched",
+                    record.run_id,
+                )
+                continue
             record.status = RunStatus.error
             record.error = error
             record.updated_at = now
-            # The receipt is durable before the terminal status. If this
-            # worker crashes after the receipt write, a later reconciliation
-            # retries the singleton write and then terminalizes the run. If the
-            # receipt write fails, leaving the row inflight makes it retryable.
-            if not await self._ensure_delivery_receipt(record):
-                continue
-            persisted = await self._persist_status(record, RunStatus.error, error=error)
-            if not persisted:
-                logger.warning("Skipped orphaned run %s recovery because error status was not persisted", record.run_id)
-                continue
+            # The atomic takeover above must win before writing a zero-delivery
+            # receipt; otherwise a stale scan could race a heartbeat renewal and
+            # permanently overwrite a live run's later detailed receipt. The
+            # receipt remains best-effort, matching normal terminal delivery
+            # when its event store is unavailable.
+            await self._ensure_delivery_receipt(record)
             recovered.append(record)
 
         if recovered:

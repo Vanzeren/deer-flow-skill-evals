@@ -573,12 +573,14 @@ When enabled, every Gateway HTTP response includes `X-Trace-Id`, logs include `t
 
 Gateway run history also records one terminal `run.delivery` receipt per run,
 including zero-output and crash-recovered runs. The receipt is persisted before
-the durable terminal run status and is idempotently backfilled during orphan
-recovery, so operators can distinguish “nothing was presented” from a missing
-delivery record after a restart or lease takeover. Runs that fail checkpoint
-preflight (or are cancelled while waiting for prior finalization) keep the
-existing completion-data behavior: they receive the zero-delivery receipt but
-do not overwrite RunStore completion fields with an empty snapshot.
+the durable terminal run status during normal execution. Orphan recovery first
+atomically claims an expired lease and then idempotently backfills the receipt,
+so a stale recovery scan cannot overwrite a live run's detailed delivery facts.
+Receipt persistence remains best-effort during an event-store outage. Runs that
+fail checkpoint preflight (or are cancelled while waiting for prior
+finalization) keep the existing completion-data behavior: they receive the
+zero-delivery receipt but do not overwrite RunStore completion fields with an
+empty snapshot.
 
 #### LangSmith Tracing
 
@@ -702,7 +704,7 @@ Interrupted first-turn runs still persist a fallback conversation title, so stop
 
 Streaming Markdown responses animate only newly arrived words; text that is already visible is not faded out and replayed when the next chunk extends the same block.
 
-In the Web UI, completed assistant turns can be branched into a new main conversation. The new thread starts from that turn's checkpoint. Because workspace files are not checkpointed, the branch only receives a best-effort copy of the current workspace when you branch from the latest turn; branching from an older turn keeps just the restored message history so the branch never inherits files that were created in a later part of the conversation.
+In the Web UI, completed assistant turns can be branched into a new main conversation. The new thread starts from that turn's checkpoint and keeps the preceding replay checkpoint, so the branched response can be regenerated immediately. Legacy or imported histories without checkpoint parent links use a bounded chronological fallback; if no earlier replay checkpoint exists, branching still succeeds with the legacy single-checkpoint shape, while regeneration remains unavailable for that inherited response. Existing single-checkpoint branches are left unchanged rather than attempting an unsafe checkpoint copy. Because workspace files are not checkpointed, the branch only receives a best-effort copy of the current workspace when you branch from the latest turn; branching from an older turn keeps just the restored message history so the branch never inherits files that were created in a later part of the conversation.
 
 The Web UI reports completed task time once per run. This is total wall-clock time—including model reasoning, tool calls, and waiting—not a per-step or model-only thinking duration. Reasoning content remains available through its own separate disclosure.
 
