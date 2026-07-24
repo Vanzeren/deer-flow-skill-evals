@@ -730,6 +730,31 @@ class TestRunRepository:
         await _cleanup()
 
     @pytest.mark.anyio
+    async def test_interrupt_reclaims_expired_checkpoint_write_reservation_on_sql_store(self, tmp_path):
+        """An expired durable checkpoint writer is immediately reclaimable."""
+        repo = await _make_repo(tmp_path)
+        expired = (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
+        await repo.put(
+            "checkpoint-write-1",
+            thread_id="thread-T",
+            status="pending",
+            operation_kind=ThreadOperationKind.checkpoint_write,
+            owner_worker_id="dead-worker",
+            lease_expires_at=expired,
+            created_at=expired,
+        )
+        manager = RunManager(store=repo, worker_id="worker-b")
+
+        admitted = await manager.create_or_reject("thread-T", multitask_strategy="interrupt")
+
+        assert admitted.status == RunStatus.pending
+        stale = await repo.get("checkpoint-write-1")
+        assert stale is not None
+        assert stale["status"] == "interrupted"
+        assert stale["owner_worker_id"] == "worker-b"
+        await _cleanup()
+
+    @pytest.mark.anyio
     async def test_is_unique_violation_detects_real_sqlite_integrity_error(self, tmp_path):
         """``_is_unique_violation`` must return True for a real SQLite IntegrityError.
 

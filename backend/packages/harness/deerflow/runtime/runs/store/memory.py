@@ -330,8 +330,7 @@ class MemoryRunStore(RunStore):
                     continue
                 if r["status"] not in ("pending", "running"):
                     continue
-                if r.get("operation_kind", "run") != "run":
-                    raise ConflictError(f"Thread {thread_id} has an active checkpoint write")
+                lease_expired = False
                 existing_lease = r.get("lease_expires_at")
                 if existing_lease is not None:
                     try:
@@ -342,6 +341,7 @@ class MemoryRunStore(RunStore):
                         # raise ``TypeError``.
                         if lease_dt.tzinfo is None:
                             lease_dt = lease_dt.replace(tzinfo=UTC)
+                        lease_expired = lease_dt < cutoff
                         if lease_dt >= cutoff and r.get("owner_worker_id") != owner_worker_id:
                             # Live run owned by another worker — cannot
                             # interrupt, and the partial unique index would
@@ -351,6 +351,8 @@ class MemoryRunStore(RunStore):
                             raise ConflictError(f"Thread {thread_id} already has an active run owned by another worker")
                     except (ValueError, TypeError):
                         pass
+                if r.get("operation_kind", "run") != "run" and not lease_expired:
+                    raise ConflictError(f"Thread {thread_id} has an active checkpoint write")
                 candidates.append(r)
             for r in candidates:
                 r["status"] = "interrupted"

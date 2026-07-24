@@ -115,6 +115,35 @@ async def test_checkpoint_write_reservation_blocks_new_runs_until_mutation_finis
 
 
 @pytest.mark.anyio
+async def test_interrupt_reclaims_expired_checkpoint_write_reservation():
+    """A dead checkpoint writer must not wait for periodic reconciliation."""
+    store = MemoryRunStore()
+    expired = (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
+    await store.put(
+        "checkpoint-write-1",
+        thread_id="thread-1",
+        status="pending",
+        operation_kind=ThreadOperationKind.checkpoint_write,
+        owner_worker_id="dead-worker",
+        lease_expires_at=expired,
+        created_at=expired,
+    )
+    manager = _make_manager(
+        store=store,
+        worker_id="worker-b",
+        run_ownership_config=_lease_config(grace_seconds=10),
+    )
+
+    admitted = await manager.create_or_reject("thread-1", multitask_strategy="interrupt")
+
+    assert admitted.status == RunStatus.pending
+    stale = await store.get("checkpoint-write-1")
+    assert stale is not None
+    assert stale["status"] == "interrupted"
+    assert stale["owner_worker_id"] == "worker-b"
+
+
+@pytest.mark.anyio
 async def test_reject_blocks_reentrant_same_thread_locally():
     """reject must also block when a local in-memory active run exists."""
     store = MemoryRunStore()

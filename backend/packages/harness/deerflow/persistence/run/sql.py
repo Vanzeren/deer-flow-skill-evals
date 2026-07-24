@@ -574,8 +574,7 @@ class RunRepository(RunStore):
                 )
                 result = await session.execute(stmt)
                 for row in result.scalars():
-                    if row.operation_kind != "run":
-                        raise ConflictError(f"Thread {thread_id} has an active checkpoint write")
+                    lease_expired = False
                     if row.lease_expires_at is not None:
                         # SQLite drops tzinfo on read despite
                         # ``DateTime(timezone=True)`` (see ``_row_to_dict``).
@@ -588,6 +587,7 @@ class RunRepository(RunStore):
                         row_lease = row.lease_expires_at
                         if row_lease.tzinfo is None:
                             row_lease = row_lease.replace(tzinfo=UTC)
+                        lease_expired = row_lease < cutoff
                         if row_lease >= cutoff and row.owner_worker_id != owner_worker_id:
                             # Live run owned by another worker — we cannot
                             # interrupt it and the partial unique index would
@@ -595,6 +595,8 @@ class RunRepository(RunStore):
                             # ConflictError so the caller gets a clean signal
                             # instead of a retry loop on IntegrityError.
                             raise ConflictError(f"Thread {thread_id} already has an active run owned by another worker")
+                    if row.operation_kind != "run" and not lease_expired:
+                        raise ConflictError(f"Thread {thread_id} has an active checkpoint write")
                     row.status = "interrupted"
                     row.error = "Cancelled by newer run"
                     row.owner_worker_id = owner_worker_id

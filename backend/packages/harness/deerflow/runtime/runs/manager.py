@@ -1148,16 +1148,25 @@ class RunManager:
         try:
             yield
         finally:
-            if self._store is not None:
-                await self._call_store_with_retry(
-                    "release thread operation",
-                    record.run_id,
-                    lambda: self._store.delete(record.run_id),
-                )
-            async with self._lock:
-                removed = self._runs.pop(record.run_id, None)
-                if removed is not None:
-                    self._unindex_run_locked(record.run_id, removed.thread_id)
+            try:
+                if self._store is not None:
+                    try:
+                        await self._call_store_with_retry(
+                            "release thread operation",
+                            record.run_id,
+                            lambda: self._store.delete(record.run_id),
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to release persisted thread operation %s; leaving it for orphan reconciliation",
+                            record.run_id,
+                            exc_info=True,
+                        )
+            finally:
+                async with self._lock:
+                    removed = self._runs.pop(record.run_id, None)
+                    if removed is not None:
+                        self._unindex_run_locked(record.run_id, removed.thread_id)
 
     async def reconcile_orphaned_inflight_runs(
         self,
