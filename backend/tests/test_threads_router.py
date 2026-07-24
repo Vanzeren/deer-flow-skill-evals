@@ -1,5 +1,6 @@
 import asyncio
 import re
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -52,6 +53,15 @@ class _PermissiveThreadMetaStore(MemoryThreadMetaStore):
         return await super().search(metadata=metadata, status=status, limit=limit, offset=offset, user_id=None)
 
 
+class _ThreadTestRunManager:
+    async def list_by_thread(self, _thread_id: str, *, user_id=None, limit: int = 100) -> list:
+        return []
+
+    @asynccontextmanager
+    async def reserve_thread_operation(self, _thread_id: str, **_kwargs):
+        yield
+
+
 def _build_thread_app() -> tuple[FastAPI, InMemoryStore, InMemorySaver]:
     """Build a stub-authed FastAPI app wired with an in-memory ThreadMetaStore.
 
@@ -66,9 +76,80 @@ def _build_thread_app() -> tuple[FastAPI, InMemoryStore, InMemorySaver]:
     checkpointer = InMemorySaver()
     app.state.store = store
     app.state.checkpointer = checkpointer
+    app.state.run_manager = _ThreadTestRunManager()
     app.state.thread_store = _PermissiveThreadMetaStore(store)
     app.include_router(threads.router)
     return app, store, checkpointer
+
+
+def test_compact_rejects_run_owned_by_another_worker(monkeypatch) -> None:
+    """The HTTP guard must consult the shared store, not only local run memory."""
+    from deerflow.runtime import RunManager, RunStatus
+    from deerflow.runtime.runs.store.memory import MemoryRunStore
+
+    app, _store, _checkpointer = _build_thread_app()
+    run_store = MemoryRunStore()
+    owner = RunManager(store=run_store, worker_id="worker-a")
+    non_owner = RunManager(store=run_store, worker_id="worker-b")
+    app.state.run_manager = non_owner
+    monkeypatch.setattr(
+        threads,
+        "build_checkpoint_state_mutation_accessor",
+        lambda *_args, **_kwargs: (SimpleNamespace(), None),
+    )
+
+    async def _seed_active_run() -> None:
+        active = await owner.create_or_reject("thread-compact-race")
+        await owner.set_status(active.run_id, RunStatus.running)
+
+    asyncio.run(_seed_active_run())
+
+    with TestClient(app) as client:
+        created = client.post("/api/threads", json={"thread_id": "thread-compact-race"})
+        assert created.status_code == 200, created.text
+        response = client.post("/api/threads/thread-compact-race/compact", json={"force": True})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Thread has a run in flight. Compact after the run finishes."
+
+
+def test_update_state_rejects_run_owned_by_another_worker(monkeypatch) -> None:
+    """All out-of-run writes share the same durable thread-operation admission."""
+    from deerflow.runtime import RunManager, RunStatus
+    from deerflow.runtime.runs.store.memory import MemoryRunStore
+
+    app, _store, _checkpointer = _build_thread_app()
+    run_store = MemoryRunStore()
+    owner = RunManager(store=run_store, worker_id="worker-a")
+    app.state.run_manager = RunManager(store=run_store, worker_id="worker-b")
+    accessor = SimpleNamespace(
+        graph=None,
+        aupdate=AsyncMock(side_effect=AssertionError("state write must not run")),
+        aget=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        threads,
+        "build_thread_checkpoint_state_mutation_accessor",
+        AsyncMock(return_value=(accessor, {"configurable": {"thread_id": "thread-state-race"}})),
+    )
+
+    async def _seed_active_run() -> None:
+        active = await owner.create_or_reject("thread-state-race")
+        await owner.set_status(active.run_id, RunStatus.running)
+
+    asyncio.run(_seed_active_run())
+
+    with TestClient(app) as client:
+        created = client.post("/api/threads", json={"thread_id": "thread-state-race"})
+        assert created.status_code == 200, created.text
+        response = client.post(
+            "/api/threads/thread-state-race/state",
+            json={"values": {"title": "must not write"}},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Thread has a run in flight. Update state after the run finishes."
+    accessor.aupdate.assert_not_awaited()
 
 
 class _RawStateAccessor:
@@ -1116,7 +1197,7 @@ def test_branch_thread_can_prepare_regenerate_without_branch_run_events() -> Non
         return []
 
     app.state.run_event_store = SimpleNamespace(list_messages=list_messages)
-    app.state.run_manager = SimpleNamespace(list_by_thread=list_by_thread)
+    app.state.run_manager.list_by_thread = list_by_thread
 
     human = HumanMessage(id="human-1", content="Question", additional_kwargs={"run_id": source_run_id})
     ai = AIMessage(id="ai-1", content="Answer")
@@ -1741,7 +1822,7 @@ def test_state_endpoints_preserve_extension_reducer_channels(monkeypatch, mode) 
         return []
 
     app.state.run_event_store = SimpleNamespace(list_messages=list_messages)
-    app.state.run_manager = SimpleNamespace(list_by_thread=list_by_thread)
+    app.state.run_manager.list_by_thread = list_by_thread
 
     recorded_updates: list[dict] = []
     real_mutation_builder = gateway_services.build_checkpoint_state_mutation_accessor

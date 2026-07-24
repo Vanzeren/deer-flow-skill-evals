@@ -442,6 +442,8 @@ metadata only.
 - `cancel()` returns a :class:`~deerflow.runtime.CancelOutcome` enum: `cancelled` (local cancel), `taken_over` (non-owning worker claimed the run because the owner's lease expired — marks it as `error`), `lease_valid_elsewhere` (owner's lease is still alive — caller should return 409 + `Retry-After`), `not_active_locally` (heartbeat disabled, preserving the old 409 path), `not_cancellable` (terminal state), or `unknown` (not found in memory or store). `create_or_reject(..., multitask_strategy="interrupt"|"rollback")` persists interrupted status through `RunStore.update_status()`, matching normal `set_status()` transitions.
 - Store-only hydrated runs are readable history. In multi-worker mode with heartbeat enabled, cancel on a store-only run can take over (mark `error`) when the owner's lease has expired past the grace window; otherwise it fails with 409 + `Retry-After`. In single-worker mode (heartbeat off), store-only runs still return 409.
 - Startup/orphan reconciliation must claim stale active rows with `RunStore.claim_for_takeover()`, not a plain `update_status()`. The final claim re-checks `status` and lease expiry atomically, so a heartbeat renewal between the candidate scan and the recovery write keeps the run active.
+- Run admission and independent checkpoint writes are first-class thread operations. `runs.operation_kind` distinguishes user-visible `run` rows from internal `checkpoint_write` reservations, while every active kind shares the existing durable active-thread uniqueness constraint. New operation kinds must go through `RunStore.create_thread_operation_atomic()` and `RunManager.reserve_thread_operation()` rather than adding another lock or metadata marker. Internal reservations are non-interruptible, deleted on normal exit, excluded from run history/reporting, and claimed only to release a stale lease during orphan reconciliation.
+- Gateway checkpoint mutations outside run execution must use `services.reserve_checkpoint_write()`, which composes the process-local thread lock with the durable `checkpoint_write` reservation. Both manual compaction and `POST /threads/{id}/state` use this boundary, so an existing run blocks the write and the reservation blocks new reject/interrupt/rollback runs across workers.
 - `POST /wait` (both thread-scoped and `/api/runs/wait`) drains the stream bridge via `wait_for_run_completion()` instead of bare `await record.task`, so it honours the run's `on_disconnect` setting and cancels the background run on real client disconnect rather than returning a stale checkpoint (issue #3265).
 - Redis `StreamBridge` keys use a rolling retained-buffer TTL (`stream_bridge.stream_ttl_seconds`, refreshed on `publish()` / `publish_end()`) as a leak safety net, not as a run timeout. Startup orphan recovery publishes `END_SENTINEL` and schedules stream cleanup for recovered runs; malformed `Last-Event-ID` reconnect values live-tail new Redis events rather than replaying the retained buffer. Do not broaden this into a shared-database multi-pod reaper without adding worker ownership/liveness first.
 - Thread-scoped run creation accepts `checkpoint` / `checkpoint_id`; Gateway validates the checkpoint belongs to the request thread before writing `checkpoint_id` / `checkpoint_ns` into `config.configurable` for LangGraph branching.
@@ -1104,9 +1106,10 @@ Automatic conversation summarization when approaching token limits:
 - Manual compaction uses `POST /api/threads/{id}/compact`, reuses the same
   `DeerFlowSummarizationMiddleware`, writes a new checkpoint with updated
   `messages` and `summary_text`, and bumps only those channel versions.
-  The route shares the per-thread serialization gate used by `/goal` writes
-  and run admission so compaction cannot race with goal updates or runs that
-  read/write checkpoints.
+  The route uses the shared `reserve_checkpoint_write()` boundary (also used by
+  manual state updates). Its short-lived `checkpoint_write` thread operation
+  shares the durable active-thread uniqueness constraint with run admission,
+  preventing either worker-local or cross-worker checkpoint-write races.
 
 See [docs/summarization.md](docs/summarization.md) for details.
 

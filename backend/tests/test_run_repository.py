@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy.dialects import postgresql
 
 from deerflow.persistence.run import RunRepository
-from deerflow.runtime import CancelOutcome, RunManager, RunStatus
+from deerflow.runtime import CancelOutcome, RunManager, RunStatus, ThreadOperationKind
 from deerflow.runtime.runs.manager import ConflictError
 from deerflow.runtime.runs.store.base import RunStore
 
@@ -65,7 +65,7 @@ class _CustomRunStoreWithoutProgress(RunStore):
     async def list_inflight_with_expired_lease(self, *args, **kwargs):
         return []
 
-    async def create_run_atomic(self, *args, **kwargs):
+    async def create_thread_operation_atomic(self, *args, **kwargs):
         return {}, []
 
     async def claim_for_takeover(self, *args, **kwargs):
@@ -146,6 +146,22 @@ class TestRunRepository:
         rows = await repo.list_by_thread("t1")
         assert len(rows) == 2
         assert all(r["thread_id"] == "t1" for r in rows)
+        await _cleanup()
+
+    @pytest.mark.anyio
+    async def test_run_history_excludes_internal_thread_operations(self, tmp_path):
+        repo = await _make_repo(tmp_path)
+        await repo.put("r1", thread_id="t1", status="success")
+        await repo.put(
+            "checkpoint-write-1",
+            thread_id="t1",
+            status="error",
+            operation_kind=ThreadOperationKind.checkpoint_write,
+        )
+
+        rows = await repo.list_by_thread("t1")
+
+        assert [row["run_id"] for row in rows] == ["r1"]
         await _cleanup()
 
     @pytest.mark.anyio
@@ -648,7 +664,7 @@ class TestRunRepository:
         await _cleanup()
 
     @pytest.mark.anyio
-    async def test_create_run_atomic_reject_propagates_conflict_on_unique_violation(self, tmp_path):
+    async def test_create_thread_operation_atomic_rejects_unique_violation(self, tmp_path):
         """reject path against a real SQLite-backed store must surface as ConflictError, not raw IntegrityError.
 
         The partial unique index ``uq_runs_thread_active`` is created by
@@ -678,7 +694,7 @@ class TestRunRepository:
         # Pre-insert an active run on thread T directly through the store so
         # the partial unique index has something to enforce on the second insert.
         lease = (datetime.now(UTC) + timedelta(seconds=30)).isoformat()
-        await repo.create_run_atomic(
+        await repo.create_thread_operation_atomic(
             "run-A",
             thread_id="thread-T",
             owner_worker_id="worker-A",
@@ -695,6 +711,22 @@ class TestRunRepository:
                 multitask_strategy="reject",
             )
 
+        await _cleanup()
+
+    @pytest.mark.anyio
+    async def test_checkpoint_write_reservation_blocks_interrupt_run_on_sql_store(self, tmp_path):
+        """An interrupt-strategy run cannot displace a durable checkpoint writer."""
+        repo = await _make_repo(tmp_path)
+        compaction_worker = RunManager(store=repo, worker_id="worker-a")
+        run_worker = RunManager(store=repo, worker_id="worker-b")
+
+        async with compaction_worker.reserve_thread_operation("thread-T", kind=ThreadOperationKind.checkpoint_write):
+            with pytest.raises(ConflictError, match="checkpoint write"):
+                await run_worker.create_or_reject("thread-T", multitask_strategy="interrupt")
+
+        assert await repo.list_by_thread("thread-T") == []
+        admitted = await run_worker.create_or_reject("thread-T")
+        assert admitted.status == RunStatus.pending
         await _cleanup()
 
     @pytest.mark.anyio
@@ -777,12 +809,12 @@ class TestRunRepository:
         assert _is_unique_violation(sa_err) is True
 
     @pytest.mark.anyio
-    async def test_create_run_atomic_interrupt_tolerates_tz_naive_lease_on_sqlite(self, tmp_path):
+    async def test_create_thread_operation_atomic_tolerates_tz_naive_lease_on_sqlite(self, tmp_path):
         """Interrupt path must not raise TypeError comparing naive vs aware datetimes.
 
         SQLite drops tzinfo on read despite ``DateTime(timezone=True)`` (see
         the comment in ``RunRepository._row_to_dict``). The interrupt branch
-        of ``create_run_atomic`` compares ``row.lease_expires_at`` against
+        of ``create_thread_operation_atomic`` compares ``row.lease_expires_at`` against
         the aware ``cutoff = datetime.now(UTC) - ...`` in Python. Under
         default config (heartbeat disabled) leases are always NULL so the
         ``is not None`` check short-circuits, but there is no guard against
@@ -801,7 +833,7 @@ class TestRunRepository:
         # The lease value is stored as ISO; SQLite reads it back as a tz-naive
         # datetime — exactly the shape that triggered the bug.
         valid_lease = (datetime.now(UTC) + timedelta(seconds=30)).isoformat()
-        await repo.create_run_atomic(
+        await repo.create_thread_operation_atomic(
             "valid-lease-run",
             thread_id="thread-T",
             owner_worker_id="other-worker",
@@ -813,7 +845,7 @@ class TestRunRepository:
         # The interrupt path must surface a clean ConflictError, not a
         # TypeError from the naive-vs-aware comparison.
         with pytest.raises(ConflictError, match="another worker"):
-            await repo.create_run_atomic(
+            await repo.create_thread_operation_atomic(
                 "run-new",
                 thread_id="thread-T",
                 owner_worker_id="w1",

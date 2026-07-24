@@ -32,13 +32,14 @@ from app.gateway.checkpoint_lineage import (
     find_checkpoint_before_message_chronologically,
     is_duration_only_checkpoint,
 )
-from app.gateway.deps import get_checkpointer, get_run_event_store, get_run_manager
+from app.gateway.deps import get_checkpointer, get_run_event_store
 from app.gateway.internal_auth import get_trusted_internal_owner_user_id
 from app.gateway.services import (
     build_checkpoint_state_accessor,
     build_checkpoint_state_mutation_accessor,
     build_thread_checkpoint_state_accessor,
     build_thread_checkpoint_state_mutation_accessor,
+    reserve_checkpoint_write,
 )
 from app.gateway.utils import sanitize_log_param
 from deerflow.agents.thread_state import THREAD_STATE_REDUCER_FIELDS
@@ -62,6 +63,7 @@ from deerflow.runtime.goal import (
     write_thread_goal,
 )
 from deerflow.runtime.journal import build_branch_history_seed_events
+from deerflow.runtime.runs.manager import ConflictError
 from deerflow.runtime.runs.worker import valid_duration_entry
 from deerflow.runtime.user_context import get_effective_user_id
 from deerflow.utils.file_io import run_file_io
@@ -1099,7 +1101,6 @@ def _thread_compact_response(result: ThreadCompactionResult) -> ThreadCompactRes
 @require_permission("threads", "write", owner_check=True, require_existing=True)
 async def compact_thread(thread_id: str, body: ThreadCompactRequest, request: Request) -> ThreadCompactResponse:
     """Manually summarize old thread context while preserving the visible history."""
-    run_manager = get_run_manager(request)
     # Compaction writes only base-schema channels (messages + summary_text);
     # every other channel — including middleware-contributed ones — is carried
     # forward by checkpoint fork inheritance, so the base-schema mutation
@@ -1114,9 +1115,7 @@ async def compact_thread(thread_id: str, body: ThreadCompactRequest, request: Re
         raise _checkpoint_mode_http_error(exc, thread_id) from exc
     keep = body.keep.to_tuple() if body.keep is not None else None
     try:
-        async with goal_thread_lock(thread_id):
-            if await run_manager.has_inflight(thread_id):
-                raise HTTPException(status_code=409, detail="Thread has a run in flight. Compact after the run finishes.")
+        async with reserve_checkpoint_write(request, thread_id, user_id=get_effective_user_id()):
             result = await compact_thread_context(
                 accessor,
                 thread_id,
@@ -1125,6 +1124,8 @@ async def compact_thread(thread_id: str, body: ThreadCompactRequest, request: Re
                 user_id=get_effective_user_id(),
                 agent_name=body.agent_name,
             )
+    except ConflictError:
+        raise HTTPException(status_code=409, detail="Thread has a run in flight. Compact after the run finishes.") from None
     except _CHECKPOINT_MODE_ERRORS as exc:
         raise _checkpoint_mode_http_error(exc, thread_id) from exc
     except ContextCompactionDisabled:
@@ -1232,12 +1233,15 @@ async def update_thread_state(thread_id: str, body: ThreadStateUpdateRequest, re
         reducer_fields = THREAD_STATE_REDUCER_FIELDS
     updates = {key: Overwrite(value) if key in reducer_fields else value for key, value in values.items()}
     try:
-        updated_config = await accessor.aupdate(
-            read_config,
-            updates,
-            as_node=mutation_node,
-        )
-        snapshot = await accessor.aget(updated_config)
+        async with reserve_checkpoint_write(request, thread_id, user_id=get_effective_user_id()):
+            updated_config = await accessor.aupdate(
+                read_config,
+                updates,
+                as_node=mutation_node,
+            )
+            snapshot = await accessor.aget(updated_config)
+    except ConflictError:
+        raise HTTPException(status_code=409, detail="Thread has a run in flight. Update state after the run finishes.") from None
     except _CHECKPOINT_MODE_ERRORS as exc:
         raise _checkpoint_mode_http_error(exc, thread_id) from exc
     except Exception:

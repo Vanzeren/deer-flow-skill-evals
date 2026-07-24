@@ -41,6 +41,7 @@ class MemoryRunStore(RunStore):
         user_id=None,
         model_name=None,
         status="pending",
+        operation_kind="run",
         multitask_strategy="reject",
         metadata=None,
         kwargs=None,
@@ -58,6 +59,7 @@ class MemoryRunStore(RunStore):
             "user_id": user_id,
             "model_name": model_name,
             "status": status,
+            "operation_kind": operation_kind,
             "multitask_strategy": multitask_strategy,
             "metadata": metadata or {},
             "kwargs": kwargs or {},
@@ -85,7 +87,7 @@ class MemoryRunStore(RunStore):
         run_ids = self._runs_by_thread.get(thread_id)
         if not run_ids:
             return []
-        results = [run for run_id in run_ids if (run := self._runs.get(run_id)) is not None and (user_id is None or run.get("user_id") == user_id)]
+        results = [run for run_id in run_ids if (run := self._runs.get(run_id)) is not None and run.get("operation_kind", "run") == "run" and (user_id is None or run.get("user_id") == user_id)]
         results.sort(key=lambda r: r["created_at"], reverse=True)
         return results[:limit]
 
@@ -94,7 +96,7 @@ class MemoryRunStore(RunStore):
         sources: set[str] = set()
         for run_id in run_ids:
             run = self._runs.get(run_id)
-            if run is None or run.get("status") != "success":
+            if run is None or run.get("operation_kind", "run") != "run" or run.get("status") != "success":
                 continue
             if user_id is not None and run.get("user_id") != user_id:
                 continue
@@ -105,7 +107,7 @@ class MemoryRunStore(RunStore):
 
     async def get_many_by_thread(self, thread_id, run_ids, *, user_id=None):
         thread_run_ids = self._runs_by_thread.get(thread_id) or ()
-        return {run_id: run for run_id in thread_run_ids if run_id in run_ids and (run := self._runs.get(run_id)) is not None and (user_id is None or run.get("user_id") == user_id)}
+        return {run_id: run for run_id in thread_run_ids if run_id in run_ids and (run := self._runs.get(run_id)) is not None and run.get("operation_kind", "run") == "run" and (user_id is None or run.get("user_id") == user_id)}
 
     async def update_status(self, run_id, status, *, error=None, stop_reason=None):
         run = self._runs.get(run_id)
@@ -152,7 +154,7 @@ class MemoryRunStore(RunStore):
 
     async def list_pending(self, *, before=None):
         now = before or datetime.now(UTC).isoformat()
-        results = [r for r in self._runs.values() if r["status"] == "pending" and r["created_at"] <= now]
+        results = [r for r in self._runs.values() if r.get("operation_kind", "run") == "run" and r["status"] == "pending" and r["created_at"] <= now]
         results.sort(key=lambda r: r["created_at"])
         return results
 
@@ -167,7 +169,7 @@ class MemoryRunStore(RunStore):
         # Use the thread index for an O(runs-in-thread) lookup instead of
         # scanning every run in the process (mirrors ``list_by_thread``).
         run_ids = self._runs_by_thread.get(thread_id) or ()
-        completed = [run for run_id in run_ids if (run := self._runs.get(run_id)) is not None and run.get("status") in statuses]
+        completed = [run for run_id in run_ids if (run := self._runs.get(run_id)) is not None and run.get("operation_kind", "run") == "run" and run.get("status") in statuses]
         by_model: dict[str, dict] = {}
         for r in completed:
             usage_by_model = r.get("token_usage_by_model") or {}
@@ -285,13 +287,14 @@ class MemoryRunStore(RunStore):
         results.sort(key=lambda r: r["created_at"])
         return results
 
-    async def create_run_atomic(
+    async def create_thread_operation_atomic(
         self,
         run_id: str,
         *,
         thread_id: str,
         owner_worker_id: str,
         lease_expires_at: str | None,
+        operation_kind: str = "run",
         multitask_strategy: str = "reject",
         assistant_id: str | None = None,
         user_id: str | None = None,
@@ -327,6 +330,8 @@ class MemoryRunStore(RunStore):
                     continue
                 if r["status"] not in ("pending", "running"):
                     continue
+                if r.get("operation_kind", "run") != "run":
+                    raise ConflictError(f"Thread {thread_id} has an active checkpoint write")
                 existing_lease = r.get("lease_expires_at")
                 if existing_lease is not None:
                     try:
@@ -361,6 +366,7 @@ class MemoryRunStore(RunStore):
             "user_id": user_id,
             "model_name": model_name,
             "status": "pending",
+            "operation_kind": operation_kind,
             "multitask_strategy": multitask_strategy,
             "metadata": metadata or {},
             "kwargs": kwargs or {},

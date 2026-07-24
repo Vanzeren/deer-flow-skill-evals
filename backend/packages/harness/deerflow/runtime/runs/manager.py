@@ -7,7 +7,8 @@ import logging
 import socket
 import sqlite3
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -19,7 +20,7 @@ from deerflow.runtime.user_context import AUTO, _AutoSentinel, resolve_user_id
 from deerflow.utils.time import is_lease_expired
 from deerflow.utils.time import now_iso as _now_iso
 
-from .schemas import DisconnectMode, RunStatus
+from .schemas import DisconnectMode, RunStatus, ThreadOperationKind
 
 if TYPE_CHECKING:
     from deerflow.config.run_ownership_config import RunOwnershipConfig
@@ -154,6 +155,7 @@ class RunRecord:
     assistant_id: str | None
     status: RunStatus
     on_disconnect: DisconnectMode
+    operation_kind: ThreadOperationKind = ThreadOperationKind.run
     multitask_strategy: str = "reject"
     metadata: dict = field(default_factory=dict)
     kwargs: dict = field(default_factory=dict)
@@ -250,6 +252,7 @@ class RunManager:
             "thread_id": record.thread_id,
             "assistant_id": record.assistant_id,
             "status": record.status.value,
+            "operation_kind": record.operation_kind.value,
             "multitask_strategy": record.multitask_strategy,
             "metadata": record.metadata or {},
             "kwargs": record.kwargs or {},
@@ -388,6 +391,7 @@ class RunManager:
             assistant_id=row.get("assistant_id"),
             status=RunStatus(row.get("status") or RunStatus.pending.value),
             on_disconnect=DisconnectMode(row.get("on_disconnect") or DisconnectMode.cancel.value),
+            operation_kind=ThreadOperationKind(row.get("operation_kind") or ThreadOperationKind.run.value),
             multitask_strategy=row.get("multitask_strategy") or "reject",
             metadata=row.get("metadata") or {},
             kwargs=row.get("kwargs") or {},
@@ -483,7 +487,7 @@ class RunManager:
 
         Note: this method assumes no active run exists for the thread. It
         persists via ``store.put`` (upsert) rather than the atomic
-        ``create_run_atomic`` primitive, so a concurrent insert for the
+        ``create_thread_operation_atomic`` primitive, so a concurrent insert for the
         same thread will hit the partial unique index and surface as a
         raw ``IntegrityError`` instead of a ``ConflictError``. Production
         callers should use :meth:`create_or_reject`.
@@ -576,7 +580,7 @@ class RunManager:
             limit: Maximum number of runs to return.
         """
         async with self._lock:
-            memory_records = self._thread_records_locked(thread_id)
+            memory_records = [record for record in self._thread_records_locked(thread_id) if record.operation_kind == ThreadOperationKind.run]
         if self._store is None:
             return sorted(memory_records, key=lambda r: r.created_at, reverse=True)[:limit]
         records_by_id = {record.run_id: record for record in memory_records}
@@ -611,7 +615,7 @@ class RunManager:
         """
         resolved_user_id = resolve_user_id(user_id, method_name="RunManager.list_successful_regenerate_sources")
         async with self._lock:
-            memory_records = [record for record in self._thread_records_locked(thread_id) if resolved_user_id is None or record.user_id == resolved_user_id]
+            memory_records = [record for record in self._thread_records_locked(thread_id) if record.operation_kind == ThreadOperationKind.run and (resolved_user_id is None or record.user_id == resolved_user_id)]
 
         sources = set(await self._store.list_successful_regenerate_sources(thread_id, user_id=resolved_user_id)) if self._store is not None else set()
         # _thread_records_locked preserves the insertion order of the thread
@@ -639,7 +643,9 @@ class RunManager:
             return {}
         resolved_user_id = resolve_user_id(user_id, method_name="RunManager.get_many_by_thread")
         async with self._lock:
-            records_by_id = {record.run_id: record for record in self._thread_records_locked(thread_id) if record.run_id in run_ids and (resolved_user_id is None or record.user_id == resolved_user_id)}
+            records_by_id = {
+                record.run_id: record for record in self._thread_records_locked(thread_id) if record.operation_kind == ThreadOperationKind.run and record.run_id in run_ids and (resolved_user_id is None or record.user_id == resolved_user_id)
+            }
         if self._store is None:
             return records_by_id
 
@@ -929,6 +935,32 @@ class RunManager:
         model_name: str | None = None,
         user_id: str | None = None,
     ) -> RunRecord:
+        """Atomically admit a normal agent run for a thread."""
+        return await self._admit_thread_operation(
+            thread_id,
+            assistant_id,
+            operation_kind=ThreadOperationKind.run,
+            on_disconnect=on_disconnect,
+            metadata=metadata,
+            kwargs=kwargs,
+            multitask_strategy=multitask_strategy,
+            model_name=model_name,
+            user_id=user_id,
+        )
+
+    async def _admit_thread_operation(
+        self,
+        thread_id: str,
+        assistant_id: str | None = None,
+        *,
+        operation_kind: ThreadOperationKind,
+        on_disconnect: DisconnectMode = DisconnectMode.cancel,
+        metadata: dict | None = None,
+        kwargs: dict | None = None,
+        multitask_strategy: str = "reject",
+        model_name: str | None = None,
+        user_id: str | None = None,
+    ) -> RunRecord:
         """Atomically check for inflight runs and create a new one.
 
         For ``reject`` strategy, raises ``ConflictError`` if thread
@@ -960,6 +992,7 @@ class RunManager:
             assistant_id=assistant_id,
             status=RunStatus.pending,
             on_disconnect=on_disconnect,
+            operation_kind=operation_kind,
             multitask_strategy=multitask_strategy,
             metadata=metadata or {},
             kwargs=kwargs or {},
@@ -975,6 +1008,9 @@ class RunManager:
             # 1) Local inflight check (same-worker guard; cross-worker is the
             #    store's partial unique index below).
             local_inflight = [r for r in self._thread_records_locked(thread_id) if r.status in (RunStatus.pending, RunStatus.running) or r.finalizing]
+
+            if multitask_strategy in ("interrupt", "rollback") and any(record.operation_kind != ThreadOperationKind.run for record in local_inflight):
+                raise ConflictError(f"Thread {thread_id} has an active checkpoint write")
 
             if multitask_strategy == "reject" and local_inflight:
                 raise ConflictError(f"Thread {thread_id} already has an active run")
@@ -993,13 +1029,14 @@ class RunManager:
                 if multitask_strategy == "reject":
                     try:
                         await self._call_store_with_retry(
-                            "create_run_atomic",
+                            "create_thread_operation_atomic",
                             run_id,
-                            lambda: self._store.create_run_atomic(
+                            lambda: self._store.create_thread_operation_atomic(
                                 run_id=run_id,
                                 thread_id=thread_id,
                                 owner_worker_id=self._worker_id,
                                 lease_expires_at=lease_expires_at,
+                                operation_kind=operation_kind.value,
                                 multitask_strategy="reject",
                                 assistant_id=assistant_id,
                                 user_id=user_id,
@@ -1024,13 +1061,14 @@ class RunManager:
                     for attempt in range(max_retries):
                         try:
                             await self._call_store_with_retry(
-                                "create_run_atomic",
+                                "create_thread_operation_atomic",
                                 run_id,
-                                lambda: self._store.create_run_atomic(
+                                lambda: self._store.create_thread_operation_atomic(
                                     run_id=run_id,
                                     thread_id=thread_id,
                                     owner_worker_id=self._worker_id,
                                     lease_expires_at=lease_expires_at,
+                                    operation_kind=operation_kind.value,
                                     multitask_strategy=multitask_strategy,
                                     assistant_id=assistant_id,
                                     user_id=user_id,
@@ -1053,7 +1091,7 @@ class RunManager:
                                 # worker won the race for this thread.
                                 raise ConflictError(f"Thread {thread_id} already has an active run") from exc
                             raise
-                    # ``create_run_atomic`` already marked any claimed store
+                    # ``create_thread_operation_atomic`` already marked any claimed store
                     # rows as interrupted in the same transaction; no extra
                     # store write is needed for them.
 
@@ -1084,6 +1122,42 @@ class RunManager:
 
         logger.info("Run created: run_id=%s thread_id=%s", run_id, thread_id)
         return record
+
+    @asynccontextmanager
+    async def reserve_thread_operation(
+        self,
+        thread_id: str,
+        *,
+        kind: ThreadOperationKind,
+        user_id: str | None = None,
+    ) -> AsyncIterator[None]:
+        """Hold exclusive durable admission for a non-run thread operation.
+
+        The reservation is a short-lived pending row, so the same durable
+        uniqueness constraint used by ``create_or_reject`` closes both sides of
+        the race across Gateway workers.
+        """
+        if kind == ThreadOperationKind.run:
+            raise ValueError("Normal runs must be admitted with create_or_reject()")
+        record = await self._admit_thread_operation(
+            thread_id,
+            operation_kind=kind,
+            multitask_strategy="reject",
+            user_id=user_id,
+        )
+        try:
+            yield
+        finally:
+            if self._store is not None:
+                await self._call_store_with_retry(
+                    "release thread operation",
+                    record.run_id,
+                    lambda: self._store.delete(record.run_id),
+                )
+            async with self._lock:
+                removed = self._runs.pop(record.run_id, None)
+                if removed is not None:
+                    self._unindex_run_locked(record.run_id, removed.thread_id)
 
     async def reconcile_orphaned_inflight_runs(
         self,
@@ -1152,7 +1226,8 @@ class RunManager:
             record.status = RunStatus.error
             record.error = error
             record.updated_at = now
-            recovered.append(record)
+            if record.operation_kind == ThreadOperationKind.run:
+                recovered.append(record)
 
         if recovered:
             logger.warning("Recovered %d orphaned inflight run(s) as error", len(recovered))
@@ -1289,7 +1364,7 @@ class RunManager:
             # Renew any pending/running run owned by this worker unless its
             # background task has already completed. A pending run whose task
             # has not been spawned yet (``task is None``) is still live from
-            # this worker's perspective — between ``create_run_atomic``
+            # this worker's perspective — between ``create_thread_operation_atomic``
             # inserting the row and the worker layer spawning the agent task
             # there is a brief window. If we drop those records here and the
             # window stretches past ``lease_seconds`` (e.g. event-loop

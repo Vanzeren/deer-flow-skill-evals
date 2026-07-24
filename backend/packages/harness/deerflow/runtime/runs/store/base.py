@@ -25,6 +25,7 @@ class RunStore(abc.ABC):
         user_id: str | None = None,
         model_name: str | None = None,
         status: str = "pending",
+        operation_kind: str = "run",
         multitask_strategy: str = "reject",
         metadata: dict[str, Any] | None = None,
         kwargs: dict[str, Any] | None = None,
@@ -214,13 +215,14 @@ class RunStore(abc.ABC):
         pass
 
     @abc.abstractmethod
-    async def create_run_atomic(
+    async def create_thread_operation_atomic(
         self,
         run_id: str,
         *,
         thread_id: str,
         owner_worker_id: str,
         lease_expires_at: str | None,
+        operation_kind: str = "run",
         multitask_strategy: str = "reject",
         assistant_id: str | None = None,
         user_id: str | None = None,
@@ -230,7 +232,7 @@ class RunStore(abc.ABC):
         created_at: str | None = None,
         grace_seconds: int = 10,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        """Atomically create a run row with cross-process thread-uniqueness.
+        """Atomically create an active thread operation with cross-process uniqueness.
 
         Returns ``(new_run_dict, claimed_run_dicts)``.
         Raises ``IntegrityError`` on conflict for ``reject`` strategy.
