@@ -10,7 +10,7 @@ docker/.cache/
 .Trashes
 ehthumbs.db
 Thumbs.db
-
+.omp
 # Python cache
 __pycache__/
 *.pyc
@@ -60,3 +60,4 @@ config.yaml.bak
 /frontend/playwright-report/
 .gstack/
 .worktrees
+/evals/
