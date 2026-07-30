@@ -1,0 +1,25 @@
+{
+  "input": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "帮我用柱状图对比三个城市上季度的销售额：北京 120 万，上海 150 万，深圳 90 万"
+      }
+    ],
+    "files": []
+  },
+  "expected_output": {
+    "description": "生成一张三城市销售额对比柱状图"
+  },
+  "metadata": {
+    "schema_version": "deerflow.skill-eval/v1",
+    "case_id": "chart-bar-001",
+    "mode": "fast",
+    "expected_skill": { "name": "chart-visualization", "should_trigger": true },
+    "references": {
+      "required": ["references/generate_bar_chart.md"],
+      "forbidden": []
+    },
+    "output_rubric": []
+  }
+}
